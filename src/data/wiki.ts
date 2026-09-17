@@ -124,11 +124,14 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
       }
     }
     const nodes: WikiNode[] = [...pages.entries()].slice(0, wanted).map(([title, page]) => ({ id: title, title, url: articleUrl(title), extract: page.extract }))
-    const ids = new Set(nodes.map((node) => titleId(node.id)))
+    const canonicalById = new Map(nodes.map((node) => [titleId(node.id), node.id]))
     const uniqueLinks = new Map<string, [string, string]>()
     for (const [source, target] of rawLinks) {
-      const key = `${titleId(source)}\u0000${titleId(target)}`
-      if (titleId(source) !== titleId(target) && ids.has(titleId(source)) && ids.has(titleId(target))) uniqueLinks.set(key, [source, target])
+      const sourceId = canonicalById.get(titleId(source))
+      const targetId = canonicalById.get(titleId(target))
+      if (sourceId && targetId && sourceId !== targetId) {
+        uniqueLinks.set(`${sourceId}\u0000${targetId}`, [sourceId, targetId])
+      }
     }
     const links: WikiLink[] = [...uniqueLinks.values()]
       .map(([source, target]) => ({ source, target }))

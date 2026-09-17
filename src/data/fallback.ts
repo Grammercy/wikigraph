@@ -37,5 +37,5 @@ export function buildFallbackGraph(count: number): WikiGraph {
     inDegree: inDegree.get(title),
     outDegree: outDegree.get(title),
   }))
-  return { nodes, links }
+  return { nodes, links, source: 'fallback' }
 }

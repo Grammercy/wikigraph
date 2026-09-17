@@ -62,6 +62,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const hoverRef = useRef<GraphNode | null>(null)
   const dragRef = useRef<{ node: GraphNode; offset: Point } | null>(null)
   const panRef = useRef<{ x: number; y: number; start: Point } | null>(null)
+  const pausedRef = useRef(paused)
+  const viewInitializedRef = useRef(false)
   // Keep the simulation and resize observer independent from React render identity.
   const graphRef = useRef(graph)
   const selectedIdRef = useRef(selectedId)
@@ -70,6 +72,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   graphRef.current = graph
   selectedIdRef.current = selectedId
   colorResolverRef.current = getNodeColor
+  pausedRef.current = paused
 
   const draw = () => {
     const canvas = canvasRef.current
@@ -165,6 +168,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }), [graph.nodes])
 
   useEffect(() => {
+    const { width, height } = sizeRef.current
+    if (width > 1 && height > 1) viewRef.current = { x: width / 2, y: height / 2, scale: 1 }
     const sim = forceSimulation(graph.nodes)
       .force('charge', forceManyBody<GraphNode>().strength(-115).distanceMax(480))
       .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + 10).iterations(2))
@@ -174,6 +179,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       .force('directed-attraction', directedAttraction(graph.links, graph.nodes))
     simulationRef.current = sim
     sim.on('tick', () => drawRef.current())
+    if (pausedRef.current) sim.stop()
     return () => { sim.stop(); simulationRef.current = null }
   }, [graph])
 
@@ -195,6 +201,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const dpr = Math.min(window.devicePixelRatio || 1, 2)
       sizeRef.current = { width: Math.max(1, rect.width), height: Math.max(1, rect.height), dpr }
       canvas.width = Math.round(rect.width * dpr); canvas.height = Math.round(rect.height * dpr)
+      if (!viewInitializedRef.current) {
+        viewRef.current = { x: rect.width / 2, y: rect.height / 2, scale: 1 }
+        viewInitializedRef.current = true
+      }
       canvas.style.width = `${rect.width}px`; canvas.style.height = `${rect.height}px`; drawRef.current()
     }
     resize()
@@ -211,11 +221,14 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   return <div ref={hostRef} className={className} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
     <canvas ref={canvasRef} aria-label="Wikipedia article graph" style={{ display: 'block', width: '100%', height: '100%', cursor: dragRef.current ? 'grabbing' : 'grab', touchAction: 'none' }}
       onPointerDown={(event) => { const point = localPoint(event); const node = hit(point); event.currentTarget.setPointerCapture(event.pointerId); if (node) { dragRef.current = { node, offset: { x: (node.x as number) - point.x, y: (node.y as number) - point.y } }; node.fx = node.x; node.fy = node.y } else panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } } }}
-      onPointerMove={(event) => { const point = localPoint(event); const drag = dragRef.current; const node = drag?.node; if (node && drag) { node.fx = point.x + drag.offset.x; node.fy = point.y + drag.offset.y; simulationRef.current?.alpha(0.12).restart(); draw(); return } const pan = panRef.current; if (pan) { viewRef.current.x = pan.x + event.clientX - pan.start.x; viewRef.current.y = pan.y + event.clientY - pan.start.y; draw(); return } const next = hit(point) ?? null; if (next !== hoverRef.current) { hoverRef.current = next; onHover?.(next); draw() } }}
+      onPointerMove={(event) => { const point = localPoint(event); const drag = dragRef.current; const node = drag?.node; if (node && drag) { node.fx = point.x + drag.offset.x; node.fy = point.y + drag.offset.y; if (!pausedRef.current) simulationRef.current?.alpha(0.12).restart(); draw(); return } const pan = panRef.current; if (pan) { viewRef.current.x = pan.x + event.clientX - pan.start.x; viewRef.current.y = pan.y + event.clientY - pan.start.y; draw(); return } const next = hit(point) ?? null; if (next !== hoverRef.current) { hoverRef.current = next; onHover?.(next); draw() } }}
       onPointerUp={(event) => { const drag = dragRef.current; if (drag) { drag.node.fx = null; drag.node.fy = null; onSelect?.(drag.node) } dragRef.current = null; panRef.current = null; event.currentTarget.releasePointerCapture(event.pointerId); draw() }}
       onPointerCancel={() => { dragRef.current = null; panRef.current = null }}
       onPointerLeave={() => { if (!dragRef.current && hoverRef.current) { hoverRef.current = null; onHover?.(null); draw() } }}
-      onWheel={(event) => { event.preventDefault(); const before = localPoint(event); const factor = Math.max(.75, Math.min(1.25, Math.exp(-event.deltaY * .001))); const view = viewRef.current; const rect = event.currentTarget.getBoundingClientRect(); view.scale = Math.max(.18, Math.min(4, view.scale * factor)); view.x = event.clientX - rect.left - before.x * view.scale; view.y = event.clientY - rect.top - before.y * view.scale; draw() }} />
+      onWheel={(event) => { event.preventDefault(); const before = localPoint(event); const factor = Math.max(.75, Math.min(1.25, Math.exp(-event.deltaY * .001))); const view = viewRef.current; const rect = event.currentTarget.getBoundingClientRect(); view.scale = Math.max(.18, Math.min(4, view.scale * factor)); view.x = event.clientX - rect.left - before.x * view.scale; view.y = event.clientY - rect.top - before.y * view.scale; draw() }}
+      tabIndex={0}
+      role="application"
+      onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.18, viewRef.current.scale / 1.15); draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const points = graphRef.current.nodes.filter((node) => node.x != null && node.y != null); if (points.length) { const xs = points.map((node) => node.x as number); const ys = points.map((node) => node.y as number); const bounds = { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) }; const { width, height } = sizeRef.current; const scale = Math.max(.2, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
   </div>
 })
 
