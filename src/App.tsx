@@ -29,7 +29,7 @@ export default function App() {
       setGraph(next)
       setSelectedId(null)
       setHoveredId(null)
-      if (next.source === 'fallback') setError('Wikipedia is unavailable — showing a local demo graph instead.')
+      if (next.source === 'fallback') setError('Wikipedia is unavailable — showing a local demo graph (up to 51 articles).')
     } catch (cause) {
       if (controller.signal.aborted || (cause instanceof DOMException && cause.name === 'AbortError')) return
       if (version === requestVersionRef.current) setError('Unable to load Wikipedia articles. Try generating the map again.')
