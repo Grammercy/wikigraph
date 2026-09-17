@@ -123,8 +123,15 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
   try {
     // Prefer a dump-backed local service when configured. It can serve the
     // complete corpus while preserving the same UI contract and slider.
-    const local = await fetchLocalGraph(wanted, signal)
-    if (local) return local
+    try {
+      const local = await fetchLocalGraph(wanted, signal)
+      if (local) return local
+    } catch (localError) {
+      // A local index is optional: if it is offline, malformed, or still
+      // rebuilding, continue with the public API instead of jumping straight
+      // to demo data. Preserve cancellation semantics for the active request.
+      if (signal?.aborted) throw localError
+    }
     const seeds = await randomTitles(Math.min(Math.max(5, Math.ceil(wanted / 8)), 50), signal)
     const queue = [...new Map(seeds.map((title) => [titleId(title), title])).values()]
     const queued = new Set(queue.map(titleId))
