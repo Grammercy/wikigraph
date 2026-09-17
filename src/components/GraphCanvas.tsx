@@ -233,9 +233,21 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 })
 
 function directedAttraction(links: GraphLink[], nodes: GraphNode[]) {
-  let resolved: Array<[GraphNode, GraphNode]> = []
-  const force = (alpha: number) => { for (const [source, target] of resolved) { if (source.x == null || target.x == null || source.y == null || target.y == null) continue; const dx = target.x - source.x; const dy = target.y - source.y; const distance = Math.hypot(dx, dy) || 1; const strength = Math.min(0.028, 0.007 + distance / 260000); source.vx = (source.vx ?? 0) + dx / distance * distance * strength * alpha; source.vy = (source.vy ?? 0) + dy / distance * distance * strength * alpha } }
-  force.initialize = (simulationNodes: GraphNode[]) => { const map = new Map(nodes.map((node) => [node.id, node])); resolved = links.flatMap((link) => { const source = linkNode(link.source, map); const target = linkNode(link.target, map); return source && target ? [[source, target] as [GraphNode, GraphNode]] : [] }); void simulationNodes }
+  let resolved: Array<[GraphNode, GraphNode, number]> = []
+  const force = (alpha: number) => { for (const [source, target, weight] of resolved) { if (source.x == null || target.x == null || source.y == null || target.y == null) continue; const dx = target.x - source.x; const dy = target.y - source.y; const distance = Math.hypot(dx, dy) || 1; const strength = Math.min(0.028, 0.007 + distance / 260000) * weight; source.vx = (source.vx ?? 0) + dx / distance * distance * strength * alpha; source.vy = (source.vy ?? 0) + dy / distance * distance * strength * alpha } }
+  force.initialize = (simulationNodes: GraphNode[]) => {
+    const map = new Map(nodes.map((node) => [node.id, node]))
+    const candidates = links.flatMap((link) => {
+      const source = linkNode(link.source, map)
+      const target = linkNode(link.target, map)
+      return source && target ? [[source, target] as [GraphNode, GraphNode]] : []
+    })
+    const outDegrees = new Map<GraphNode, number>()
+    for (const [source] of candidates) outDegrees.set(source, (outDegrees.get(source) ?? 0) + 1)
+    // Keep high-outdegree pages influential without letting one hub dominate the whole map.
+    resolved = candidates.map(([source, target]) => [source, target, 1 / Math.sqrt(outDegrees.get(source) ?? 1)])
+    void simulationNodes
+  }
   return force
 }
 
