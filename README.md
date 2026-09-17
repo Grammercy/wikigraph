@@ -14,6 +14,18 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 
 The app requests random main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). Requests are bounded to the selected article count, use small API batches, and include a timeout. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
 
+## Optional full-dump storage
+
+For a local, full-English-Wikipedia index, keep Wikimedia's large dump outside the repository (and off the system drive). The helper defaults to `D:\\WikiGraphData` on Windows and `/mnt/d/WikiGraphData` in WSL:
+
+```bash
+npm run wiki:data
+npm run wiki:download -- --dry-run
+npm run wiki:download
+```
+
+Set `WIKIGRAPH_DATA_DIR` to another absolute HDD path when needed. Downloads resume through a `.part` file and write a small `manifest.json` only after completion. The app continues to use the bounded public API until a local index service is connected; the dump itself is never checked into Git.
+
 ## Run locally
 
 Requirements: Node.js 18+.
@@ -29,4 +41,3 @@ Open the local URL printed by Vite (normally `http://localhost:5173`). To verify
 npm run build
 npm run preview
 ```
-
