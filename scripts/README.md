@@ -54,8 +54,10 @@ extracts conservative `[[article]]` links. The parser reads one page at a time,
 so it does not require enough RAM for all of Wikipedia:
 
 ```powershell
-python .\scripts\parse-wikimedia-dump.py --input D:\WikiGraphData\enwiki-latest-pages-articles-multistream.xml.bz2 --output D:\WikiGraphData\articles.jsonl
+node .\scripts\wiki-data.mjs download
+python .\scripts\parse-wikimedia-dump.py
 node .\scripts\wiki-data.mjs index --input D:\WikiGraphData\articles.jsonl
+$env:WIKIGRAPH_DATA_DIR = 'D:\WikiGraphData'; npm run wiki:serve
 ```
 
 Progress is printed every 100,000 pages and saved atomically to
