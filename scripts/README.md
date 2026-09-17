@@ -45,3 +45,18 @@ an atomic `.part-*` file. Existing completed indexes are never overwritten.
 This format is intentionally streamable by the local graph service; converting
 the compressed Wikimedia XML into normalized JSONL remains a separate,
 dump-aware step because Node's built-in modules do not include an XML parser.
+
+## Local API
+
+Start the dependency-free local API after preparing an index:
+
+```powershell
+$env:WIKIGRAPH_DATA_DIR = 'D:\WikiGraphData'
+npm run wiki:serve
+```
+
+Set `VITE_WIKIGRAPH_INDEX_URL=http://127.0.0.1:8787/api/graph` before starting
+Vite. The service reads `D:\WikiGraphData\index.json` when present, samples
+deterministically up to the requested slider count, and exposes `/health`.
+Without an index it serves a tiny deterministic graph for endpoint testing;
+it never downloads, parses raw XML, or loads the full corpus into the browser.
