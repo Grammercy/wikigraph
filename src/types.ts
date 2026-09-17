@@ -19,4 +19,6 @@ export interface WikiLink extends SimulationLinkDatum<WikiNode> {
 export interface WikiGraph {
   nodes: WikiNode[]
   links: WikiLink[]
+  /** Identifies whether this graph came from Wikipedia or the offline seed graph. */
+  source?: 'wikipedia' | 'fallback'
 }
