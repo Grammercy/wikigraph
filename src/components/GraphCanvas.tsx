@@ -14,6 +14,9 @@ export type GraphNode = SimulationNodeDatum & {
   label?: string
   group?: string | number
   color?: string
+  /** Link degree is also used as a lightweight article-importance signal. */
+  inDegree?: number
+  outDegree?: number
 }
 
 export type GraphLink = {
@@ -42,7 +45,13 @@ export type GraphCanvasProps = {
 type Point = { x: number; y: number }
 type View = { x: number; y: number; scale: number }
 
-const nodeRadius = (node: GraphNode) => (node.id.length > 18 ? 5 : 6)
+const articleDegree = (node: GraphNode) => Math.max(0, (node.inDegree ?? 0) + (node.outDegree ?? 0))
+// More connected articles are visually larger, with a cap so hubs never swallow
+// nearby nodes. Keeping this in one helper also keeps hit testing/collision aligned.
+const nodeRadius = (node: GraphNode) => {
+  const degreeSize = Math.min(6, Math.sqrt(Math.min(articleDegree(node), 56)) * 0.8)
+  return (node.id.length > 18 ? 5 : 6) + degreeSize
+}
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
 
@@ -171,7 +180,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const { width, height } = sizeRef.current
     if (width > 1 && height > 1) viewRef.current = { x: width / 2, y: height / 2, scale: 1 }
     const sim = forceSimulation(graph.nodes)
-      .force('charge', forceManyBody<GraphNode>().strength(-115).distanceMax(480))
+      // Hubs need more breathing room: their repulsion grows with degree, but is
+      // capped to keep a single highly-linked page from dominating the whole map.
+      .force('charge', forceManyBody<GraphNode>()
+        .strength((node) => -115 - Math.min(126, Math.sqrt(Math.min(articleDegree(node), 56)) * 17))
+        .distanceMax(480))
       .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + 10).iterations(2))
       .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))
       // Wikipedia links are directed: the source article moves toward its target,
