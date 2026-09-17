@@ -15,6 +15,7 @@ interface ApiPage {
   ns?: number
   title?: string
   extract?: string
+  length?: number
   links?: Array<{ ns?: number; title?: string }>
 }
 
@@ -102,7 +103,7 @@ async function pageBatch(titles: string[], signal?: AbortSignal): Promise<PageBa
   let continuation: { plcontinue?: string; continue?: string } | undefined
   for (let attempt = 0; attempt <= MAX_LINK_CONTINUATIONS; attempt += 1) {
     const data = await request({
-      action: 'query', titles: titles.join('|'), prop: 'extracts|links', exintro: '1', explaintext: '1', exchars: '280',
+      action: 'query', titles: titles.join('|'), prop: 'extracts|links|info', inprop: 'url', exintro: '1', explaintext: '1', exchars: '280',
       plnamespace: '0', pllimit: String(MAX_LINKS_PER_PAGE), redirects: '1', ...(continuation ?? {}),
     }, signal)
     for (const mapping of [...(data.query?.normalized ?? []), ...(data.query?.redirects ?? [])]) {
@@ -158,7 +159,7 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
         }
       }
     }
-    const nodes: WikiNode[] = [...pages.entries()].slice(0, wanted).map(([title, page]) => ({ id: title, title, url: articleUrl(title), extract: page.extract }))
+    const nodes: WikiNode[] = [...pages.entries()].slice(0, wanted).map(([title, page]) => ({ id: title, title, url: articleUrl(title), extract: page.extract, byteLength: page.length }))
     const canonicalById = new Map(nodes.map((node) => [titleId(node.id), node.id]))
     const uniqueLinks = new Map<string, [string, string]>()
     for (const [source, target] of rawLinks) {

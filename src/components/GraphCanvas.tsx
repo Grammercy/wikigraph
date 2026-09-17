@@ -17,6 +17,8 @@ export type GraphNode = SimulationNodeDatum & {
   /** Link degree is also used as a lightweight article-importance signal. */
   inDegree?: number
   outDegree?: number
+  articleSize?: number
+  byteLength?: number
 }
 
 export type GraphLink = {
@@ -46,11 +48,20 @@ type Point = { x: number; y: number }
 type View = { x: number; y: number; scale: number }
 
 const articleDegree = (node: GraphNode) => Math.max(0, (node.inDegree ?? 0) + (node.outDegree ?? 0))
+const articleBytes = (node: GraphNode) => {
+  const value = node.articleSize ?? node.byteLength ?? 0
+  return Number.isFinite(value) && value > 0 ? value : 0
+}
+const articleImportance = (node: GraphNode) => {
+  const degree = Math.min(articleDegree(node), 56)
+  // Log scaling prevents unusually long articles from overwhelming the graph.
+  const bytes = Math.min(Math.max(articleBytes(node), 0), 2_000_000)
+  return Math.min(1, Math.log1p(bytes) / Math.log1p(2_000_000)) * 0.45 + Math.sqrt(degree / 56) * 0.55
+}
 // More connected articles are visually larger, with a cap so hubs never swallow
 // nearby nodes. Keeping this in one helper also keeps hit testing/collision aligned.
 const nodeRadius = (node: GraphNode) => {
-  const degreeSize = Math.min(6, Math.sqrt(Math.min(articleDegree(node), 56)) * 0.8)
-  return (node.id.length > 18 ? 5 : 6) + degreeSize
+  return (node.id.length > 18 ? 5 : 6) + articleImportance(node) * 6
 }
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
@@ -183,7 +194,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       // Hubs need more breathing room: their repulsion grows with degree, but is
       // capped to keep a single highly-linked page from dominating the whole map.
       .force('charge', forceManyBody<GraphNode>()
-        .strength((node) => -115 - Math.min(126, Math.sqrt(Math.min(articleDegree(node), 56)) * 17))
+        .strength((node) => -115 - articleImportance(node) * 126)
         .distanceMax(480))
       .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + 10).iterations(2))
       .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))

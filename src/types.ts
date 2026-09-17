@@ -7,6 +7,9 @@ export interface WikiNode extends SimulationNodeDatum {
   title: string
   url: string
   extract?: string
+  /** Optional source metadata from a dump/index (usually article byte length). */
+  articleSize?: number
+  byteLength?: number
   inDegree?: number
   outDegree?: number
 }
