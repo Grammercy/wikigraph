@@ -13,7 +13,7 @@
  * safe, and a small manifest records the completed artifact.
  */
 
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
@@ -34,16 +34,17 @@ function dataDir() {
 
   // Large dumps should not silently fill the system drive. Opt in explicitly
   // when developing on a machine without a D: drive.
-  const onSystemDrive = process.platform === "win32" && /^[A-Za-z]:/.test(value) && value[0].toUpperCase() === "C";
+  const onSystemDrive = (process.platform === "win32" && /^[A-Za-z]:/.test(value) && value[0].toUpperCase() === "C")
+    || (process.platform !== "win32" && /^\/mnt\/c(?:\/|$)/i.test(value));
   if (onSystemDrive && process.env.WIKIGRAPH_ALLOW_SYSTEM_DRIVE !== "1") {
-    throw new Error("Refusing to use C:. Set WIKIGRAPH_DATA_DIR to a D: path (or WIKIGRAPH_ALLOW_SYSTEM_DRIVE=1 for an explicit exception).");
+    throw new Error("Refusing to use the C: drive. Set WIKIGRAPH_DATA_DIR to a D: path (or WIKIGRAPH_ALLOW_SYSTEM_DRIVE=1 for an explicit exception).");
   }
   return value;
 }
 
 function paths() {
   const root = dataDir();
-  return { root, dump: join(root, DUMP_NAME), partial: join(root, `${DUMP_NAME}.part`), manifest: join(root, MANIFEST_NAME), index: join(root, "index") };
+  return { root, dump: join(root, DUMP_NAME), partial: join(root, `${DUMP_NAME}.part`), partialMeta: join(root, `${DUMP_NAME}.part.json`), manifest: join(root, MANIFEST_NAME), index: join(root, "index") };
 }
 
 function readManifest(file) {
@@ -65,6 +66,7 @@ function showStatus() {
   console.log(`data directory: ${p.root}`);
   console.log(`dump: ${existsSync(p.dump) ? formatBytes(statSync(p.dump).size) : "not downloaded"}`);
   console.log(`partial download: ${existsSync(p.partial) ? formatBytes(statSync(p.partial).size) : "none"}`);
+  if (existsSync(p.partialMeta)) console.log("partial metadata: present (resume is version-checked)");
   console.log(`local index directory: ${existsSync(p.index) ? p.index : "not created"}`);
   if (manifest) console.log(`manifest: ${manifest.source ?? "unknown"} (${manifest.completedAt ?? "unknown date"})`);
 }
@@ -84,17 +86,46 @@ async function download({ dryRun = false } = {}) {
     return;
   }
 
-  const headers = existing ? { Range: `bytes=${existing}-` } : {};
-  const response = await fetch(DUMP_URL, { headers, redirect: "follow" });
+  let partialMeta = readManifest(p.partialMeta);
+  // A partial file without response metadata cannot be safely resumed from a
+  // mutable `latest` URL, so it is restarted and its bytes are replaced.
+  const canResume = existing > 0 && partialMeta?.url === DUMP_URL;
+  const headers = canResume ? { Range: `bytes=${existing}-` } : {};
+  let response = await fetch(DUMP_URL, { headers, redirect: "follow" });
   if (!response.ok || !response.body) throw new Error(`Wikimedia returned HTTP ${response.status}`);
-  const append = existing && response.status === 206;
+  let append = canResume && response.status === 206;
+  let responseMeta = {
+    url: DUMP_URL,
+    etag: response.headers.get("etag") ?? null,
+    lastModified: response.headers.get("last-modified") ?? null,
+    contentRange: response.headers.get("content-range") ?? null,
+  };
+  const startMatches = !responseMeta.contentRange || responseMeta.contentRange.startsWith(`bytes ${existing}-`);
+  const versionMatches = !partialMeta || ((!partialMeta.etag || !responseMeta.etag || partialMeta.etag === responseMeta.etag)
+    && (!partialMeta.lastModified || !responseMeta.lastModified || partialMeta.lastModified === responseMeta.lastModified));
+  if (append && (!startMatches || !versionMatches)) {
+    console.warn("The latest dump changed while resuming; restarting from byte zero.");
+    await response.body.cancel();
+    response = await fetch(DUMP_URL, { redirect: "follow" });
+    if (!response.ok || !response.body) throw new Error(`Wikimedia returned HTTP ${response.status}`);
+    append = false;
+    partialMeta = null;
+    responseMeta = {
+      url: DUMP_URL,
+      etag: response.headers.get("etag") ?? null,
+      lastModified: response.headers.get("last-modified") ?? null,
+      contentRange: response.headers.get("content-range") ?? null,
+    };
+  }
   if (existing && !append) {
     console.warn("The server did not honor resume; restarting the partial download.");
   }
+  writeFileSync(p.partialMeta, JSON.stringify({ ...responseMeta, url: DUMP_URL }, null, 2) + "\n");
   const stream = Readable.fromWeb(response.body);
   await pipeline(stream, createWriteStream(p.partial, { flags: append ? "a" : "w" }));
   renameSync(p.partial, p.dump);
-  writeFileSync(p.manifest, JSON.stringify({ source: DUMP_URL, dump: DUMP_NAME, completedAt: new Date().toISOString(), bytes: statSync(p.dump).size }, null, 2) + "\n");
+  unlinkSync(p.partialMeta);
+  writeFileSync(p.manifest, JSON.stringify({ source: DUMP_URL, dump: DUMP_NAME, completedAt: new Date().toISOString(), bytes: statSync(p.dump).size, etag: responseMeta.etag, lastModified: responseMeta.lastModified }, null, 2) + "\n");
   console.log(`Downloaded ${formatBytes(statSync(p.dump).size)} to ${p.dump}`);
 }
 

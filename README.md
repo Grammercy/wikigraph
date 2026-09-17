@@ -24,7 +24,7 @@ npm run wiki:download -- --dry-run
 npm run wiki:download
 ```
 
-Set `WIKIGRAPH_DATA_DIR` to another absolute HDD path when needed. Downloads resume through a `.part` file and write a small `manifest.json` only after completion. The app continues to use the bounded public API until a local index service is connected; the dump itself is never checked into Git.
+Set `WIKIGRAPH_DATA_DIR` to another absolute HDD path when needed. Downloads resume through a `.part` file, checking ETag/Last-Modified and Content-Range before appending when the mutable `latest` URL changes. A small `manifest.json` is written only after completion. The app continues to use the bounded public API until a local index service is connected; the dump itself is never checked into Git.
 
 ## Run locally
 
