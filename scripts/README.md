@@ -46,6 +46,27 @@ This format is intentionally streamable by the local graph service; converting
 the compressed Wikimedia XML into normalized JSONL remains a separate,
 dump-aware step because Node's built-in modules do not include an XML parser.
 
+### Convert the dump to JSONL
+
+`parse-wikimedia-dump.py` is a dependency-free streaming converter for the
+compressed XML dump. It keeps only main-namespace, non-redirect pages and
+extracts conservative `[[article]]` links. The parser reads one page at a time,
+so it does not require enough RAM for all of Wikipedia:
+
+```powershell
+python .\scripts\parse-wikimedia-dump.py --input D:\WikiGraphData\enwiki-latest-pages-articles-multistream.xml.bz2 --output D:\WikiGraphData\articles.jsonl
+node .\scripts\wiki-data.mjs index --input D:\WikiGraphData\articles.jsonl
+```
+
+Progress is printed every 100,000 pages and saved atomically to
+`articles.checkpoint.json`; use `--progress-every`, `--limit`, or `--dry-run`
+to tune or inspect a run. A completed output is never overwritten. The script
+refuses C: paths by default, including custom `--input`, `--output`, and
+`--checkpoint` paths; `--allow-system-drive` is intended only for tiny local
+fixtures, not a full dump. Parsing is a separate pass after download and can
+take a long time because the compressed source must be decompressed and
+scanned sequentially.
+
 ## Local API
 
 Start the dependency-free local API after preparing an index:
