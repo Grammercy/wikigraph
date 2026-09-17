@@ -1,0 +1,32 @@
+# WikiGraph
+
+WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one another while directed Wikipedia links attract their source toward their target, producing an emergent view of related knowledge.
+
+## Controls
+
+- **Articles** — choose 10–500 articles, then select **Generate new map** to fetch a new random graph.
+- **Physics engine** — pause or resume the force simulation.
+- **Article labels** — show or hide node labels.
+- **Select article** — open an inspector with an extract, connection counts, related articles, and a link to Wikipedia.
+- **Fit / Reset** — fit the current graph to the canvas or restore the default view. Drag nodes to explore and scroll to zoom.
+
+## Data and fallback behavior
+
+The app requests random main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). Requests are bounded to the selected article count, use small API batches, and include a timeout. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
+
+## Run locally
+
+Requirements: Node.js 18+.
+
+```bash
+npm install
+npm run dev
+```
+
+Open the local URL printed by Vite (normally `http://localhost:5173`). To verify a production build:
+
+```bash
+npm run build
+npm run preview
+```
+
