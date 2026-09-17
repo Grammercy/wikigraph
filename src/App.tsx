@@ -69,7 +69,7 @@ export default function App() {
       return {
         ...node,
         label: showLabels ? node.title : '',
-        color: degree >= 10 ? '#8d8cfe' : degree >= 4 ? '#71bcff' : '#c7f36b',
+        color: degree >= 10 ? '#254fef' : degree >= 4 ? '#6e86f2' : '#b6c4ff',
       }
     }),
     links: graph.links,
@@ -80,14 +80,14 @@ export default function App() {
   return <main className="app-shell">
     <header className="topbar">
       <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
-      <div><div className="eyebrow">EXPLORATORY GRAPH</div><h1>Wiki<span>Graph</span></h1></div>
+      <div><div className="eyebrow">EXPLORATORY GRAPH</div><h1>Wiki<span>/Graph</span></h1></div>
       <div className="topbar-meta"><span className="live-dot" /> {graph.source === 'fallback' ? 'LOCAL DEMO DATA' : 'LIVE SIMULATION'} <span className="divider" /> <span className="muted">Wikipedia knowledge map</span></div>
     </header>
     <section className="workspace">
       <aside className="control-panel">
         <div className="panel-heading"><div><div className="eyebrow">CONTROL DECK</div><h2>Shape your map</h2></div><span className={`status-pill ${graph.source === 'fallback' ? 'offline' : ''}`}>● {statusLabel}</span></div>
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
-        <input id="article-count" className="range" type="range" min="10" max="500" step="10" value={count} style={{ background: `linear-gradient(90deg, #c7f36b 0%, #c7f36b ${rangeProgress}, #353b46 ${rangeProgress})` }} onChange={(event) => setCount(Number(event.target.value))} />
+        <input id="article-count" className="range" type="range" min="10" max="500" step="10" value={count} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${rangeProgress}, #d9dde5 ${rangeProgress})` }} onChange={(event) => setCount(Number(event.target.value))} />
         <div className="range-labels"><span>10</span><span>500</span></div>
         <button className="primary-button" onClick={() => void load(count)} disabled={loading}><span>{loading ? '◌' : '↻'}</span>{loading ? 'Loading graph…' : 'Generate new map'}</button>
         <div className="rule" />

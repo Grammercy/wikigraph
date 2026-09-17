@@ -98,7 +98,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const target = linkNode(edge.target, nodeMap)
       if (!source || !target || source.x == null || target.x == null || source.y == null || target.y == null) continue
       const isRelated = source === selected || target === selected
-      ctx.strokeStyle = isRelated ? 'rgba(111, 188, 255, .55)' : 'rgba(130, 151, 181, .16)'
+      ctx.strokeStyle = isRelated ? 'rgba(37, 79, 239, .72)' : 'rgba(115, 119, 127, .22)'
       ctx.lineWidth = isRelated ? 1.7 : 1
       ctx.beginPath()
       ctx.moveTo(source.x, source.y)
@@ -129,19 +129,19 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       if (active) {
         ctx.beginPath()
         ctx.arc(node.x, node.y, radius + 5, 0, Math.PI * 2)
-        ctx.fillStyle = node === selected ? 'rgba(71, 163, 255, .2)' : 'rgba(255, 255, 255, .12)'
+        ctx.fillStyle = node === selected ? 'rgba(37, 79, 239, .16)' : 'rgba(37, 79, 239, .08)'
         ctx.fill()
       }
       ctx.beginPath()
       ctx.arc(node.x, node.y, radius, 0, Math.PI * 2)
-      ctx.fillStyle = colorResolverRef.current?.(node) ?? node.color ?? (node === selected ? '#73c4ff' : '#9aaec9')
+      ctx.fillStyle = colorResolverRef.current?.(node) ?? node.color ?? (node === selected ? '#254fef' : '#9aabf8')
       ctx.fill()
-      ctx.strokeStyle = node === selected ? '#d7f1ff' : 'rgba(255,255,255,.42)'
+      ctx.strokeStyle = node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
       ctx.lineWidth = node === selected ? 2 : 1
       ctx.stroke()
       const text = node.label ?? node.title ?? node.id
       if (view.scale > 0.58 || active || node === selected) {
-        ctx.fillStyle = node === selected ? '#e8f6ff' : 'rgba(220, 231, 244, .78)'
+        ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
         ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, node.x, node.y + radius + 5)
       }
     }
