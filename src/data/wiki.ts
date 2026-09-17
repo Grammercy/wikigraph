@@ -3,9 +3,12 @@ import { buildFallbackGraph } from './fallback'
 
 const API = 'https://en.wikipedia.org/w/api.php'
 const REQUEST_TIMEOUT = 12_000
-const MAX_BATCH = 25
+const MAX_BATCH = 50
 const MAX_LINKS_PER_PAGE = 45
-const MAX_LINK_CONTINUATIONS = 4
+// Keep the browser crawl deliberately small. Each page already contributes a
+// useful sample of outgoing links; following every continuation quickly trips
+// Wikimedia's anonymous request throttles when a slider is moved repeatedly.
+const MAX_LINK_CONTINUATIONS = 0
 
 interface ApiPage {
   pageid?: number
