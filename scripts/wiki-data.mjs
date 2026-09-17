@@ -13,8 +13,9 @@
  * safe, and a small manifest records the completed artifact.
  */
 
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -97,15 +98,87 @@ async function download({ dryRun = false } = {}) {
   console.log(`Downloaded ${formatBytes(statSync(p.dump).size)} to ${p.dump}`);
 }
 
+/**
+ * Stream a normalized article JSONL file into the compact format consumed by
+ * a dump-backed local service. This deliberately does not parse Wikimedia XML:
+ * XML parsing needs a dump-aware tool (and substantial temporary storage), so
+ * it accepts the output of one instead. Each input line is one article:
+ * {id,title,extract,byteLength,links:["target id", ...]}.
+ */
+async function buildIndex({ input, limit = Infinity, dryRun = false } = {}) {
+  const p = paths();
+  const source = resolve(input || join(p.root, "articles.jsonl"));
+  const output = join(p.index, "articles.jsonl");
+  if (dryRun) {
+    console.log(`Would stream ${source} into ${output}`);
+    console.log(`Article limit: ${Number.isFinite(limit) ? limit : "unlimited"}`);
+    return;
+  }
+  if (!existsSync(source)) throw new Error(`Input JSONL not found: ${source}`);
+  if (existsSync(output)) {
+    console.log(`Index already exists: ${output}`);
+    console.log("Move it aside before rebuilding; completed indexes are never overwritten automatically.");
+    return;
+  }
+  mkdirSync(p.index, { recursive: true });
+  const partial = `${output}.part-${process.pid}`;
+  const writer = createWriteStream(partial, { flags: "wx" });
+  const reader = createInterface({ input: createReadStream(source), crlfDelay: Infinity });
+  let records = 0; let malformed = 0; let bytes = 0;
+  try {
+    for await (const line of reader) {
+      if (!line.trim()) continue;
+      if (records >= limit) break;
+      let article;
+      try { article = JSON.parse(line); } catch { malformed += 1; continue; }
+      const id = typeof article.id === "string" ? article.id.trim() : "";
+      const title = typeof article.title === "string" ? article.title.trim() : id;
+      if (!id || !title) { malformed += 1; continue; }
+      const links = Array.isArray(article.links)
+        ? [...new Set(article.links.map((link) => typeof link === "string" ? link.trim() : link?.id ?? link?.title ?? "").filter(Boolean))]
+        : [];
+      const indexed = {
+        id, title,
+        url: typeof article.url === "string" ? article.url : `https://en.wikipedia.org/wiki/${encodeURIComponent(title).replace(/%20/g, "_")}`,
+        ...(typeof article.extract === "string" && article.extract ? { extract: article.extract } : {}),
+        ...(Number.isFinite(article.byteLength) ? { byteLength: article.byteLength } : {}),
+        links,
+      };
+      const serialized = `${JSON.stringify(indexed)}\n`;
+      if (!writer.write(serialized)) await new Promise((resolveWrite) => writer.once("drain", resolveWrite));
+      bytes += Buffer.byteLength(serialized); records += 1;
+    }
+    await new Promise((resolveWrite, rejectWrite) => writer.end((error) => error ? rejectWrite(error) : resolveWrite()));
+    renameSync(partial, output);
+    const manifest = { type: "wikigraph-jsonl", source, output: "index/articles.jsonl", records, malformed, bytes, completedAt: new Date().toISOString() };
+    writeFileSync(join(p.index, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+    console.log(`Indexed ${records.toLocaleString()} articles (${formatBytes(bytes)}) at ${output}`);
+    if (malformed) console.warn(`Skipped ${malformed.toLocaleString()} malformed input lines.`);
+  } catch (error) {
+    writer.destroy();
+    throw error;
+  }
+}
+
+function optionValue(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
 function help() {
-  console.log("Usage: node scripts/wiki-data.mjs <status|download> [--dry-run]");
+  console.log("Usage: node scripts/wiki-data.mjs <status|download|index> [options]");
   console.log("Set WIKIGRAPH_DATA_DIR to choose the external HDD directory.");
+  console.log("index options: --input <articles.jsonl> [--limit <n>] [--dry-run]");
 }
 
 const command = process.argv[2] ?? "status";
 try {
   if (command === "status") showStatus();
   else if (command === "download") await download({ dryRun: process.argv.includes("--dry-run") });
+  else if (command === "index") {
+    const parsedLimit = Number(optionValue("--limit"));
+    await buildIndex({ input: optionValue("--input"), limit: Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : Infinity, dryRun: process.argv.includes("--dry-run") });
+  }
   else { help(); process.exitCode = 1; }
 } catch (error) {
   console.error(`wiki-data: ${error instanceof Error ? error.message : error}`);

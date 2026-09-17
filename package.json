@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "wiki:data": "node scripts/wiki-data.mjs status",
-    "wiki:download": "node scripts/wiki-data.mjs download"
+    "wiki:download": "node scripts/wiki-data.mjs download",
+    "wiki:index": "node scripts/wiki-data.mjs index"
   },
   "dependencies": {
     "d3-force": "^3.0.0",
