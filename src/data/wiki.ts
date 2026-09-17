@@ -28,6 +28,34 @@ interface ApiResponse {
   }
 }
 
+/**
+ * Optional local corpus endpoint. A dump-backed service can expose the same
+ * compact graph shape as the browser crawler and be enabled with
+ * VITE_WIKIGRAPH_INDEX_URL (for example, http://127.0.0.1:8787/api/graph).
+ * Keeping this opt-in means the hosted/static UI still works without a local
+ * multi-gigabyte Wikipedia index.
+ */
+const LOCAL_INDEX_URL = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_WIKIGRAPH_INDEX_URL?.trim()
+
+function isWikiGraph(value: unknown): value is WikiGraph {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<WikiGraph>
+  return Array.isArray(candidate.nodes) && Array.isArray(candidate.links)
+    && candidate.nodes.every((node) => node && typeof node.id === 'string' && typeof node.title === 'string')
+    && candidate.links.every((link) => link && link.source != null && link.target != null)
+}
+
+async function fetchLocalGraph(count: number, signal?: AbortSignal): Promise<WikiGraph | null> {
+  if (!LOCAL_INDEX_URL) return null
+  const url = new URL(LOCAL_INDEX_URL, window.location.origin)
+  url.searchParams.set('count', String(count))
+  const response = await fetch(url, { signal })
+  if (!response.ok) throw new Error(`Local Wikipedia index returned HTTP ${response.status}`)
+  const graph = await response.json() as unknown
+  if (!isWikiGraph(graph)) throw new Error('Local Wikipedia index returned an invalid graph')
+  return { ...graph, source: 'wikipedia' }
+}
+
 function titleKey(title: string): string {
   return title.trim().replace(/\s+/g, ' ')
 }
@@ -92,6 +120,10 @@ async function pageBatch(titles: string[], signal?: AbortSignal): Promise<PageBa
 export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promise<WikiGraph> {
   const wanted = Math.max(1, Math.min(Math.floor(count) || 1, 500))
   try {
+    // Prefer a dump-backed local service when configured. It can serve the
+    // complete corpus while preserving the same UI contract and slider.
+    const local = await fetchLocalGraph(wanted, signal)
+    if (local) return local
     const seeds = await randomTitles(Math.min(Math.max(5, Math.ceil(wanted / 8)), 50), signal)
     const queue = [...new Map(seeds.map((title) => [titleId(title), title])).values()]
     const queued = new Set(queue.map(titleId))
