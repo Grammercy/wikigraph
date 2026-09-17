@@ -22,6 +22,7 @@ import { pipeline } from "node:stream/promises";
 const DUMP_URL = "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2";
 const DUMP_NAME = "enwiki-latest-pages-articles-multistream.xml.bz2";
 const MANIFEST_NAME = "manifest.json";
+const SAMPLE_LIMIT = 500;
 
 function defaultDataDir() {
   if (process.env.WIKIGRAPH_DATA_DIR) return resolve(process.env.WIKIGRAPH_DATA_DIR);
@@ -156,6 +157,7 @@ async function buildIndex({ input, limit = Infinity, dryRun = false } = {}) {
   const writer = createWriteStream(partial, { flags: "wx" });
   const reader = createInterface({ input: createReadStream(source), crlfDelay: Infinity });
   let records = 0; let malformed = 0; let bytes = 0;
+  const sample = [];
   try {
     for await (const line of reader) {
       if (!line.trim()) continue;
@@ -178,10 +180,18 @@ async function buildIndex({ input, limit = Infinity, dryRun = false } = {}) {
       const serialized = `${JSON.stringify(indexed)}\n`;
       if (!writer.write(serialized)) await new Promise((resolveWrite) => writer.once("drain", resolveWrite));
       bytes += Buffer.byteLength(serialized); records += 1;
+      sample.push(indexed);
+      sample.sort((a, b) => stableHash(a.id) - stableHash(b.id));
+      if (sample.length > SAMPLE_LIMIT) sample.pop();
     }
     await new Promise((resolveWrite, rejectWrite) => writer.end((error) => error ? rejectWrite(error) : resolveWrite()));
     renameSync(partial, output);
-    const manifest = { type: "wikigraph-jsonl", source, output: "index/articles.jsonl", records, malformed, bytes, completedAt: new Date().toISOString() };
+    const sampleGraph = buildSampleGraph(sample);
+    const sampleOutput = join(p.index, "sample.json");
+    const samplePartial = `${sampleOutput}.part-${process.pid}`;
+    writeFileSync(samplePartial, `${JSON.stringify(sampleGraph)}\n`);
+    renameSync(samplePartial, sampleOutput);
+    const manifest = { type: "wikigraph-jsonl", source, output: "index/articles.jsonl", sample: "index/sample.json", records, malformed, bytes, completedAt: new Date().toISOString() };
     writeFileSync(join(p.index, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
     console.log(`Indexed ${records.toLocaleString()} articles (${formatBytes(bytes)}) at ${output}`);
     if (malformed) console.warn(`Skipped ${malformed.toLocaleString()} malformed input lines.`);
@@ -189,6 +199,30 @@ async function buildIndex({ input, limit = Infinity, dryRun = false } = {}) {
     writer.destroy();
     throw error;
   }
+}
+
+function stableHash(value) {
+  let hash = 2166136261;
+  for (const character of String(value)) hash = Math.imul(hash ^ character.codePointAt(0), 16777619);
+  return hash >>> 0;
+}
+
+function articleKey(value) {
+  return String(value ?? "").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+}
+
+function buildSampleGraph(records) {
+  const byRef = new Map(records.flatMap((article) => [[articleKey(article.id), article.id], [articleKey(article.title), article.id]]));
+  const edgeKeys = new Set();
+  const links = records.flatMap((article) => (Array.isArray(article.links) ? article.links : []).flatMap((target) => {
+    const targetId = byRef.get(articleKey(typeof target === "object" && target ? target.id ?? target.title : target));
+    if (!targetId || targetId === article.id) return [];
+    const edgeKey = `${article.id}\u0000${targetId}`;
+    if (edgeKeys.has(edgeKey)) return [];
+    edgeKeys.add(edgeKey);
+    return [{ source: article.id, target: targetId }];
+  }));
+  return { nodes: records.map(({ links: _links, ...article }) => article), links };
 }
 
 function optionValue(name) {

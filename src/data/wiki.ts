@@ -54,6 +54,11 @@ async function fetchLocalGraph(count: number, signal?: AbortSignal): Promise<Wik
   if (!response.ok) throw new Error(`Local Wikipedia index returned HTTP ${response.status}`)
   const graph = await response.json() as unknown
   if (!isWikiGraph(graph)) throw new Error('Local Wikipedia index returned an invalid graph')
+  // The local server uses a tiny fallback payload while an index is being
+  // built. Treat that as unavailable so the live API remains the next source
+  // of truth instead of mislabeling synthetic edges as Wikipedia data.
+  const metadata = graph as WikiGraph & { indexed?: boolean }
+  if (metadata.source === 'fallback' || metadata.indexed === false) return null
   return { ...graph, source: 'wikipedia' }
 }
 

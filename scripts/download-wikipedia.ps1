@@ -7,28 +7,33 @@
   the repository, and refuses a C: destination unless -AllowSystemDrive is
   explicitly supplied.  The dump is large (many gigabytes), so leave enough
   free space for both the compressed source and the extracted/indexed data.
+  The Node helper owns the download/resume logic so this PowerShell wrapper
+  behaves the same as `npm run wiki:download`.
 #>
 [CmdletBinding()]
 param(
   [string]$DataRoot = $(if ($env:WIKIGRAPH_DATA_DIR) { $env:WIKIGRAPH_DATA_DIR } else { 'D:\WikiGraphData' }),
-  [switch]$AllowSystemDrive
+  [switch]$AllowSystemDrive,
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
-$dumpName = 'enwiki-latest-pages-articles-multistream.xml.bz2'
-$uri = "https://dumps.wikimedia.org/enwiki/latest/$dumpName"
 $root = [IO.Path]::GetFullPath($DataRoot)
 $drive = [IO.Path]::GetPathRoot($root)
 if ($drive -eq 'C:\' -and -not $AllowSystemDrive) {
   throw "Refusing to store a Wikipedia dump on C:. Choose a D: (or other external) path with -DataRoot."
 }
-New-Item -ItemType Directory -Force -Path $root | Out-Null
-$destination = Join-Path $root $dumpName
-if (Test-Path -LiteralPath $destination) {
-  throw "Destination already exists: $destination. Remove it or choose another -DataRoot."
+$oldDataRoot = $env:WIKIGRAPH_DATA_DIR
+$oldAllow = $env:WIKIGRAPH_ALLOW_SYSTEM_DRIVE
+$env:WIKIGRAPH_DATA_DIR = $root
+if ($AllowSystemDrive) { $env:WIKIGRAPH_ALLOW_SYSTEM_DRIVE = '1' }
+try {
+  $downloadArgs = @('download')
+  if ($DryRun) { $downloadArgs += '--dry-run' }
+  & node (Join-Path $PSScriptRoot 'wiki-data.mjs') @downloadArgs
+  if ($LASTEXITCODE -ne 0) { throw "Wikipedia download failed (exit code $LASTEXITCODE)." }
 }
-
-Write-Host "Downloading $uri"
-Write-Host "Destination: $destination"
-Start-BitsTransfer -Source $uri -Destination $destination -DisplayName 'WikiGraph Wikipedia dump'
-Write-Host "Download complete. Keep the dump outside Git and use an external index for the app."
+finally {
+  if ($null -eq $oldDataRoot) { Remove-Item Env:WIKIGRAPH_DATA_DIR -ErrorAction SilentlyContinue } else { $env:WIKIGRAPH_DATA_DIR = $oldDataRoot }
+  if ($null -eq $oldAllow) { Remove-Item Env:WIKIGRAPH_ALLOW_SYSTEM_DRIVE -ErrorAction SilentlyContinue } else { $env:WIKIGRAPH_ALLOW_SYSTEM_DRIVE = $oldAllow }
+}

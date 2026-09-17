@@ -26,6 +26,22 @@ npm run wiki:download
 
 Set `WIKIGRAPH_DATA_DIR` to another absolute HDD path when needed. Downloads resume through a `.part` file, checking ETag/Last-Modified and Content-Range before appending when the mutable `latest` URL changes. A small `manifest.json` is written only after completion. The app continues to use the bounded public API until a local index service is connected; the dump itself is never checked into Git.
 
+To build and serve a dump-backed corpus, run the streaming pipeline on D: (the
+parse step can take hours for the full snapshot):
+
+```powershell
+npm run wiki:download
+npm run wiki:parse
+npm run wiki:index
+$env:WIKIGRAPH_DATA_DIR = 'D:\WikiGraphData'
+npm run wiki:serve
+```
+
+Then restart Vite with `VITE_WIKIGRAPH_INDEX_URL=http://127.0.0.1:8787/api/graph`.
+The browser intentionally samples at most 500 articles per view so the force
+layout stays interactive; the complete English corpus remains on disk and
+queryable by the local service.
+
 ## Run locally
 
 Requirements: Node.js 18+.

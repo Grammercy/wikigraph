@@ -44,7 +44,12 @@ def child_text(element: ET.Element, name: str) -> str:
 
 def normalize_title(raw: str) -> str | None:
     title = " ".join(raw.replace("_", " ").split()).strip()
-    if not title or ":" in title:
+    if not title:
+        return None
+    # Main-namespace article titles may legitimately contain a colon. Only
+    # discard a colon-prefixed target when its prefix is a known non-article
+    # namespace (File:, Category:, Template:, and friends).
+    if ":" in title and title.split(":", 1)[0].casefold() in IGNORED_PREFIXES:
         return None
     return title[0].upper() + title[1:]
 
@@ -54,7 +59,7 @@ def extract_links(wikitext: str) -> list[str]:
     seen: set[str] = set()
     for match in LINK_RE.finditer(wikitext):
         title = normalize_title(match.group(1))
-        if title is None or title.casefold() in IGNORED_PREFIXES or title.casefold().startswith("#"):
+        if title is None or title.casefold().startswith("#"):
             continue
         if title.casefold() in {"current", "main page"}:
             # Keep Main Page if present; this guard only avoids parser artifacts.

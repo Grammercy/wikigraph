@@ -42,9 +42,11 @@ node .\scripts\wiki-data.mjs index --input D:\WikiGraphData\articles.jsonl --lim
 
 It writes `D:\WikiGraphData\index\articles.jsonl` and a small manifest using
 an atomic `.part-*` file. Existing completed indexes are never overwritten.
-This format is intentionally streamable by the local graph service; converting
-the compressed Wikimedia XML into normalized JSONL remains a separate,
-dump-aware step because Node's built-in modules do not include an XML parser.
+The command also writes a small deterministic `index/sample.json` (up to 500
+articles) so the local service can answer its first request without scanning
+the full corpus. This format is intentionally streamable by the local graph
+service; converting the compressed Wikimedia XML into normalized JSONL is done
+by the dependency-free parser below.
 
 ### Convert the dump to JSONL
 
@@ -79,7 +81,8 @@ npm run wiki:serve
 ```
 
 Set `VITE_WIKIGRAPH_INDEX_URL=http://127.0.0.1:8787/api/graph` before starting
-Vite. The service reads `D:\WikiGraphData\index.json` when present, samples
-deterministically up to the requested slider count, and exposes `/health`.
+Vite. The service reads either `D:\WikiGraphData\index.json` or the JSONL
+index at `D:\WikiGraphData\index\articles.jsonl`, samples deterministically
+up to the requested slider count, and exposes `/health`.
 Without an index it serves a tiny deterministic graph for endpoint testing;
 it never downloads, parses raw XML, or loads the full corpus into the browser.

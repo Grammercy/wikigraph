@@ -112,6 +112,8 @@ button, select { -webkit-tap-highlight-color: transparent; }
 .inspector-stat b { color: #254fef; }
 .inspector-degree { display: flex; justify-content: space-between; gap: 12px; color: #73777f; font: 10px 'DM Mono'; padding-top: 10px; }
 .inspector-degree b { color: #555c68; }
+.inspector-size { border-top: 1px solid #e7e9ed; margin-top: 11px; padding-top: 11px; display: flex; justify-content: space-between; color: #73777f; font: 10px 'DM Mono'; }
+.inspector-size b { color: #555c68; font-weight: 500; }
 .related { border-top: 1px solid #e7e9ed; margin-top: 14px; padding-top: 12px; }
 .related .field-label { margin-bottom: 8px; }
 .related ul { margin: 0; padding: 0; list-style: none; color: #555c68; font-size: 11px; line-height: 1.55; }
