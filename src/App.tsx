@@ -121,7 +121,7 @@ export default function App() {
       setSelectedId(null)
       setHoveredId(null)
       if (next.source === 'fallback') setError('Wikipedia is unavailable — showing a local demo graph (up to 51 articles).')
-      else if (amount > 500 && usesLocalCorpus && next.local !== true) setError('The local Wikipedia index is still building — showing a 500-article preview until its tiers are ready.')
+      else if (amount > 500 && usesLocalCorpus && next.local !== true) setError('The local Wikipedia index is still building — showing a 1,000-article public-API preview until its tiers are ready.')
       else if (amount > 500 && !usesLocalCorpus) setError('The hosted public API is limited to 500 articles. Run the local D: host for the full indexed corpus.')
     } catch (cause) {
       if (controller.signal.aborted || (cause instanceof DOMException && cause.name === 'AbortError')) return
@@ -184,6 +184,7 @@ export default function App() {
     }),
     links: graph.links,
   }), [graph, showLabels])
+  const averageLinks = graph.nodes.length ? graph.links.length / graph.nodes.length : 0
   const statusLabel = loading ? 'FETCHING' : graph.source === 'fallback' ? 'DEMO DATA' : graph.nodes.length ? 'WIKIPEDIA' : 'READY'
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
@@ -265,7 +266,7 @@ export default function App() {
         <div className="panel-footer">Drag to explore <span>·</span> Scroll to zoom</div>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections{corpusStats?.articles && <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></>}{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
+        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{corpusStats?.articles ? <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></> : null}{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
         <GraphCanvas ref={canvasRef} graph={graphForCanvas} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}

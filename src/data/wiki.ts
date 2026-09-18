@@ -5,11 +5,25 @@ const API = 'https://en.wikipedia.org/w/api.php'
 const REQUEST_TIMEOUT = 12_000
 const MAX_BATCH = 50
 const PUBLIC_MAX_NODES = 500
-const MAX_LINKS_PER_PAGE = 45
-// Keep the browser crawl deliberately small. Each page already contributes a
-// useful sample of outgoing links; following every continuation quickly trips
-// Wikimedia's anonymous request throttles when a slider is moved repeatedly.
+const LOCAL_API_PREVIEW_MAX_NODES = 1_000
+const PUBLIC_CANDIDATE_MAX_NODES = 1_500
+const MAX_LINKS_PER_PAGE = 500
+const CANDIDATE_MULTIPLIER = 3
+// Keep the browser crawl bounded while retaining enough of each page's local
+// neighbourhood to form a link-dense induced subgraph. A thin 45-link sample
+// tends to produce a tree after filtering to the requested node count.
 const MAX_LINK_CONTINUATIONS = 0
+
+// Random Wikipedia pages are frequently leaves or tiny disjoint topics. Each
+// cluster below starts from a well-connected neighbourhood, then the crawler
+// still adds random titles so repeated generations do not become identical.
+const DENSE_SEED_CLUSTERS = [
+  ['Science', 'Physics', 'Mathematics', 'Chemistry', 'Biology', 'Astronomy', 'Earth', 'Medicine', 'Technology', 'Engineering', 'Computer science', 'Artificial intelligence'],
+  ['History', 'Geography', 'Politics', 'Economics', 'Society', 'Culture', 'Philosophy', 'Religion', 'Language', 'Education', 'Law', 'Government'],
+  ['Art', 'Music', 'Literature', 'Film', 'Architecture', 'Theatre', 'Painting', 'Sculpture', 'Dance', 'Photography', 'Design', 'Poetry'],
+  ['Internet', 'World Wide Web', 'Software', 'Programming language', 'Data science', 'Machine learning', 'Robotics', 'Computer network', 'Database', 'Information technology', 'Cryptography', 'Video game'],
+  ['Association football', 'Football', 'Olympic Games', 'Sport', 'Basketball', 'Baseball', 'Tennis', 'Cricket', 'Rugby football', 'Athletics', 'Swimming', 'Motorsport'],
+]
 
 interface ApiPage {
   pageid?: number
@@ -109,8 +123,28 @@ async function request(params: Record<string, string>, signal?: AbortSignal): Pr
 }
 
 async function randomTitles(count: number, signal?: AbortSignal): Promise<string[]> {
-  const data = await request({ action: 'query', list: 'random', rnnamespace: '0', rnlimit: String(Math.min(count, 50)) }, signal)
-  return (data.query?.random ?? []).map((item) => item.title ? titleKey(item.title) : '').filter(Boolean)
+  try {
+    const data = await request({ action: 'query', list: 'random', rnnamespace: '0', rnlimit: String(Math.min(count, 50)) }, signal)
+    return (data.query?.random ?? []).map((item) => item.title ? titleKey(item.title) : '').filter(Boolean)
+  } catch (error) {
+    if (signal?.aborted) throw error
+    return []
+  }
+}
+
+function denseSeedTitles(randomTitlesFromApi: string[], maxSeeds: number): string[] {
+  // Seed every broad neighbourhood in a round-robin order. That gives the
+  // density selector several genuinely connected pockets to choose from,
+  // instead of betting the whole request on one occasionally sparse topic.
+  const clusterSeeds: string[] = []
+  const start = Math.floor(Math.random() * DENSE_SEED_CLUSTERS.length)
+  for (let index = 0; index < maxSeeds; index += 1) {
+    const cluster = DENSE_SEED_CLUSTERS[(start + index) % DENSE_SEED_CLUSTERS.length]
+    const item = cluster[Math.floor(index / DENSE_SEED_CLUSTERS.length)]
+    if (item) clusterSeeds.push(item)
+  }
+  const randomTail = randomTitlesFromApi.slice(0, Math.min(8, Math.max(0, maxSeeds - clusterSeeds.length)))
+  return [...new Set([...clusterSeeds, ...randomTail])].slice(0, Math.min(maxSeeds, 50))
 }
 
 interface PageBatchResult {
@@ -119,50 +153,114 @@ interface PageBatchResult {
 }
 
 /**
- * Return a deterministic edge-backed order for pages discovered by the
- * public crawl. Random seeds are useful for coverage, but they must not leak
- * into the rendered map as isolated dots when their link neighbourhood was
- * not fetched. Components are traversed through undirected adjacency so the
- * directed Wikipedia links still produce a connected visual neighbourhood.
+ * Pick a link-dense neighbourhood instead of taking the first breadth-first
+ * pages that happen to be discovered. The public API crawl often finds a
+ * dozen plausible neighbours for every page; selecting the densest connected
+ * pocket keeps the map useful and targets at least two internal links per
+ * article on average whenever the fetched candidates can support it.
  */
-function connectedPageOrder(pages: Map<string, ApiPage>, rawLinks: Array<[string, string]>): string[] {
+function linkDensePageOrder(pages: Map<string, ApiPage>, rawLinks: Array<[string, string]>, limit: number): string[] {
   const titles = [...pages.keys()]
   const byTitle = new Map(titles.map((title) => [titleId(title), title]))
-  const neighbors = new Map(titles.map((title) => [title, new Set<string>()]))
+  const outgoing = new Map(titles.map((title) => [title, new Set<string>()]))
+  const incoming = new Map(titles.map((title) => [title, new Set<string>()]))
   for (const [source, target] of rawLinks) {
     const sourceTitle = byTitle.get(titleId(source))
     const targetTitle = byTitle.get(titleId(target))
     if (!sourceTitle || !targetTitle || sourceTitle === targetTitle) continue
-    neighbors.get(sourceTitle)?.add(targetTitle)
-    neighbors.get(targetTitle)?.add(sourceTitle)
+    outgoing.get(sourceTitle)?.add(targetTitle)
+    incoming.get(targetTitle)?.add(sourceTitle)
   }
-  const starts = titles
-    .filter((title) => (neighbors.get(title)?.size ?? 0) > 0)
-    .sort((a, b) => titleId(a).localeCompare(titleId(b)) || a.localeCompare(b))
-  const order: string[] = []
-  const seen = new Set<string>()
-  for (const start of starts) {
-    if (seen.has(start)) continue
-    const queue = [start]
-    seen.add(start)
-    const firstNeighbor = [...(neighbors.get(start) ?? [])]
-      .filter((title) => !seen.has(title))
-      .sort((a, b) => titleId(a).localeCompare(titleId(b)) || a.localeCompare(b))[0]
-    if (firstNeighbor) {
-      seen.add(firstNeighbor)
-      queue.push(firstNeighbor)
+
+  const wanted = Math.min(Math.max(1, limit), titles.length)
+  const degree = (title: string) => (outgoing.get(title)?.size ?? 0) + (incoming.get(title)?.size ?? 0)
+  const compareTitles = (a: string, b: string) => titleId(a).localeCompare(titleId(b)) || a.localeCompare(b)
+  // Peel the lowest-outlink pages first. This is a directed k-core style
+  // selection: every removal updates the pages that pointed at it, so the
+  // surviving set maximizes internal outgoing links instead of preserving a
+  // breadth-first tree by accident.
+  const core = new Set(titles)
+  const internalOut = new Map(titles.map((title) => [title, [...(outgoing.get(title) ?? [])].filter((target) => core.has(target)).length]))
+  while (core.size > wanted) {
+    let remove = ''
+    for (const candidate of core) {
+      if (!remove) {
+        remove = candidate
+        continue
+      }
+      const candidateOut = internalOut.get(candidate) ?? 0
+      const removeOut = internalOut.get(remove) ?? 0
+      const candidateDegree = degree(candidate)
+      const removeDegree = degree(remove)
+      if (candidateOut < removeOut
+        || (candidateOut === removeOut && candidateDegree < removeDegree)
+        || (candidateOut === removeOut && candidateDegree === removeDegree && compareTitles(candidate, remove) > 0)) remove = candidate
     }
-    while (queue.length) {
-      const current = queue.shift()!
-      order.push(current)
-      const next = [...(neighbors.get(current) ?? [])]
-        .filter((title) => !seen.has(title))
-        .sort((a, b) => titleId(a).localeCompare(titleId(b)) || a.localeCompare(b))
-      for (const title of next) {
-        seen.add(title)
-        queue.push(title)
+    if (!remove) break
+    core.delete(remove)
+    for (const source of incoming.get(remove) ?? []) {
+      if (core.has(source)) internalOut.set(source, Math.max(0, (internalOut.get(source) ?? 0) - 1))
+    }
+  }
+
+  // The peel above keeps the strongest local core, but ties can leave a
+  // slightly less dense exact-size pocket than another nearby combination.
+  // Make a bounded series of improving swaps while preserving the requested
+  // article count. This stays bounded by the public candidate pool and
+  // directly optimizes the number of links that remain inside the selection.
+  const incidentLinks = (title: string, set: Set<string>) => {
+    let total = 0
+    for (const target of outgoing.get(title) ?? []) if (set.has(target)) total += 1
+    for (const source of incoming.get(title) ?? []) if (set.has(source)) total += 1
+    return total
+  }
+  const selected = new Set(core)
+  const excluded = new Set(titles.filter((title) => !selected.has(title)))
+  for (let pass = 0; pass < Math.min(16, wanted); pass += 1) {
+    let bestCandidate = ''
+    let bestRemove = ''
+    let bestDelta = 0
+    for (const candidate of excluded) {
+      for (const remove of selected) {
+        let added = 0
+        for (const target of outgoing.get(candidate) ?? []) if (selected.has(target) && target !== remove) added += 1
+        for (const source of incoming.get(candidate) ?? []) if (selected.has(source) && source !== remove) added += 1
+        const delta = added - incidentLinks(remove, selected)
+        if (delta > bestDelta || (delta === bestDelta && delta > 0 && (!bestCandidate || compareTitles(candidate, bestCandidate) < 0))) {
+          bestCandidate = candidate
+          bestRemove = remove
+          bestDelta = delta
+        }
       }
     }
+    if (!bestCandidate || bestDelta <= 0) break
+    selected.delete(bestRemove)
+    selected.add(bestCandidate)
+    excluded.delete(bestCandidate)
+    excluded.add(bestRemove)
+  }
+
+  // Render the retained core as one connected walk for a coherent first view.
+  const remaining = new Set(selected)
+  const order: string[] = []
+  while (order.length < selected.size && remaining.size) {
+    let best = ''
+    let bestConnection = -1
+    let bestDegree = -1
+    for (const candidate of remaining) {
+      let connection = 0
+      for (const target of outgoing.get(candidate) ?? []) if (selected.has(target) && !remaining.has(target)) connection += 1
+      for (const source of incoming.get(candidate) ?? []) if (selected.has(source) && !remaining.has(source)) connection += 1
+      const candidateDegree = degree(candidate)
+      if (connection > bestConnection || (connection === bestConnection && candidateDegree > bestDegree) || (connection === bestConnection && candidateDegree === bestDegree && (!best || compareTitles(candidate, best) < 0))) {
+        best = candidate
+        bestConnection = connection
+        bestDegree = candidateDegree
+      }
+    }
+    if (!best) break
+    remaining.delete(best)
+    order.push(best)
   }
   return order
 }
@@ -207,15 +305,22 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
     // indexed. Never turn that temporary state into a huge public-API crawl.
     // The public API remains intentionally bounded and is only a preview until
     // the local tiers become available.
-    const publicWanted = Math.min(wanted, PUBLIC_MAX_NODES)
-    const seeds = await randomTitles(Math.min(Math.max(5, Math.ceil(publicWanted / 8)), 50), signal)
+    const publicWanted = Math.min(wanted, LOCAL_INDEX_URL ? LOCAL_API_PREVIEW_MAX_NODES : PUBLIC_MAX_NODES)
+    // Over-fetch a bounded candidate pool, then choose a dense neighbourhood.
+    // A 50-article request therefore has enough context to avoid returning a
+    // thin tree even when the random seeds land in unrelated topics.
+    const candidateTarget = Math.min(PUBLIC_CANDIDATE_MAX_NODES, Math.max(publicWanted, publicWanted * CANDIDATE_MULTIPLIER))
+    const randomSeeds = await randomTitles(Math.min(Math.max(5, Math.ceil(candidateTarget / 32)), 12), signal)
+    const seeds = denseSeedTitles(randomSeeds, Math.min(Math.max(12, Math.ceil(candidateTarget / 8)), 50))
     const queue = [...new Map(seeds.map((title) => [titleId(title), title])).values()]
     const queued = new Set(queue.map(titleId))
+    const frontierScore = new Map<string, number>()
     const aliases = new Map<string, string>()
     const seen = new Set<string>()
     const pages = new Map<string, ApiPage>()
     const rawLinks: Array<[string, string]> = []
-    while (queue.length && seen.size < publicWanted) {
+    while (queue.length && seen.size < candidateTarget) {
+      queue.sort((a, b) => (frontierScore.get(titleId(b)) ?? 0) - (frontierScore.get(titleId(a)) ?? 0) || titleId(a).localeCompare(titleId(b)))
       const batch = queue.splice(0, MAX_BATCH).filter((title) => {
         queued.delete(titleId(title))
         return !seen.has(titleId(title))
@@ -235,21 +340,39 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
           const targetCanonical = aliases.get(titleId(target)) ?? target
           const targetId = titleId(targetCanonical)
           rawLinks.push([source, targetCanonical])
-          if (!seen.has(targetId) && !queued.has(targetId) && queue.length + seen.size < publicWanted * 2) {
+          frontierScore.set(targetId, (frontierScore.get(targetId) ?? 0) + 1)
+          if (!seen.has(targetId) && !queued.has(targetId) && queue.length + seen.size < candidateTarget * 2) {
             queue.push(targetCanonical)
             queued.add(targetId)
           }
         }
       }
     }
-    const orderedTitles = connectedPageOrder(pages, rawLinks)
+    // Resolve aliases after the complete crawl. A page can link to a redirect
+    // before the batch containing that redirect's canonical title is fetched;
+    // canonicalizing only at enqueue time silently drops those edges later.
+    const resolveAlias = (value: string) => {
+      let current = titleKey(value)
+      const visited = new Set<string>()
+      while (!visited.has(titleId(current))) {
+        visited.add(titleId(current))
+        const next = aliases.get(titleId(current))
+        if (!next) break
+        current = titleKey(next)
+      }
+      return current
+    }
+    const canonicalPages = new Map<string, ApiPage>()
+    for (const [title, page] of pages) canonicalPages.set(resolveAlias(title), page)
+    const canonicalLinks = rawLinks.map(([source, target]) => [resolveAlias(source), resolveAlias(target)] as [string, string])
+    const orderedTitles = linkDensePageOrder(canonicalPages, canonicalLinks, publicWanted)
     const nodes: WikiNode[] = orderedTitles.slice(0, publicWanted).map((title) => {
-      const page = pages.get(title)!
+      const page = canonicalPages.get(title)!
       return { id: title, title, url: articleUrl(title), extract: page.extract, byteLength: page.length }
     })
     const canonicalById = new Map(nodes.map((node) => [titleId(node.id), node.id]))
     const uniqueLinks = new Map<string, [string, string]>()
-    for (const [source, target] of rawLinks) {
+    for (const [source, target] of canonicalLinks) {
       const sourceId = canonicalById.get(titleId(source))
       const targetId = canonicalById.get(titleId(target))
       if (sourceId && targetId && sourceId !== targetId) {

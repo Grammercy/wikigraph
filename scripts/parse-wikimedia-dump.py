@@ -95,8 +95,24 @@ def write_checkpoint(path: Path, pages: int, records: int, skipped: int, output:
     temporary.replace(path)
 
 
+def truncate_jsonl_records(path: Path, records: int) -> None:
+    """Trim a partial JSONL file to the last checkpointed record."""
+    if records <= 0:
+        with path.open("r+b") as stream:
+            stream.truncate(0)
+        return
+    offset = 0
+    with path.open("rb") as stream:
+        for _ in range(records):
+            if not stream.readline():
+                raise SystemExit(f"Partial output has fewer than {records:,} checkpointed records: {path}")
+            offset = stream.tell()
+    with path.open("r+b") as stream:
+        stream.truncate(offset)
+
+
 def parse_dump(source: Path, output: Path, limit: int | None, progress_every: int,
-               checkpoint: Path, dry_run: bool, allow_system_drive: bool) -> None:
+               checkpoint: Path, dry_run: bool, allow_system_drive: bool, resume: bool) -> None:
     source = assert_external(source, allow_system_drive)
     output = assert_external(output, allow_system_drive)
     checkpoint = assert_external(checkpoint, allow_system_drive)
@@ -104,6 +120,7 @@ def parse_dump(source: Path, output: Path, limit: int | None, progress_every: in
         print(f"Would stream: {source}")
         print(f"Would write:  {output}")
         print(f"Article limit: {limit if limit is not None else 'unlimited'}")
+        print(f"Resume partial output: {'yes' if resume else 'no'}")
         return
     if not source.is_file():
         raise SystemExit(f"Dump not found: {source}\nRun: node scripts/wiki-data.mjs download")
@@ -113,12 +130,30 @@ def parse_dump(source: Path, output: Path, limit: int | None, progress_every: in
         raise SystemExit(f"Output already exists: {output}\nMove it aside before rebuilding; completed indexes are never overwritten automatically.")
     temporary = output.with_name(output.name + f".part-{os.getpid()}")
     pages = records = skipped = 0
+    resume_pages = 0
+    if resume and checkpoint.exists():
+        try:
+            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+            saved_output = Path(saved.get("output", "")).resolve()
+            candidates = sorted(output.parent.glob(f"{output.name}.part-*"), key=lambda item: item.stat().st_mtime, reverse=True)
+            if saved_output == output and candidates:
+                temporary = candidates[0]
+                resume_pages = max(0, int(saved.get("pagesRead", 0)))
+                records = max(0, int(saved.get("recordsWritten", 0)))
+                skipped = max(0, int(saved.get("pagesSkipped", 0)))
+                truncate_jsonl_records(temporary, records)
+                print(f"Resuming at page {resume_pages:,} with {records:,} articles from {temporary}", file=sys.stderr, flush=True)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise SystemExit(f"Unable to resume from {checkpoint}: {error}") from error
     try:
-        with bz2.open(source, "rb") as compressed, temporary.open("w", encoding="utf-8", newline="\n") as out:
+        with bz2.open(source, "rb") as compressed, temporary.open("a", encoding="utf-8", newline="\n") as out:
             for _, page in ET.iterparse(compressed, events=("end",)):
                 if local_name(page.tag) != "page":
                     continue
                 pages += 1
+                if pages <= resume_pages:
+                    page.clear()
+                    continue
                 namespace = child_text(page, "ns").strip()
                 title = normalize_title(child_text(page, "title"))
                 redirect = any(local_name(child.tag) == "redirect" for child in page)
@@ -147,7 +182,9 @@ def parse_dump(source: Path, output: Path, limit: int | None, progress_every: in
                 page.clear()
                 if pages % progress_every == 0:
                     print(f"pages={pages:,} records={records:,} skipped={skipped:,}", file=sys.stderr, flush=True)
+                    out.flush()
                     write_checkpoint(checkpoint, pages, records, skipped, output)
+            out.flush()
         temporary.replace(output)
         write_checkpoint(checkpoint, pages, records, skipped, output)
         print(f"Parsed {records:,} articles ({skipped:,} skipped) to {output}")
@@ -165,6 +202,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, default=None, help="checkpoint JSON path")
     parser.add_argument("--dry-run", action="store_true", help="show paths and exit without reading or writing")
     parser.add_argument("--allow-system-drive", action="store_true", help="explicitly allow C: paths for tiny test fixtures")
+    parser.add_argument("--resume", action="store_true", help="resume the newest partial output from its checkpoint")
     args = parser.parse_args()
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
@@ -174,7 +212,7 @@ def main() -> None:
     source = args.input or root / DUMP_NAME
     output = args.output or root / "articles.jsonl"
     checkpoint = args.checkpoint or output.with_suffix(".checkpoint.json")
-    parse_dump(source, output, args.limit, args.progress_every, checkpoint, args.dry_run, args.allow_system_drive)
+    parse_dump(source, output, args.limit, args.progress_every, checkpoint, args.dry_run, args.allow_system_drive, args.resume)
 
 
 if __name__ == "__main__":

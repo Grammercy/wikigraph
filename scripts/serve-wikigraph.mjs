@@ -15,7 +15,20 @@ const tiersDir = resolve(dataRoot, 'index', 'tiers')
 const parserCheckpoint = resolve(dataRoot, 'articles.checkpoint.json')
 const port = Number(process.env.WIKIGRAPH_PORT || 8787)
 const webRoot = resolve(process.env.WIKIGRAPH_WEB_ROOT || 'dist')
-const fallback = { nodes: [{ id: 'Physics', title: 'Physics', url: 'https://en.wikipedia.org/wiki/Physics' }, { id: 'Mathematics', title: 'Mathematics', url: 'https://en.wikipedia.org/wiki/Mathematics' }], links: [{ source: 'Physics', target: 'Mathematics' }] }
+const fallback = {
+  nodes: [
+    { id: 'Physics', title: 'Physics', url: 'https://en.wikipedia.org/wiki/Physics' },
+    { id: 'Mathematics', title: 'Mathematics', url: 'https://en.wikipedia.org/wiki/Mathematics' },
+    { id: 'Biology', title: 'Biology', url: 'https://en.wikipedia.org/wiki/Biology' },
+    { id: 'Chemistry', title: 'Chemistry', url: 'https://en.wikipedia.org/wiki/Chemistry' },
+  ],
+  links: [
+    { source: 'Physics', target: 'Mathematics' }, { source: 'Physics', target: 'Biology' },
+    { source: 'Mathematics', target: 'Physics' }, { source: 'Mathematics', target: 'Chemistry' },
+    { source: 'Biology', target: 'Chemistry' }, { source: 'Biology', target: 'Physics' },
+    { source: 'Chemistry', target: 'Physics' }, { source: 'Chemistry', target: 'Mathematics' },
+  ],
+}
 let jsonlCache = null
 let corpusStatsCache = null
 let tierManifestCache = null
@@ -115,6 +128,58 @@ function connectedOrder(nodes, links) {
   return ordered.filter((id) => byId.has(id))
 }
 
+// Prefer a compact link-rich pocket over the first connected prefix. This is
+// intentionally bounded for large tiers: small and medium requests are the
+// interactive path where a thin tree is most noticeable, while very large
+// maps retain their precomputed tier order to avoid rebuilding millions of
+// adjacency entries on every slider change.
+function linkDenseOrder(nodes, links, count) {
+  const wanted = Math.min(Math.max(1, count), nodes.length)
+  if (wanted > 5_000 || nodes.length <= wanted) return nodes.map((node) => node.id)
+  const score = new Map(nodes.map((node) => [node.id, { out: 0, in: 0 }]))
+  for (const edge of links) {
+    const source = String(edge.source); const target = String(edge.target)
+    const sourceScore = score.get(source); const targetScore = score.get(target)
+    if (!sourceScore || !targetScore || source === target) continue
+    sourceScore.out += 1
+    targetScore.in += 1
+  }
+  const poolSize = Math.min(nodes.length, Math.max(wanted * 8, wanted + 100))
+  const poolNodes = [...nodes].sort((a, b) => {
+    const left = score.get(a.id) || { out: 0, in: 0 }
+    const right = score.get(b.id) || { out: 0, in: 0 }
+    return (right.out * 2 + right.in) - (left.out * 2 + left.in) || hash(a.id) - hash(b.id) || a.id.localeCompare(b.id)
+  }).slice(0, poolSize)
+  const poolIds = new Set(poolNodes.map((node) => node.id))
+  const outgoing = new Map(poolNodes.map((node) => [node.id, new Set()]))
+  const incoming = new Map(poolNodes.map((node) => [node.id, new Set()]))
+  for (const edge of links) {
+    const source = String(edge.source); const target = String(edge.target)
+    if (!poolIds.has(source) || !poolIds.has(target) || source === target) continue
+    outgoing.get(source)?.add(target)
+    incoming.get(target)?.add(source)
+  }
+  const degree = (id) => (outgoing.get(id)?.size || 0) + (incoming.get(id)?.size || 0)
+  const core = new Set(poolIds)
+  const internalOut = new Map([...core].map((id) => [id, [...(outgoing.get(id) || [])].filter((target) => core.has(target)).length]))
+  while (core.size > wanted) {
+    let remove = ''
+    for (const candidate of core) {
+      if (!remove) { remove = candidate; continue }
+      const candidateOut = internalOut.get(candidate) || 0; const removeOut = internalOut.get(remove) || 0
+      if (candidateOut < removeOut || (candidateOut === removeOut && degree(candidate) < degree(remove)) || (candidateOut === removeOut && degree(candidate) === degree(remove) && candidate > remove)) remove = candidate
+    }
+    if (!remove) break
+    core.delete(remove)
+    for (const source of incoming.get(remove) || []) if (core.has(source)) internalOut.set(source, Math.max(0, (internalOut.get(source) || 0) - 1))
+  }
+  const retainedNodes = poolNodes.filter((node) => core.has(node.id))
+  const retainedLinks = links.filter((edge) => core.has(String(edge.source)) && core.has(String(edge.target)))
+  const connected = connectedOrder(retainedNodes, retainedLinks)
+  const seen = new Set(connected)
+  return [...connected, ...retainedNodes.map((node) => node.id).filter((id) => !seen.has(id))]
+}
+
 function sample(value, count) {
   if (!value || !Array.isArray(value.nodes) || !Array.isArray(value.links)) return null
   const allNodes = normalizedNodes(value)
@@ -128,9 +193,7 @@ function sample(value, count) {
       return source && target && source !== target ? [{ source, target }] : []
     })
     : resolvedEdges(value, allNodes)
-  const order = value.order === 'connected'
-    ? allNodes.map((node) => node.id)
-    : connectedOrder(allNodes, allLinks)
+  const order = linkDenseOrder(allNodes, allLinks, count)
   const chosenIds = new Set(order.slice(0, Math.max(1, count)))
   const nodes = allNodes.filter((node) => chosenIds.has(node.id))
   const links = allLinks.filter((edge) => chosenIds.has(edge.source) && chosenIds.has(edge.target))

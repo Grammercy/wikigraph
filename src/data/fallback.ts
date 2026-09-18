@@ -16,12 +16,21 @@ const ARTICLES = [
 export function buildFallbackGraph(count: number): WikiGraph {
   const size = Math.max(1, Math.min(Math.floor(count) || 1, ARTICLES.length))
   const titles = ARTICLES.slice(0, size)
-  const links = []
-  // Local chain plus longer-range links gives the fallback a few visible clusters.
+  const links: Array<{ source: string; target: string }> = []
+  const edgeKeys = new Set<string>()
+  // The offline graph is intentionally small, but it should still feel like a
+  // knowledge neighbourhood. Two circular neighbours per article guarantee a
+  // two-link average for normal demo sizes instead of presenting a thin chain.
   for (let i = 0; i < size; i += 1) {
-    if (i + 1 < size) links.push({ source: titles[i], target: titles[i + 1] })
-    if (i + 3 < size && i % 2 === 0) links.push({ source: titles[i], target: titles[i + 3] })
-    if (i + 8 < size && i % 5 === 0) links.push({ source: titles[i], target: titles[i + 8] })
+    for (const offset of [1, 2, 4]) {
+      if (size < 2) continue
+      const target = titles[(i + offset) % size]
+      if (target === titles[i]) continue
+      const edgeKey = `${titles[i]}\u0000${target}`
+      if (edgeKeys.has(edgeKey)) continue
+      edgeKeys.add(edgeKey)
+      links.push({ source: titles[i], target })
+    }
   }
   const inDegree = new Map(titles.map((title) => [title, 0]))
   const outDegree = new Map(titles.map((title) => [title, 0]))
