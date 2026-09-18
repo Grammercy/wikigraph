@@ -38,6 +38,7 @@ export type GraphCanvasProps = {
   selectedId?: string | null
   onSelect?: (node: GraphNode) => void
   onHover?: (node: GraphNode | null) => void
+  onSimulationGuard?: () => void
   paused?: boolean
   className?: string
   /** Optional node color resolver, useful when groups are domain-specific. */
@@ -151,7 +152,7 @@ const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
  * (x/y/vx/vy/fx/fy), so callers should treat those fields as simulation state.
  */
 const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
-  { graph, selectedId, onSelect, onHover, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS },
+  { graph, selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS },
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -172,6 +173,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const graphRef = useRef(graph)
   const selectedIdRef = useRef(selectedId)
   const colorResolverRef = useRef(getNodeColor)
+  const simulationGuardRef = useRef(onSimulationGuard)
   const settingsRef = useRef(settings)
   const drawRef = useRef<() => void>(() => undefined)
   const nodeMapRef = useRef<{ graph: GraphData; map: Map<string, GraphNode> } | null>(null)
@@ -180,6 +182,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   graphRef.current = graph
   selectedIdRef.current = selectedId
   colorResolverRef.current = getNodeColor
+  simulationGuardRef.current = onSimulationGuard
   settingsRef.current = settings
   pausedRef.current = paused
 
@@ -438,17 +441,22 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     let framePending = false
     let invalidState = false
     let validationTicks = 0
+    const protectNumerics = largeGraph || settings.linkDistanceScale < 10_000
     sim.on('tick', () => {
-      if (!invalidState && largeGraph && validationTicks < 120) {
+      if (!invalidState && protectNumerics && validationTicks < 120) {
         validationTicks += 1
-        const invalid = graph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy))
+        const numericLimit = 1_000_000
+        const invalid = graph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy)
+          || Math.abs(node.x ?? 0) > numericLimit || Math.abs(node.y ?? 0) > numericLimit
+          || Math.abs(node.vx ?? 0) > numericLimit || Math.abs(node.vy ?? 0) > numericLimit)
         if (invalid) {
           invalidState = true
           sim.stop()
-          invalid.x = Number.isFinite(invalid.x) ? invalid.x : 0
-          invalid.y = Number.isFinite(invalid.y) ? invalid.y : 0
-          invalid.vx = 0
-          invalid.vy = 0
+          invalid.x = Number.isFinite(invalid.x) && Math.abs(invalid.x as number) <= numericLimit ? invalid.x : 0
+          invalid.y = Number.isFinite(invalid.y) && Math.abs(invalid.y as number) <= numericLimit ? invalid.y : 0
+          invalid.vx = Number.isFinite(invalid.vx) && Math.abs(invalid.vx as number) <= numericLimit ? invalid.vx : 0
+          invalid.vy = Number.isFinite(invalid.vy) && Math.abs(invalid.vy as number) <= numericLimit ? invalid.vy : 0
+          simulationGuardRef.current?.()
           drawRef.current()
           return
         }
