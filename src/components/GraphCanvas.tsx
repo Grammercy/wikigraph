@@ -309,9 +309,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       .force('hub-repulsion', hubRepulsion(graph.nodes, largeGraph))
       .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + (largeGraph ? 5 : 10)).iterations(largeGraph ? 1 : 2))
       .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))
-      // Wikipedia links are directed: the source article moves toward its target,
-      // while the target does not receive the spring's equal-and-opposite pull.
-      .force('directed-attraction', directedAttraction(attractionLinks, graph.nodes))
+      // The arrow remains directed in the renderer, but the physical spring is
+      // symmetric: both articles move toward one another for every link.
+      // Applying equal-and-opposite velocity keeps the map stable and prevents
+      // a one-way link from making its target appear artificially anchored.
+      .force('link-attraction', symmetricAttraction(attractionLinks, graph.nodes))
     simulationRef.current = sim
     let framePending = false
     sim.on('tick', () => {
@@ -376,9 +378,28 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   </div>
 })
 
-function directedAttraction(links: GraphLink[], nodes: GraphNode[]) {
+function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
   let resolved: Array<[GraphNode, GraphNode, number]> = []
-  const force = (alpha: number) => { for (const [source, target, weight] of resolved) { if (source.x == null || target.x == null || source.y == null || target.y == null) continue; const dx = target.x - source.x; const dy = target.y - source.y; const distance = Math.hypot(dx, dy) || 1; const strength = Math.min(0.028, 0.007 + distance / 260000) * weight; source.vx = (source.vx ?? 0) + dx / distance * distance * strength * alpha; source.vy = (source.vy ?? 0) + dy / distance * distance * strength * alpha } }
+  const force = (alpha: number) => {
+    for (const [source, target, weight] of resolved) {
+      if (source.x == null || target.x == null || source.y == null || target.y == null) continue
+      const dx = target.x - source.x
+      const dy = target.y - source.y
+      const distance = Math.hypot(dx, dy) || 1
+      const strength = Math.min(0.028, 0.007 + distance / 260000) * weight
+      const pullX = dx / distance * distance * strength * alpha
+      const pullY = dy / distance * distance * strength * alpha
+
+      // Equal and opposite impulses make this a true spring: the source moves
+      // toward the target and the target moves toward the source. Keeping the
+      // same impulse magnitude also preserves momentum when link direction is
+      // only a semantic Wikipedia property rather than a physical constraint.
+      source.vx = (source.vx ?? 0) + pullX
+      source.vy = (source.vy ?? 0) + pullY
+      target.vx = (target.vx ?? 0) - pullX
+      target.vy = (target.vy ?? 0) - pullY
+    }
+  }
   force.initialize = (simulationNodes: GraphNode[]) => {
     const map = new Map(nodes.map((node) => [node.id, node]))
     const candidates = links.flatMap((link) => {
