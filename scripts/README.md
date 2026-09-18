@@ -71,6 +71,26 @@ fixtures, not a full dump. Parsing is a separate pass after download and can
 take a long time because the compressed source must be decompressed and
 scanned sequentially.
 
+### Build progressive graph tiers
+
+After the normalized JSONL exists, build deterministic snapshots for
+progressive loading. The default tiers are 1,000, 5,000, 25,000, and 100,000
+articles; only the largest tier is retained in memory during the scan, and
+each output is committed with an atomic rename:
+
+```powershell
+npm run wiki:tiers
+# or choose a smaller test set:
+node .\scripts\build-wiki-tiers.mjs --tiers 100,500,1000
+```
+
+Outputs are written to `D:\WikiGraphData\index\tiers\<count>.json` with a
+`manifest.json`. Selection uses a stable hash of article IDs, so rebuilding
+the same source produces nested, repeatable tiers instead of a request-order
+dependent sample. These files are external data and must not be committed to
+Git; the browser/API can load them incrementally and warn before selecting a
+large tier.
+
 ## Local API
 
 Start the dependency-free local API after preparing an index:

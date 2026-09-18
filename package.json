@@ -10,6 +10,7 @@
     "wiki:data": "node scripts/wiki-data.mjs status",
     "wiki:download": "node scripts/wiki-data.mjs download",
     "wiki:index": "node scripts/wiki-data.mjs index",
+    "wiki:tiers": "node scripts/build-wiki-tiers.mjs",
     "wiki:parse": "python scripts/parse-wikimedia-dump.py",
     "wiki:serve": "node scripts/serve-wikigraph.mjs"
   },
