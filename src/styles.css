@@ -79,6 +79,7 @@ button, select { -webkit-tap-highlight-color: transparent; }
 .toggle i { display: block; width: 11px; height: 11px; border-radius: 50%; background: #9a9ea6; transition: .2s; }
 .toggle.on { background: #b8c6ff; }
 .toggle.on i { background: #254fef; transform: translateX(13px); }
+.distance-mode-toggle { margin-top: -4px; margin-bottom: 4px; }
 .simulation-settings { margin-top: 17px; border-top: 1px solid #e7e9ed; border-bottom: 1px solid #e7e9ed; padding: 15px 0 17px; }
 .simulation-settings summary { list-style: none; display: flex; justify-content: space-between; align-items: center; color: #555c68; cursor: pointer; font: 500 11px 'Space Grotesk'; }
 .simulation-settings summary::-webkit-details-marker { display: none; }

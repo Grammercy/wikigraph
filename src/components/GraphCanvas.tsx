@@ -68,12 +68,16 @@ export type GraphSimulationSettings = {
   hubForceMax: number
   hubMaxNodes: number
   linkDistanceScale: number
+  /** Exponent used by the link spring: squared by default, optionally cubic. */
+  linkDistanceExponent: 2 | 3
   linkWeightFloor: number
   hubLinkDamping: number
   collisionPadding: number
   collisionIterations: number
   centerStrength: number
   velocityDecay: number
+  /** Starting force temperature. D3 calls this the simulation alpha. */
+  initialTemperature: number
   alphaDecay: number
   alphaMin: number
   alphaTarget: number
@@ -100,15 +104,19 @@ export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
   hubForceMax: 70,
   hubMaxNodes: 320,
   linkDistanceScale: 1_000,
+  linkDistanceExponent: 2,
   linkWeightFloor: 0.02,
   hubLinkDamping: 0.24,
   collisionPadding: 10,
   collisionIterations: 2,
   centerStrength: 0.035,
   velocityDecay: 0.4,
+  // Give the layout enough heat to cross shallow barriers, then let alpha
+  // decay to alphaMin so it can settle instead of running hot forever.
+  initialTemperature: 0.15,
   alphaDecay: 0.0228,
   alphaMin: 0.001,
-  alphaTarget: 0.03,
+  alphaTarget: 0,
 }
 
 type Point = { x: number; y: number }
@@ -446,19 +454,20 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       .velocityDecay(settings.velocityDecay)
       .alphaDecay(settings.alphaDecay)
       .alphaMin(settings.alphaMin)
-    // The squared-distance spring is intentionally uncapped, but starting a
-    // strong-link layout at alpha=1 creates an avoidable first-tick impulse.
-    // A low initial temperature lets the same force law integrate instead of
-    // launching endpoints beyond the numeric range. This applies below the
-    // large-graph threshold too, since the 1,000 default is intentionally hot.
-    if (largeGraph || settings.linkDistanceScale < 10_000) {
-      sim.alpha(Math.min(0.15, Math.max(0.02, settings.alphaTarget * 4)))
-    }
+      .alphaTarget(settings.alphaTarget)
+    // D3 starts at alpha=1. That is too hot for the unbounded squared/cubic
+    // spring, so use a bounded starting temperature and cool toward the
+    // configured target. This gives the layout enough movement to leave a
+    // shallow high-energy arrangement without creating a runaway first tick.
+    const initialTemperature = Number.isFinite(settings.initialTemperature)
+      ? Math.max(settings.alphaMin, Math.min(1, settings.initialTemperature))
+      : 0.15
+    sim.alpha(initialTemperature)
     simulationRef.current = sim
     let framePending = false
     let invalidState = false
     let simulationTicks = 0
-    const protectNumerics = largeGraph || settings.linkDistanceScale < 10_000
+    const protectNumerics = largeGraph || settings.linkDistanceScale < 10_000 || settings.linkDistanceExponent > 2
     sim.on('tick', () => {
       simulationTicks += 1
       if (!invalidState && protectNumerics && (simulationTicks <= 120 || simulationTicks % 32 === 0)) {
@@ -509,16 +518,28 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   useEffect(() => { drawRef.current() }, [selectedId])
 
   useEffect(() => {
-    simulationRef.current?.alphaTarget(paused ? 0 : settings.alphaTarget)
+    const simulation = simulationRef.current
+    simulation?.alphaTarget(paused ? 0 : settings.alphaTarget)
     if (paused) {
-      simulationRef.current?.stop()
+      simulation?.stop()
       if (largeTickTimerRef.current != null) window.clearTimeout(largeTickTimerRef.current)
       largeTickTimerRef.current = null
     } else if (manualTickRef.current) {
-      simulationRef.current?.stop()
+      simulation?.stop()
       if (largeTickTimerRef.current == null) manualTickRef.current()
-    } else simulationRef.current?.restart()
-  }, [paused, settings.alphaTarget])
+    } else {
+      // With a zero alpha target, a simulation that already cooled below
+      // alphaMin will have stopped. Reheat it when the user resumes physics so
+      // the layout can make another local improvement.
+      if (simulation && simulation.alpha() < settings.alphaMin) {
+        const resumeTemperature = Number.isFinite(settings.initialTemperature)
+          ? Math.max(settings.alphaMin, Math.min(1, settings.initialTemperature))
+          : 0.15
+        simulation.alpha(resumeTemperature)
+      }
+      simulation?.restart()
+    }
+  }, [paused, settings.alphaTarget, settings.alphaMin, settings.initialTemperature])
 
   useEffect(() => {
     const host = hostRef.current
@@ -667,11 +688,11 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: G
         continue
       }
       const distance = Math.hypot(dx, dy) || 1
-      // Make the spring strength grow exactly with the square of separation.
-      // There is intentionally no distance ceiling: long links pull harder,
-      // as requested, while endpoint-degree normalization still keeps hubs
+      // Make the spring strength grow exactly with the selected power of
+      // separation. There is intentionally no distance ceiling: long links
+      // pull harder, while endpoint-degree normalization still keeps hubs
       // from receiving one full-strength spring per incident edge.
-      const pullMagnitude = (distance * distance) / settings.linkDistanceScale * weight * alpha
+      const pullMagnitude = Math.pow(distance, settings.linkDistanceExponent) / settings.linkDistanceScale * weight * alpha
       if (!Number.isFinite(pullMagnitude)) {
         source.vx = 0; source.vy = 0; target.vx = 0; target.vy = 0
         continue
