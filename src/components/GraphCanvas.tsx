@@ -313,6 +313,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
         // hub-repulsion force below handles hub-to-hub separation directly.
         .strength((node) => -115 - articleImportance(node) * 126 - hubRepulsionScore(node) ** 3 * 520)
         .distanceMax(480))
+      // A direct link is allowed to pull its endpoints together, but a nearby
+      // pair with no loaded link in either direction receives an extra push.
+      // This makes disconnected topic islands separate instead of relying on
+      // the same generic charge for every relationship.
+      .force('unrelated-repulsion', unrelatedRepulsion(graph.links, graph.nodes, largeGraph))
       .force('hub-repulsion', hubRepulsion(largeGraph))
       .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + (largeGraph ? 5 : 10)).iterations(largeGraph ? 1 : 2))
       .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))
@@ -384,6 +389,93 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.18, viewRef.current.scale / 1.15); draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const points = graphRef.current.nodes.filter((node) => node.x != null && node.y != null); if (points.length) { const xs = points.map((node) => node.x as number); const ys = points.map((node) => node.y as number); const bounds = { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) }; const { width, height } = sizeRef.current; const scale = Math.max(.2, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
   </div>
 })
+
+function pairKey(first: string, second: string) {
+  return first < second ? `${first}\u0000${second}` : `${second}\u0000${first}`
+}
+
+/**
+ * Adds relationship-aware separation on top of d3's Barnes–Hut charge. A
+ * spatial grid keeps the exact unlinked-pair check local; the interaction
+ * budget and rotating traversal keep dense 25k-node tiers responsive.
+ */
+function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], largeGraph: boolean) {
+  let orderedNodes = initialNodes
+  let nodeOrder = new Map<GraphNode, number>()
+  let relatedPairs = new Set<string>()
+  let tickIndex = 0
+  const force = (alpha: number) => {
+    const cellSize = largeGraph ? 240 : 200
+    const maxDistance = largeGraph ? 480 : 420
+    const cellRadius = Math.ceil(maxDistance / cellSize)
+    const cells = new Map<string, GraphNode[]>()
+    for (const node of orderedNodes) {
+      if (node.x == null || node.y == null || !Number.isFinite(node.x) || !Number.isFinite(node.y)) continue
+      const key = `${Math.floor(node.x / cellSize)},${Math.floor(node.y / cellSize)}`
+      const bucket = cells.get(key)
+      if (bucket) bucket.push(node)
+      else cells.set(key, [node])
+    }
+
+    let interactions = 0
+    const interactionBudget = orderedNodes.length < LARGE_GRAPH_THRESHOLD
+      ? Number.POSITIVE_INFINITY
+      : largeGraph ? 220_000 : 320_000
+    const start = orderedNodes.length ? tickIndex++ % orderedNodes.length : 0
+    outer: for (let visited = 0; visited < orderedNodes.length; visited += 1) {
+      const sourceIndex = (start + visited) % orderedNodes.length
+      const source = orderedNodes[sourceIndex]
+      if (source.x == null || source.y == null || !Number.isFinite(source.x) || !Number.isFinite(source.y)) continue
+      const sourceCellX = Math.floor(source.x / cellSize)
+      const sourceCellY = Math.floor(source.y / cellSize)
+      for (let cellX = sourceCellX - cellRadius; cellX <= sourceCellX + cellRadius; cellX += 1) {
+        for (let cellY = sourceCellY - cellRadius; cellY <= sourceCellY + cellRadius; cellY += 1) {
+          const bucket = cells.get(`${cellX},${cellY}`)
+          if (!bucket) continue
+          for (const target of bucket) {
+            const targetIndex = nodeOrder.get(target)
+            if (targetIndex == null || targetIndex <= sourceIndex) continue
+            if (relatedPairs.has(pairKey(source.id, target.id))) continue
+            let dx = source.x - (target.x as number)
+            let dy = source.y - (target.y as number)
+            let distance = Math.hypot(dx, dy)
+            if (distance < 0.001) {
+              const angle = ((sourceIndex * 7919 + targetIndex * 104729) % 360) * Math.PI / 180
+              dx = Math.cos(angle)
+              dy = Math.sin(angle)
+              distance = 1
+            }
+            if (distance > maxDistance) continue
+            interactions += 1
+            const falloff = 1 - distance / maxDistance
+            const hubBoost = 0.6 + 1.4 * Math.max(hubRepulsionScore(source), hubRepulsionScore(target))
+            const magnitude = Math.min(14, ((40 + 220 * hubBoost) / Math.max(28, distance)) * falloff) * alpha
+            const vx = dx / distance * magnitude
+            const vy = dy / distance * magnitude
+            source.vx = (source.vx ?? 0) + vx
+            source.vy = (source.vy ?? 0) + vy
+            target.vx = (target.vx ?? 0) - vx
+            target.vy = (target.vy ?? 0) - vy
+            if (interactions >= interactionBudget) break outer
+          }
+        }
+      }
+    }
+  }
+  force.initialize = (simulationNodes: GraphNode[]) => {
+    orderedNodes = [...simulationNodes]
+      .sort((a, b) => articleDegree(b) - articleDegree(a) || a.id.localeCompare(b.id))
+    nodeOrder = new Map(orderedNodes.map((node, index) => [node, index]))
+    const byId = new Map(orderedNodes.map((node) => [node.id, node]))
+    relatedPairs = new Set<string>()
+    for (const link of links) {
+      const source = linkNode(link.source, byId)
+      const target = linkNode(link.target, byId)
+      if (source && target && source !== target) relatedPairs.add(pairKey(source.id, target.id))
+    }
+  }
+  return force
+}
 
 function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
   const LINK_PULL_SCALE = 90_000
