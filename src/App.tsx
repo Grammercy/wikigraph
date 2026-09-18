@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { type GraphCanvasHandle } from './components/GraphCanvas'
-import { fetchWikiGraphProgressive, fetchWikiStats } from './data/wiki'
+import { fetchWikiGraphProgressive, fetchWikiStats, usesLocalCorpus } from './data/wiki'
 import type { WikiGraph, WikiStats } from './types'
 
 function formatArticleSize(bytes?: number) {
@@ -57,6 +57,7 @@ export default function App() {
       setSelectedId(null)
       setHoveredId(null)
       if (next.source === 'fallback') setError('Wikipedia is unavailable — showing a local demo graph (up to 51 articles).')
+      else if (amount > 500 && !usesLocalCorpus) setError('The hosted public API is limited to 500 articles. Run the local D: host for the full indexed corpus.')
     } catch (cause) {
       if (controller.signal.aborted || (cause instanceof DOMException && cause.name === 'AbortError')) return
       if (version === requestVersionRef.current) setError('Unable to load Wikipedia articles. Try generating the map again.')

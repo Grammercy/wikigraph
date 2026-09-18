@@ -42,6 +42,7 @@ const localHost = typeof window !== 'undefined' && (window.location.hostname ===
 // contract. GitHub Pages and other public hosts stay on Wikipedia's API.
 const LOCAL_INDEX_URL = configuredLocalIndex || (localHost ? '/api/graph' : undefined)
 const LOCAL_MAX_NODES = 25_000
+export const usesLocalCorpus = Boolean(LOCAL_INDEX_URL)
 
 function isWikiGraph(value: unknown): value is WikiGraph {
   if (!value || typeof value !== 'object') return false
@@ -236,7 +237,7 @@ export async function fetchWikiGraphProgressive(
   signal?: AbortSignal,
   onProgress?: (progress: WikiGraphProgress) => void,
 ): Promise<WikiGraph> {
-  const requested = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : 5_000))
+  const requested = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : 500))
   const merged: WikiGraph = { nodes: [], links: [], source: 'wikipedia' }
   const nodeIds = new Set<string>()
   const linkIds = new Set<string>()
