@@ -394,10 +394,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const distance = Math.hypot(dx, dy) || 1
       const ux = dx / distance
       const uy = dy / distance
-      const targetRadius = nodeRadius(edge.target, settingsRef.current) * edge.targetPoint.perspective
+      const targetRadius = nodeRadius(edge.target, settingsRef.current) * edge.targetPoint.perspective * viewRef.current.scale
       const tipX = edge.targetPoint.x - ux * (targetRadius + 2)
       const tipY = edge.targetPoint.y - uy * (targetRadius + 2)
-      const size = isRelated ? 5 : 3.5
+      const size = (isRelated ? 5 : 3.5) * viewRef.current.scale
       ctx.fillStyle = ctx.strokeStyle
       ctx.beginPath()
       ctx.moveTo(tipX, tipY)
@@ -412,11 +412,12 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.textBaseline = 'top'
     ctx.font = '500 11px Inter, ui-sans-serif, system-ui, sans-serif'
     for (const { node, point } of sortedNodes) {
-      const radius = nodeRadius(node, settingsRef.current) * point.perspective
+      const radius = nodeRadius(node, settingsRef.current) * point.perspective * viewRef.current.scale
+      const activeRing = 5 * viewRef.current.scale
       const active = node === selected || node === hovered
       if (active) {
         ctx.beginPath()
-        ctx.arc(point.x, point.y, radius + 5, 0, Math.PI * 2)
+        ctx.arc(point.x, point.y, radius + activeRing, 0, Math.PI * 2)
         ctx.fillStyle = node === selected ? 'rgba(37, 79, 239, .16)' : 'rgba(37, 79, 239, .08)'
         ctx.fill()
       }
@@ -773,7 +774,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       return nodes.map((node) => ({ node, projected: project3D(node) }))
         .filter(({ projected }) => Number.isFinite(projected.x) && Number.isFinite(projected.y))
         .sort((first, second) => first.projected.depth - second.projected.depth)
-        .find(({ node, projected }) => Math.hypot(projected.x - point.x, projected.y - point.y) <= nodeRadius(node, settingsRef.current) * projected.perspective + 8)?.node
+        .find(({ node, projected }) => Math.hypot(projected.x - point.x, projected.y - point.y) <= nodeRadius(node, settingsRef.current) * projected.perspective * viewRef.current.scale + Math.max(4, 8 * viewRef.current.scale))?.node
     }
     return nodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (nodeRadius(node, settingsRef.current) + 7) / viewRef.current.scale)
   }
@@ -786,10 +787,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       onPointerUp={(event) => { const drag = dragRef.current; if (drag) { drag.node.fx = null; drag.node.fy = null; onSelect?.(drag.node) } else if (pressedNodeRef.current && !rotateRef.current && !panRef.current) onSelect?.(pressedNodeRef.current); dragRef.current = null; pressedNodeRef.current = null; panRef.current = null; rotateRef.current = null; event.currentTarget.releasePointerCapture(event.pointerId); draw() }}
       onPointerCancel={() => { dragRef.current = null; pressedNodeRef.current = null; panRef.current = null; rotateRef.current = null }}
       onPointerLeave={() => { if (!dragRef.current && !rotateRef.current && hoverRef.current) { hoverRef.current = null; onHover?.(null); draw() } }}
-      onWheel={(event) => { event.preventDefault(); const factor = Math.max(.75, Math.min(1.25, Math.exp(-event.deltaY * .001))); const view = viewRef.current; const screen = screenPoint(event); if (modeRef.current === '3d') { view.x = screen.x - (screen.x - view.x) * factor; view.y = screen.y - (screen.y - view.y) * factor } else { const before = localPoint(event); view.x = screen.x - before.x * view.scale * factor; view.y = screen.y - before.y * view.scale * factor } view.scale = Math.max(.18, Math.min(4, view.scale * factor)); draw() }}
+      onWheel={(event) => { event.preventDefault(); const factor = Math.max(.75, Math.min(1.25, Math.exp(-event.deltaY * .001))); const view = viewRef.current; if (modeRef.current === '3d') { view.scale = Math.max(.18, Math.min(4, view.scale * factor)) } else { const before = localPoint(event); const screen = screenPoint(event); view.scale = Math.max(.18, Math.min(4, view.scale * factor)); view.x = screen.x - before.x * view.scale; view.y = screen.y - before.y * view.scale } draw() }}
       tabIndex={0}
       role="application"
-      onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.18, viewRef.current.scale / 1.15); draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }; orbitRef.current = { yaw: -0.45, pitch: 0.24 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const bounds = graphBounds(graphRef.current.nodes); if (bounds) { const { width, height } = sizeRef.current; const scale = Math.max(.2, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
+      onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.18, viewRef.current.scale / 1.15); draw() } else if (modeRef.current === '3d' && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); if (event.shiftKey) { const panStep = 36; if (event.key === 'ArrowLeft') viewRef.current.x += panStep; else if (event.key === 'ArrowRight') viewRef.current.x -= panStep; else if (event.key === 'ArrowUp') viewRef.current.y += panStep; else viewRef.current.y -= panStep } else { const orbitStep = 0.12; if (event.key === 'ArrowLeft') orbitRef.current.yaw -= orbitStep; else if (event.key === 'ArrowRight') orbitRef.current.yaw += orbitStep; else if (event.key === 'ArrowUp') orbitRef.current.pitch = Math.max(-1.2, orbitRef.current.pitch - orbitStep); else orbitRef.current.pitch = Math.min(1.2, orbitRef.current.pitch + orbitStep) } draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }; orbitRef.current = { yaw: -0.45, pitch: 0.24 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const bounds = graphBounds(activeLayoutRef.current?.nodes ?? graphRef.current.nodes); if (bounds) { const { width, height } = sizeRef.current; const scale = Math.max(.2, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
   </div>
 })
 
