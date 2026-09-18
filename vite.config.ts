@@ -14,5 +14,11 @@ export default defineConfig({
   server: {
     host: 'localhost',
     port: 5173,
+    proxy: {
+      // Keep the browser contract identical in dev and in the production
+      // local host. If the D:-drive API is not running, the data loader falls
+      // back to the public Wikipedia API.
+      '/api': 'http://127.0.0.1:8787',
+    },
   },
 })

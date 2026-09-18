@@ -76,6 +76,45 @@ function graphFor(records) {
   return { nodes: records.map(({ links: _links, ...article }) => article), links };
 }
 
+// Keep the K smallest stable hashes in O(log K) per article. Sorting the
+// retained array for every line becomes prohibitively expensive for the full
+// English dump (millions of rows).
+function compareArticles(a, b) {
+  return stableHash(a.id) - stableHash(b.id) || a.id.localeCompare(b.id)
+}
+function siftUp(heap, index) {
+  let child = index
+  while (child > 0) {
+    const parent = Math.floor((child - 1) / 2)
+    if (compareArticles(heap[parent], heap[child]) >= 0) break
+    ;[heap[parent], heap[child]] = [heap[child], heap[parent]]
+    child = parent
+  }
+}
+function siftDown(heap, index) {
+  let parent = index
+  while (true) {
+    const left = parent * 2 + 1
+    const right = left + 1
+    let largest = parent
+    if (left < heap.length && compareArticles(heap[left], heap[largest]) > 0) largest = left
+    if (right < heap.length && compareArticles(heap[right], heap[largest]) > 0) largest = right
+    if (largest === parent) break
+    ;[heap[parent], heap[largest]] = [heap[largest], heap[parent]]
+    parent = largest
+  }
+}
+function retainSmallest(heap, article, limit) {
+  if (heap.length < limit) {
+    heap.push(article)
+    siftUp(heap, heap.length - 1)
+    return
+  }
+  if (compareArticles(article, heap[0]) >= 0) return
+  heap[0] = article
+  siftDown(heap, 0)
+}
+
 function writeAtomic(file, value) {
   const partial = `${file}.part-${process.pid}`;
   writeFileSync(partial, `${JSON.stringify(value)}\n`);
@@ -84,13 +123,13 @@ function writeAtomic(file, value) {
 
 async function build({ input, outputDir, tiers, dryRun }) {
   if (!isAbsolute(input) || !isAbsolute(outputDir)) throw new Error("--input and --output-dir must be absolute paths");
-  if (!existsSync(input)) throw new Error(`Input JSONL not found: ${input}`);
   const largest = tiers.at(-1);
   if (dryRun) {
     console.log(`Would read ${input}`);
     console.log(`Would write ${tiers.join(", ")} tiers to ${outputDir}`);
     return;
   }
+  if (!existsSync(input)) throw new Error(`Input JSONL not found: ${input}`);
   mkdirSync(outputDir, { recursive: true });
   const selected = [];
   let scanned = 0; let malformed = 0;
@@ -101,14 +140,12 @@ async function build({ input, outputDir, tiers, dryRun }) {
     let article;
     try { article = normalizeArticle(JSON.parse(line)); } catch { article = null; }
     if (!article) { malformed += 1; continue; }
-    selected.push(article);
-    selected.sort((a, b) => stableHash(a.id) - stableHash(b.id) || a.id.localeCompare(b.id));
-    if (selected.length > largest) selected.pop();
+    retainSmallest(selected, article, largest);
     if (scanned % 100000 === 0) console.log(`Scanned ${scanned.toLocaleString()} articles; retained ${selected.length.toLocaleString()}`);
   }
   const outputs = [];
   for (const count of tiers) {
-    const records = selected.slice(0, count);
+    const records = selected.slice().sort(compareArticles).slice(0, count);
     const graph = graphFor(records);
     const file = join(outputDir, `${count}.json`);
     writeAtomic(file, graph);

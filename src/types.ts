@@ -25,3 +25,16 @@ export interface WikiGraph {
   /** Identifies whether this graph came from Wikipedia or the offline seed graph. */
   source?: 'wikipedia' | 'fallback'
 }
+
+/** Corpus-level metadata returned by the local dump-backed API. */
+export interface WikiStats {
+  articles: number
+  links?: number | null
+  totalArticleBytes?: number | null
+  pagesRead?: number
+  indexed?: boolean
+  building?: boolean
+  source?: string
+  tiers?: Array<{ count: number; links?: number; bytes?: number }>
+  updatedAt?: string | null
+}

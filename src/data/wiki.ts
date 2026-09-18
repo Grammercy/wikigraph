@@ -1,4 +1,4 @@
-import type { WikiGraph, WikiLink, WikiNode } from '../types'
+import type { WikiGraph, WikiLink, WikiNode, WikiStats } from '../types'
 import { buildFallbackGraph } from './fallback'
 
 const API = 'https://en.wikipedia.org/w/api.php'
@@ -36,7 +36,12 @@ interface ApiResponse {
  * Keeping this opt-in means the hosted/static UI still works without a local
  * multi-gigabyte Wikipedia index.
  */
-const LOCAL_INDEX_URL = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_WIKIGRAPH_INDEX_URL?.trim()
+const configuredLocalIndex = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_WIKIGRAPH_INDEX_URL?.trim()
+const localHost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+// Local development and the D:-drive production host share the same API
+// contract. GitHub Pages and other public hosts stay on Wikipedia's API.
+const LOCAL_INDEX_URL = configuredLocalIndex || (localHost ? '/api/graph' : undefined)
+const LOCAL_MAX_NODES = 25_000
 
 function isWikiGraph(value: unknown): value is WikiGraph {
   if (!value || typeof value !== 'object') return false
@@ -124,7 +129,7 @@ async function pageBatch(titles: string[], signal?: AbortSignal): Promise<PageBa
 
 /** Fetch a bounded graph grown from random article seeds; falls back gracefully offline. */
 export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promise<WikiGraph> {
-  const wanted = Math.max(1, Math.min(Math.floor(count) || 1, 500))
+  const wanted = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : 500))
   try {
     // Prefer a dump-backed local service when configured. It can serve the
     // complete corpus while preserving the same UI contract and slider.
@@ -197,6 +202,24 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
   }
 }
 
+/** Read corpus progress/size when the local D:-drive API is available. */
+export async function fetchWikiStats(signal?: AbortSignal): Promise<WikiStats | null> {
+  if (!LOCAL_INDEX_URL) return null
+  try {
+    const url = new URL(LOCAL_INDEX_URL, window.location.origin)
+    url.pathname = '/api/stats'
+    url.search = ''
+    const response = await fetch(url, { signal })
+    if (!response.ok) return null
+    const stats = await response.json() as unknown
+    if (!stats || typeof stats !== 'object' || !Number.isFinite((stats as WikiStats).articles)) return null
+    return stats as WikiStats
+  } catch (error) {
+    if (signal?.aborted) throw error
+    return null
+  }
+}
+
 export type WikiGraphProgress = {
   loaded: number
   requested: number
@@ -213,7 +236,7 @@ export async function fetchWikiGraphProgressive(
   signal?: AbortSignal,
   onProgress?: (progress: WikiGraphProgress) => void,
 ): Promise<WikiGraph> {
-  const requested = Math.max(1, Math.min(Math.floor(count) || 1, 5_000))
+  const requested = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : 5_000))
   const merged: WikiGraph = { nodes: [], links: [], source: 'wikipedia' }
   const nodeIds = new Set<string>()
   const linkIds = new Set<string>()
@@ -221,8 +244,13 @@ export async function fetchWikiGraphProgressive(
 
   while (completed < requested) {
     if (signal?.aborted) throw new DOMException('The graph request was cancelled.', 'AbortError')
-    const batchSize = Math.min(MAX_BATCH * 2, requested - completed)
-    const batch = await fetchWikiGraph(batchSize, signal)
+    // Local tiers are deterministic and nested. Ask for cumulative sizes so
+    // each response can add nodes without re-downloading the same small batch.
+    // The public API remains bounded to independent random batches.
+    const nextTarget = LOCAL_INDEX_URL
+      ? Math.min(requested, Math.max(500, completed ? completed * 2 : 500))
+      : Math.min(MAX_BATCH * 2, requested - completed)
+    const batch = await fetchWikiGraph(nextTarget, signal)
     if (batch.source === 'fallback') merged.source = 'fallback'
     for (const node of batch.nodes) {
       if (nodeIds.has(node.id)) continue
@@ -239,10 +267,12 @@ export async function fetchWikiGraphProgressive(
         merged.links.push({ source, target })
       }
     }
-    completed += batchSize
+    const previousCompleted = completed
+    completed = LOCAL_INDEX_URL ? Math.max(completed, batch.nodes.length) : completed + nextTarget
     onProgress?.({ loaded: Math.min(completed, requested), requested, graph: { ...merged, nodes: [...merged.nodes], links: [...merged.links] } })
     // A fallback graph is finite; avoid repeatedly emitting the same demo map.
-    if (batch.source === 'fallback' && batch.nodes.length < batchSize) break
+    if (batch.source === 'fallback' && batch.nodes.length < nextTarget) break
+    if (LOCAL_INDEX_URL && completed <= previousCompleted) break
   }
   return merged
 }

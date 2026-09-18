@@ -10,11 +10,15 @@ const dataRoot = resolve(process.env.WIKIGRAPH_DATA_DIR || (process.platform ===
 const indexFile = resolve(dataRoot, 'index.json')
 const jsonlFile = resolve(dataRoot, 'index', 'articles.jsonl')
 const sampleFile = resolve(dataRoot, 'index', 'sample.json')
+const tiersDir = resolve(dataRoot, 'index', 'tiers')
+const parserCheckpoint = resolve(dataRoot, 'articles.checkpoint.json')
 const port = Number(process.env.WIKIGRAPH_PORT || 8787)
 const webRoot = resolve(process.env.WIKIGRAPH_WEB_ROOT || 'dist')
 const fallback = { nodes: [{ id: 'Physics', title: 'Physics', url: 'https://en.wikipedia.org/wiki/Physics' }, { id: 'Mathematics', title: 'Mathematics', url: 'https://en.wikipedia.org/wiki/Mathematics' }], links: [{ source: 'Physics', target: 'Mathematics' }] }
 let jsonlCache = null
 let corpusStatsCache = null
+let tierManifestCache = null
+const tierGraphCache = new Map()
 // Keep the existing 500-node default, while allowing bounded larger tiers
 // for GPU-backed clients without ever attempting a full-corpus response.
 const CACHE_LIMIT = Math.max(500, Math.min(25000, Number(process.env.WIKIGRAPH_MAX_GRAPH_NODES || 10000) || 10000))
@@ -59,6 +63,39 @@ function sample(value, count) {
   })
   return withDegrees({ nodes: nodes.map((n) => ({ ...n, id: String(n.id || n.title), url: n.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(n.title).replaceAll('%20', '_')}` })), links })
 }
+function readTierManifest() {
+  const file = resolve(tiersDir, 'manifest.json')
+  if (!existsSync(file)) return null
+  const stat = statSync(file)
+  if (tierManifestCache && tierManifestCache.mtimeMs === stat.mtimeMs && tierManifestCache.size === stat.size) return tierManifestCache.value
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    const tiers = Array.isArray(parsed.tiers)
+      ? parsed.tiers.filter((tier) => Number.isInteger(tier?.count) && tier.count > 0).sort((a, b) => a.count - b.count)
+      : []
+    const value = { ...parsed, tiers }
+    tierManifestCache = { mtimeMs: stat.mtimeMs, size: stat.size, value }
+    return value
+  } catch { return null }
+}
+function readTier(count) {
+  const manifest = readTierManifest()
+  if (!manifest?.tiers?.length) return null
+  const tier = manifest.tiers.find((candidate) => candidate.count >= count) || manifest.tiers.at(-1)
+  const fileName = typeof tier.file === 'string' ? tier.file : `${tier.count}.json`
+  const file = resolve(tiersDir, fileName)
+  const prefix = tiersDir.endsWith(sep) ? tiersDir : `${tiersDir}${sep}`
+  if (file !== tiersDir && !file.startsWith(prefix)) return null
+  if (!existsSync(file)) return null
+  const stat = statSync(file)
+  const cached = tierGraphCache.get(file)
+  if (cached?.mtimeMs === stat.mtimeMs && cached.size === stat.size) return { graph: cached.graph, count: tier.count }
+  try {
+    const graph = JSON.parse(readFileSync(file, 'utf8'))
+    tierGraphCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, graph })
+    return { graph, count: tier.count }
+  } catch { return null }
+}
 async function sampleJsonl(count) {
   if (!existsSync(jsonlFile)) return null
   const stat = statSync(jsonlFile)
@@ -93,7 +130,19 @@ async function sampleJsonl(count) {
 }
 
 async function scanCorpus() {
-  if (!existsSync(jsonlFile)) return null
+  const tierManifest = readTierManifest()
+  if (tierManifest?.scanned) {
+    return { articles: tierManifest.scanned, links: null, totalArticleBytes: null, indexed: true, source: 'tiers', tiers: tierManifest.tiers, updatedAt: tierManifest.completedAt ?? null }
+  }
+  if (!existsSync(jsonlFile) && existsSync(parserCheckpoint)) {
+    try {
+      const progress = JSON.parse(readFileSync(parserCheckpoint, 'utf8'))
+      return { articles: progress.recordsWritten ?? 0, pagesRead: progress.pagesRead ?? 0, indexed: false, building: true, source: 'parser', updatedAt: progress.updatedAt ?? null }
+    } catch { /* continue to the fallback response */ }
+  }
+  if (!existsSync(jsonlFile)) {
+    return null
+  }
   const stat = statSync(jsonlFile)
   if (corpusStatsCache && corpusStatsCache.mtimeMs === stat.mtimeMs && corpusStatsCache.size === stat.size) return corpusStatsCache.value
   let articles = 0; let links = 0; let totalArticleBytes = 0
@@ -108,7 +157,7 @@ async function scanCorpus() {
       links += Array.isArray(article.links) ? article.links.length : 0
     } catch { /* skip malformed rows */ }
   }
-  const value = { articles, links, totalArticleBytes, indexed: true, source: 'jsonl', updatedAt: new Date(stat.mtimeMs).toISOString() }
+  const value = { articles, links, totalArticleBytes, indexed: true, source: 'jsonl', tiers: readTierManifest()?.tiers ?? [], updatedAt: new Date(stat.mtimeMs).toISOString() }
   corpusStatsCache = { mtimeMs: stat.mtimeMs, size: stat.size, value }
   return value
 }
@@ -160,7 +209,7 @@ createServer(async (req, res) => {
   const request = new URL(req.url || '/', `http://127.0.0.1:${port}`)
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS' }); return res.end() }
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, { allow: 'GET, HEAD, OPTIONS' }); return res.end() }
-  if (request.pathname === '/health') return send(res, 200, { ok: true, indexed: existsSync(indexFile) || existsSync(jsonlFile) || existsSync(sampleFile), dataRoot })
+  if (request.pathname === '/health') return send(res, 200, { ok: true, indexed: existsSync(indexFile) || existsSync(jsonlFile) || existsSync(sampleFile) || existsSync(tiersDir), dataRoot, tiers: readTierManifest()?.tiers ?? [] })
   try {
     if (request.pathname === '/api/stats') {
       const stats = await scanCorpus()
@@ -182,10 +231,15 @@ createServer(async (req, res) => {
     let graph = null
     // The compact sample is intentionally only used for the backwards-
     // compatible 500-node path; larger tiers come from the complete JSONL.
+    let tier = null
+    if (count > 500) {
+      tier = readTier(count)
+      if (tier) graph = sample(tier.graph, count)
+    }
     if (count <= 500 && existsSync(sampleFile)) { try { graph = sample(JSON.parse(readFileSync(sampleFile, 'utf8')), count) } catch { graph = null } }
     if (!graph && existsSync(indexFile)) { try { graph = sample(JSON.parse(readFileSync(indexFile, 'utf8')), count) } catch { graph = null } }
     if (!graph) graph = await sampleJsonl(count)
-    send(res, 200, graph || { ...withDegrees(fallback), source: 'fallback', indexed: false })
+    send(res, 200, graph ? { ...graph, source: 'wikipedia', indexed: true, tier: tier?.count ?? null } : { ...withDegrees(fallback), source: 'fallback', indexed: false })
   } catch (error) {
     send(res, 503, { error: 'Local Wikipedia index is unavailable', detail: error instanceof Error ? error.message : String(error) })
   }

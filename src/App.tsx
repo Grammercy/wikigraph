@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { type GraphCanvasHandle } from './components/GraphCanvas'
-import { fetchWikiGraphProgressive } from './data/wiki'
-import type { WikiGraph } from './types'
+import { fetchWikiGraphProgressive, fetchWikiStats } from './data/wiki'
+import type { WikiGraph, WikiStats } from './types'
 
 function formatArticleSize(bytes?: number) {
   if (!Number.isFinite(bytes) || (bytes ?? 0) <= 0) return 'unknown'
@@ -15,6 +15,11 @@ function formatArticleSize(bytes?: number) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`
 }
 
+function formatCount(value?: number | null) {
+  if (!Number.isFinite(value)) return '—'
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value as number)
+}
+
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
   const [count, setCount] = useState(50)
@@ -25,6 +30,7 @@ export default function App() {
   const [paused, setPaused] = useState(false)
   const [showLabels, setShowLabels] = useState(true)
   const [hoveredId, setHoveredId] = useState<string | null>(null)
+  const [corpusStats, setCorpusStats] = useState<WikiStats | null>(null)
   const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
   const [largeMapAcknowledged, setLargeMapAcknowledged] = useState(false)
   const requestRef = useRef<AbortController | null>(null)
@@ -66,6 +72,14 @@ export default function App() {
     }
   }, [load])
 
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetchWikiStats(controller.signal).then((stats) => {
+      if (!controller.signal.aborted) setCorpusStats(stats)
+    }).catch(() => undefined)
+    return () => controller.abort()
+  }, [])
+
   const selected = useMemo(() => graph.nodes.find((node) => node.id === selectedId), [graph.nodes, selectedId])
   const selectedLinks = selected ? graph.links.filter((edge) => {
     const source = typeof edge.source === 'string' ? edge.source : edge.source.id
@@ -105,7 +119,7 @@ export default function App() {
     <header className="topbar">
       <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
       <div><div className="eyebrow">EXPLORATORY GRAPH</div><h1>Wiki<span>/Graph</span></h1></div>
-      <div className="topbar-meta"><span className="live-dot" /> {graph.source === 'fallback' ? 'LOCAL DEMO DATA' : 'LIVE SIMULATION'} <span className="divider" /> <span className="muted">Wikipedia knowledge map</span></div>
+      <div className="topbar-meta"><span className="live-dot" /> {graph.source === 'fallback' ? 'LOCAL DEMO DATA' : 'LIVE SIMULATION'} <span className="divider" /> <span className="muted">{corpusStats?.building ? `INDEXING ${formatCount(corpusStats.articles)} ARTICLES` : corpusStats?.articles ? `${formatCount(corpusStats.articles)} ARTICLE CORPUS` : 'Wikipedia knowledge map'}</span></div>
     </header>
     <section className="workspace">
       <aside className="control-panel">
@@ -128,7 +142,7 @@ export default function App() {
         <div className="panel-footer">Drag to explore <span>·</span> Scroll to zoom</div>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections{hoveredId && <><i /> <span className="hover-readout">{graph.nodes.find((node) => node.id === hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
+        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections{corpusStats?.articles && <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></>}{hoveredId && <><i /> <span className="hover-readout">{graph.nodes.find((node) => node.id === hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
         <GraphCanvas ref={canvasRef} graph={graphForCanvas} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} paused={paused} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}

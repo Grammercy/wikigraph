@@ -11,7 +11,7 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 
 ## Controls
 
-- **Articles** — choose 10–500 articles, then select **Generate new map** to fetch a new random graph.
+- **Articles** — choose 10–5,000 articles, then select **Generate new map**. Local dump tiers stream in cumulatively; a warning and acknowledgement appear above 1,000 nodes.
 - **Physics engine** — pause or resume the force simulation.
 - **Article labels** — show or hide node labels.
 - **Select article** — open an inspector with an extract, connection counts, related articles, and a link to Wikipedia.
@@ -19,7 +19,7 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 
 ## Data and fallback behavior
 
-The app requests random main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). Requests are bounded to the selected article count, use small API batches, and include a timeout. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
+The hosted Pages build requests random main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). The local build automatically uses the D:-drive API when it is available, progressively loading deterministic 1k/5k/25k/100k tiers while the page remains open. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
 
 ## Optional full-dump storage
 
@@ -31,7 +31,7 @@ npm run wiki:download -- --dry-run
 npm run wiki:download
 ```
 
-Set `WIKIGRAPH_DATA_DIR` to another absolute HDD path when needed. Downloads resume through a `.part` file, checking ETag/Last-Modified and Content-Range before appending when the mutable `latest` URL changes. A small `manifest.json` is written only after completion. The app continues to use the bounded public API until a local index service is connected; the dump itself is never checked into Git.
+Set `WIKIGRAPH_DATA_DIR` to another absolute HDD path when needed. Downloads resume through a `.part` file, checking ETag/Last-Modified and Content-Range before appending when the mutable `latest` URL changes. A small `manifest.json` is written only after completion. The dump itself is never checked into Git; the derived JSONL and tiers stay on D:.
 
 To build and serve a dump-backed corpus, run the streaming pipeline on D: (the
 parse step can take hours for the full snapshot):
@@ -40,19 +40,19 @@ parse step can take hours for the full snapshot):
 npm run wiki:download
 npm run wiki:parse
 npm run wiki:index
+npm run wiki:tiers
 $env:WIKIGRAPH_DATA_DIR = 'D:\WikiGraphData'
 npm run wiki:serve
 ```
 
-Then restart Vite with `VITE_WIKIGRAPH_INDEX_URL=http://127.0.0.1:8787/api/graph`.
-The browser intentionally samples at most 500 articles per view so the force
-layout stays interactive; the complete English corpus remains on disk and
-queryable by the local service.
+The local Vite server proxies `/api` to port 8787, and the production host
+serves the same API and UI from one origin. The complete English corpus remains
+on D: and is queryable through `/api/stats`, `/api/search`, and `/api/article`;
+the browser renders bounded progressive tiers so the tab stays responsive.
 
 To serve the production website and local API from one origin, run
-`npm run wiki:host` after setting `VITE_WIKIGRAPH_INDEX_URL=/api/graph` before
-the build. Open `http://127.0.0.1:8787/`; the host serves `dist/` with SPA
-fallback plus `/health`, `/api/stats`, `/api/search`, `/api/article`, and
+`npm run wiki:host` and open `http://127.0.0.1:8787/`; it serves `dist/` with
+SPA fallback plus `/health`, `/api/stats`, `/api/search`, `/api/article`, and
 `/api/graph`.
 
 ## Run locally

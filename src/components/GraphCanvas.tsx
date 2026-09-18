@@ -63,6 +63,7 @@ const articleImportance = (node: GraphNode) => {
 const nodeRadius = (node: GraphNode) => {
   return (node.id.length > 18 ? 5 : 6) + articleImportance(node) * 6
 }
+const LARGE_GRAPH_THRESHOLD = 2_000
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
 
@@ -108,6 +109,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.scale(view.scale, view.scale)
     const currentGraph = graphRef.current
     const nodes = currentGraph.nodes
+    const largeGraph = nodes.length > LARGE_GRAPH_THRESHOLD
     const nodeMap = new Map(nodes.map((node) => [node.id, node]))
     const selected = selectedIdRef.current ? nodeMap.get(selectedIdRef.current) : undefined
     const hovered = hoverRef.current
@@ -118,12 +120,13 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const target = linkNode(edge.target, nodeMap)
       if (!source || !target || source.x == null || target.x == null || source.y == null || target.y == null) continue
       const isRelated = source === selected || target === selected
-      ctx.strokeStyle = isRelated ? 'rgba(37, 79, 239, .72)' : 'rgba(115, 119, 127, .22)'
-      ctx.lineWidth = isRelated ? 1.7 : 1
+      ctx.strokeStyle = isRelated ? 'rgba(37, 79, 239, .72)' : largeGraph ? 'rgba(115, 119, 127, .16)' : 'rgba(115, 119, 127, .22)'
+      ctx.lineWidth = isRelated ? 1.7 : largeGraph ? 0.65 : 1
       ctx.beginPath()
       ctx.moveTo(source.x, source.y)
       ctx.lineTo(target.x, target.y)
       ctx.stroke()
+      if (largeGraph && !isRelated) continue
       const dx = target.x - source.x
       const dy = target.y - source.y
       const distance = Math.hypot(dx, dy) || 1
@@ -160,7 +163,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.lineWidth = node === selected ? 2 : 1
       ctx.stroke()
       const text = node.label ?? node.title ?? node.id
-      if (view.scale > 0.58 || active || node === selected) {
+      // Labels and arrowheads are deliberately level-of-detail features. At
+      // several thousand nodes the graph remains interactive only when text is
+      // limited to the hovered/selected neighborhood.
+      if ((!largeGraph && view.scale > 0.58) || active || node === selected) {
         ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
         ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, node.x, node.y + radius + 5)
       }
@@ -190,19 +196,32 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   useEffect(() => {
     const { width, height } = sizeRef.current
     if (width > 1 && height > 1) viewRef.current = { x: width / 2, y: height / 2, scale: 1 }
+    const largeGraph = graph.nodes.length > LARGE_GRAPH_THRESHOLD
+    // Keep every edge available for rendering, but cap the per-tick attraction
+    // work in large maps. The representative stride preserves the overall
+    // topology while preventing a dense dump tier from freezing the tab.
+    const attractionLinks = largeGraph && graph.links.length > 50_000
+      ? graph.links.filter((_, index) => index % Math.ceil(graph.links.length / 50_000) === 0)
+      : graph.links
     const sim = forceSimulation(graph.nodes)
       // Hubs need more breathing room: their repulsion grows with degree, but is
       // capped to keep a single highly-linked page from dominating the whole map.
       .force('charge', forceManyBody<GraphNode>()
         .strength((node) => -115 - articleImportance(node) * 126)
         .distanceMax(480))
-      .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + 10).iterations(2))
+      .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + (largeGraph ? 5 : 10)).iterations(largeGraph ? 1 : 2))
       .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))
       // Wikipedia links are directed: the source article moves toward its target,
       // while the target does not receive the spring's equal-and-opposite pull.
-      .force('directed-attraction', directedAttraction(graph.links, graph.nodes))
+      .force('directed-attraction', directedAttraction(attractionLinks, graph.nodes))
     simulationRef.current = sim
-    sim.on('tick', () => drawRef.current())
+    let framePending = false
+    sim.on('tick', () => {
+      if (!largeGraph) { drawRef.current(); return }
+      if (framePending) return
+      framePending = true
+      requestAnimationFrame(() => { framePending = false; drawRef.current() })
+    })
     if (pausedRef.current) sim.stop()
     return () => { sim.stop(); simulationRef.current = null }
   }, [graph])

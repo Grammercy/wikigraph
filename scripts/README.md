@@ -1,9 +1,9 @@
 # Full-dump data workflow
 
-WikiGraph's browser API mode is deliberately capped at 500 articles. A full
-English Wikipedia map should be built from a Wikimedia dump and an indexed
-representation on a large drive; the raw XML is not suitable for bundling in
-the Vite app or loading into one browser tab.
+WikiGraph's public API mode is deliberately capped at 500 articles. A local
+English Wikipedia map is built from a Wikimedia dump and progressive indexed
+tiers on a large drive; the raw XML is not suitable for bundling in the Vite
+app or loading into one browser tab.
 
 Download the current multistream article dump to D: (the script refuses C: by
 default):
@@ -21,10 +21,10 @@ $env:WIKIGRAPH_DATA_DIR = 'D:\WikiGraphData'
 ```
 
 The downloaded `.xml.bz2` is a source artifact. The production full-corpus
-path should stream it into an on-disk index (article title, byte size, and
-outgoing links), then expose sampled subgraphs through a local API. The UI can
-continue using the public API while that index is built. Keep both the dump
-and generated index under `WIKIGRAPH_DATA_DIR`; neither belongs in Git.
+path streams it into an on-disk index (article title, byte size, and outgoing
+links), then exposes progressive sampled subgraphs through a local API. Keep
+both the dump and generated index under `WIKIGRAPH_DATA_DIR`; neither belongs
+in Git.
 
 The dump URL is the official Wikimedia English Wikipedia `latest` multistream
 endpoint. Re-run the script only after moving or removing an existing file so
@@ -100,9 +100,10 @@ $env:WIKIGRAPH_DATA_DIR = 'D:\WikiGraphData'
 npm run wiki:serve
 ```
 
-Set `VITE_WIKIGRAPH_INDEX_URL=http://127.0.0.1:8787/api/graph` before starting
-Vite. The service reads either `D:\WikiGraphData\index.json` or the JSONL
-index at `D:\WikiGraphData\index\articles.jsonl`, samples deterministically
-up to the requested slider count, and exposes `/health`.
-Without an index it serves a tiny deterministic graph for endpoint testing;
-it never downloads, parses raw XML, or loads the full corpus into the browser.
+The service reads either `D:\WikiGraphData\index.json`, the JSONL index at
+`D:\WikiGraphData\index\articles.jsonl`, or progressive tiers at
+`D:\WikiGraphData\index\tiers`. It samples deterministically up to the
+requested local slider count, exposes `/health`, and serves the built frontend
+when run through `npm run wiki:host`. Without an index it serves a tiny
+deterministic graph for endpoint testing; it never downloads, parses raw XML,
+or loads the full corpus into the browser.
