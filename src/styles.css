@@ -52,6 +52,7 @@ button, select { -webkit-tap-highlight-color: transparent; }
 
 .workspace { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 82px); min-height: 560px; }
 .control-panel { padding: 35px 25px 20px; border-right: 1px solid #e7e9ed; background: #fbfcfe; display: flex; flex-direction: column; overflow-y: auto; }
+.control-panel > * { flex-shrink: 0; }
 .panel-heading { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 39px; }
 .panel-heading h2 { font-size: 18px; margin: 7px 0 0; letter-spacing: -.03em; color: #1c2027; }
 .status-pill { font: 500 9px 'DM Mono'; color: #254fef; border: 1px solid #cdd6ff; background: #f5f7ff; padding: 5px 7px; border-radius: 3px; white-space: nowrap; }

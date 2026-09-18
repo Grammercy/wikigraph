@@ -98,7 +98,7 @@ export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
   hubForceScale: 260,
   hubForceMax: 70,
   hubMaxNodes: 320,
-  linkDistanceScale: 90_000,
+  linkDistanceScale: 1_000,
   linkWeightFloor: 0.02,
   hubLinkDamping: 0.24,
   collisionPadding: 10,

@@ -41,7 +41,7 @@ const localHost = typeof window !== 'undefined' && (window.location.hostname ===
 // Local development and the D:-drive production host share the same API
 // contract. GitHub Pages and other public hosts stay on Wikipedia's API.
 const LOCAL_INDEX_URL = configuredLocalIndex || (localHost ? '/api/graph' : undefined)
-const LOCAL_MAX_NODES = 25_000
+const LOCAL_MAX_NODES = 100_000
 export const usesLocalCorpus = Boolean(LOCAL_INDEX_URL)
 
 function isWikiGraph(value: unknown): value is WikiGraph {

@@ -19,9 +19,11 @@ let jsonlCache = null
 let corpusStatsCache = null
 let tierManifestCache = null
 const tierGraphCache = new Map()
-// Keep the existing 500-node default, while allowing bounded larger tiers
-// for GPU-backed clients without ever attempting a full-corpus response.
-const CACHE_LIMIT = Math.max(500, Math.min(25000, Number(process.env.WIKIGRAPH_MAX_GRAPH_NODES || 25000) || 25000))
+// Keep the existing 500-node default, while allowing the complete 100k
+// progressive tier for GPU-backed clients without attempting a full-corpus
+// response in one browser tab. Set WIKIGRAPH_MAX_GRAPH_NODES lower when a
+// machine needs a smaller working set.
+const CACHE_LIMIT = Math.max(500, Math.min(100_000, Number(process.env.WIKIGRAPH_MAX_GRAPH_NODES || 100_000) || 100_000))
 const key = (value) => String(value).trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US')
 const refValue = (value) => value && typeof value === 'object' ? value.id ?? value.title ?? '' : value
 const hash = (value) => { let h = 2166136261; for (const c of String(value)) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0 }

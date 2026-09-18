@@ -42,7 +42,7 @@ function PhysicsSlider({ id, label, value, min, max, step, onChange, format }: P
 
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
-  const MAX_LOCAL_ARTICLES = 25_000
+  const MAX_LOCAL_ARTICLES = 100_000
   const [count, setCount] = useState(50)
   const [graph, setGraph] = useState<WikiGraph>({ nodes: [], links: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
