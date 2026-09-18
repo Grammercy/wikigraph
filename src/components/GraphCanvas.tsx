@@ -42,6 +42,72 @@ export type GraphCanvasProps = {
   className?: string
   /** Optional node color resolver, useful when groups are domain-specific. */
   getNodeColor?: (node: GraphNode) => string
+  /** Live-tunable force-layout parameters. */
+  settings?: GraphSimulationSettings
+}
+
+export type GraphSimulationSettings = {
+  baseCharge: number
+  articleImportanceCharge: number
+  hubCharge: number
+  chargeDistance: number
+  articleSizeWeight: number
+  articleMaxBytes: number
+  articleDegreeCap: number
+  hubDegreeReference: number
+  hubDegreeThreshold: number
+  unrelatedBaseStrength: number
+  unrelatedHubStrength: number
+  unrelatedDistance: number
+  unrelatedInteractionBudget: number
+  hubTerritoryBase: number
+  hubTerritoryScale: number
+  hubForceBase: number
+  hubForceScale: number
+  hubForceMax: number
+  hubMaxNodes: number
+  linkDistanceScale: number
+  linkWeightFloor: number
+  hubLinkDamping: number
+  collisionPadding: number
+  collisionIterations: number
+  centerStrength: number
+  velocityDecay: number
+  alphaDecay: number
+  alphaMin: number
+  alphaTarget: number
+}
+
+export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
+  baseCharge: 115,
+  articleImportanceCharge: 126,
+  hubCharge: 520,
+  chargeDistance: 480,
+  articleSizeWeight: 0.45,
+  articleMaxBytes: 2_000_000,
+  articleDegreeCap: 56,
+  hubDegreeReference: 60,
+  hubDegreeThreshold: 10,
+  unrelatedBaseStrength: 40,
+  unrelatedHubStrength: 220,
+  unrelatedDistance: 480,
+  unrelatedInteractionBudget: 220_000,
+  hubTerritoryBase: 360,
+  hubTerritoryScale: 260,
+  hubForceBase: 12,
+  hubForceScale: 260,
+  hubForceMax: 70,
+  hubMaxNodes: 320,
+  linkDistanceScale: 90_000,
+  linkWeightFloor: 0.02,
+  hubLinkDamping: 0.24,
+  collisionPadding: 10,
+  collisionIterations: 2,
+  centerStrength: 0.035,
+  velocityDecay: 0.4,
+  alphaDecay: 0.0228,
+  alphaMin: 0.001,
+  alphaTarget: 0.03,
 }
 
 type Point = { x: number; y: number }
@@ -52,27 +118,29 @@ const articleBytes = (node: GraphNode) => {
   const value = node.articleSize ?? node.byteLength ?? 0
   return Number.isFinite(value) && value > 0 ? value : 0
 }
-const articleImportance = (node: GraphNode) => {
-  const degree = Math.min(articleDegree(node), 56)
+const articleImportance = (node: GraphNode, settings: GraphSimulationSettings = DEFAULT_SIMULATION_SETTINGS) => {
+  const degree = Math.min(articleDegree(node), settings.articleDegreeCap)
   // Log scaling prevents unusually long articles from overwhelming the graph.
-  const bytes = Math.min(Math.max(articleBytes(node), 0), 2_000_000)
-  return Math.min(1, Math.log1p(bytes) / Math.log1p(2_000_000)) * 0.45 + Math.sqrt(degree / 56) * 0.55
+  const bytes = Math.min(Math.max(articleBytes(node), 0), settings.articleMaxBytes)
+  const sizeWeight = Math.max(0, Math.min(1, settings.articleSizeWeight))
+  return Math.min(1, Math.log1p(bytes) / Math.log1p(settings.articleMaxBytes)) * sizeWeight
+    + Math.sqrt(degree / settings.articleDegreeCap) * (1 - sizeWeight)
 }
 // Degree is intentionally normalized separately from visual importance. A
 // page can be a small article but still be a structural hub, and those hubs
 // need to create a much stronger boundary around other structural hubs.
-const hubRepulsionScore = (node: GraphNode) => {
+const hubRepulsionScore = (node: GraphNode, settings: GraphSimulationSettings = DEFAULT_SIMULATION_SETTINGS) => {
   const degree = articleDegree(node)
   // The UI marks degree-10 articles as blue hubs. Calibrate the physics to
   // that same visible threshold instead of waiting until degree 2,500 before
   // the special force becomes meaningful.
-  if (degree < 10) return 0
-  return Math.min(1, Math.log1p(degree) / Math.log1p(60))
+  if (degree < settings.hubDegreeThreshold) return 0
+  return Math.min(1, Math.log1p(degree) / Math.log1p(Math.max(1, settings.hubDegreeReference)))
 }
 // More connected articles are visually larger, with a cap so hubs never swallow
 // nearby nodes. Keeping this in one helper also keeps hit testing/collision aligned.
-const nodeRadius = (node: GraphNode) => {
-  return (node.id.length > 18 ? 5 : 6) + articleImportance(node) * 6
+const nodeRadius = (node: GraphNode, settings: GraphSimulationSettings = DEFAULT_SIMULATION_SETTINGS) => {
+  return (node.id.length > 18 ? 5 : 6) + articleImportance(node, settings) * 6
 }
 const LARGE_GRAPH_THRESHOLD = 2_000
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
@@ -83,7 +151,7 @@ const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
  * (x/y/vx/vy/fx/fy), so callers should treat those fields as simulation state.
  */
 const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
-  { graph, selectedId, onSelect, onHover, paused = false, className, getNodeColor },
+  { graph, selectedId, onSelect, onHover, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS },
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -104,10 +172,12 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const graphRef = useRef(graph)
   const selectedIdRef = useRef(selectedId)
   const colorResolverRef = useRef(getNodeColor)
+  const settingsRef = useRef(settings)
   const drawRef = useRef<() => void>(() => undefined)
   graphRef.current = graph
   selectedIdRef.current = selectedId
   colorResolverRef.current = getNodeColor
+  settingsRef.current = settings
   pausedRef.current = paused
 
   const renderWebGL = (gl: WebGL2RenderingContext, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
@@ -210,7 +280,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const distance = Math.hypot(dx, dy) || 1
       const ux = dx / distance
       const uy = dy / distance
-      const tip = { x: target.x - ux * (nodeRadius(target) + 2), y: target.y - uy * (nodeRadius(target) + 2) }
+      const tip = { x: target.x - ux * (nodeRadius(target, settingsRef.current) + 2), y: target.y - uy * (nodeRadius(target, settingsRef.current) + 2) }
       const size = isRelated ? 5 : 4
       ctx.fillStyle = ctx.strokeStyle
       ctx.beginPath()
@@ -225,7 +295,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.font = '500 11px Inter, ui-sans-serif, system-ui, sans-serif'
     for (const node of nodes) {
       if (node.x == null || node.y == null) continue
-      const radius = nodeRadius(node)
+      const radius = nodeRadius(node, settingsRef.current)
       const active = node === selected || node === hovered
       if (active) {
         ctx.beginPath()
@@ -311,21 +381,24 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
         // The cubic hub term makes high-degree pages repel the whole graph
         // strongly enough to expose topic islands, while the dedicated
         // hub-repulsion force below handles hub-to-hub separation directly.
-        .strength((node) => -115 - articleImportance(node) * 126 - hubRepulsionScore(node) ** 3 * 520)
-        .distanceMax(480))
+        .strength((node) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge - hubRepulsionScore(node, settings) ** 3 * settings.hubCharge)
+        .distanceMax(settings.chargeDistance))
       // A direct link is allowed to pull its endpoints together, but a nearby
       // pair with no loaded link in either direction receives an extra push.
       // This makes disconnected topic islands separate instead of relying on
       // the same generic charge for every relationship.
-      .force('unrelated-repulsion', unrelatedRepulsion(graph.links, graph.nodes, largeGraph))
-      .force('hub-repulsion', hubRepulsion(largeGraph))
-      .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + (largeGraph ? 5 : 10)).iterations(largeGraph ? 1 : 2))
-      .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))
+      .force('unrelated-repulsion', unrelatedRepulsion(graph.links, graph.nodes, largeGraph, settings))
+      .force('hub-repulsion', hubRepulsion(largeGraph, settings))
+      .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + (largeGraph ? Math.max(5, settings.collisionPadding / 2) : settings.collisionPadding)).iterations(largeGraph ? Math.max(1, Math.round(settings.collisionIterations / 2)) : Math.max(1, Math.round(settings.collisionIterations))))
+      .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
       // The arrow remains directed in the renderer, but the physical spring is
       // symmetric: both articles move toward one another for every link.
       // Applying equal-and-opposite velocity keeps the map stable and prevents
       // a one-way link from making its target appear artificially anchored.
-      .force('link-attraction', symmetricAttraction(attractionLinks, graph.nodes))
+      .force('link-attraction', symmetricAttraction(attractionLinks, graph.nodes, settings))
+      .velocityDecay(settings.velocityDecay)
+      .alphaDecay(settings.alphaDecay)
+      .alphaMin(settings.alphaMin)
     simulationRef.current = sim
     let framePending = false
     sim.on('tick', () => {
@@ -336,15 +409,15 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     })
     if (pausedRef.current) sim.stop()
     return () => { sim.stop(); simulationRef.current = null }
-  }, [graph])
+  }, [graph, settings])
 
   useEffect(() => { drawRef.current() }, [selectedId])
 
   useEffect(() => {
-    simulationRef.current?.alphaTarget(paused ? 0 : 0.03)
+    simulationRef.current?.alphaTarget(paused ? 0 : settings.alphaTarget)
     if (paused) simulationRef.current?.stop()
     else simulationRef.current?.restart()
-  }, [paused])
+  }, [paused, settings.alphaTarget])
 
   useEffect(() => {
     const host = hostRef.current
@@ -373,7 +446,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const rect = event.currentTarget.getBoundingClientRect(); const view = viewRef.current
     return { x: (event.clientX - rect.left - view.x) / view.scale, y: (event.clientY - rect.top - view.y) / view.scale }
   }
-  const hit = (point: Point) => graph.nodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (nodeRadius(node) + 7) / viewRef.current.scale)
+  const hit = (point: Point) => graph.nodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (nodeRadius(node, settingsRef.current) + 7) / viewRef.current.scale)
 
   return <div ref={hostRef} className={className} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
     <canvas ref={webglCanvasRef} aria-hidden="true" style={{ position: 'absolute', inset: 0, display: graph.nodes.length > LARGE_GRAPH_THRESHOLD ? 'block' : 'none', width: '100%', height: '100%', pointerEvents: 'none' }} />
@@ -399,14 +472,14 @@ function pairKey(first: string, second: string) {
  * spatial grid keeps the exact unlinked-pair check local; the interaction
  * budget and rotating traversal keep dense 25k-node tiers responsive.
  */
-function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], largeGraph: boolean) {
+function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], largeGraph: boolean, settings: GraphSimulationSettings) {
   let orderedNodes = initialNodes
   let nodeOrder = new Map<GraphNode, number>()
   let relatedPairs = new Set<string>()
   let tickIndex = 0
   const force = (alpha: number) => {
     const cellSize = largeGraph ? 240 : 200
-    const maxDistance = largeGraph ? 480 : 420
+    const maxDistance = largeGraph ? Math.min(settings.unrelatedDistance, 480) : Math.min(settings.unrelatedDistance, 420)
     const cellRadius = Math.ceil(maxDistance / cellSize)
     const cells = new Map<string, GraphNode[]>()
     for (const node of orderedNodes) {
@@ -420,7 +493,7 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
     let interactions = 0
     const interactionBudget = orderedNodes.length < LARGE_GRAPH_THRESHOLD
       ? Number.POSITIVE_INFINITY
-      : largeGraph ? 220_000 : 320_000
+      : largeGraph ? settings.unrelatedInteractionBudget : settings.unrelatedInteractionBudget * 1.45
     const start = orderedNodes.length ? tickIndex++ % orderedNodes.length : 0
     outer: for (let visited = 0; visited < orderedNodes.length; visited += 1) {
       const sourceIndex = (start + visited) % orderedNodes.length
@@ -448,8 +521,8 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
             if (distance > maxDistance) continue
             interactions += 1
             const falloff = 1 - distance / maxDistance
-            const hubBoost = 0.6 + 1.4 * Math.max(hubRepulsionScore(source), hubRepulsionScore(target))
-            const magnitude = Math.min(14, ((40 + 220 * hubBoost) / Math.max(28, distance)) * falloff) * alpha
+            const hubBoost = 0.6 + 1.4 * Math.max(hubRepulsionScore(source, settings), hubRepulsionScore(target, settings))
+            const magnitude = Math.min(14, ((settings.unrelatedBaseStrength + settings.unrelatedHubStrength * hubBoost) / Math.max(28, distance)) * falloff) * alpha
             const vx = dx / distance * magnitude
             const vy = dy / distance * magnitude
             source.vx = (source.vx ?? 0) + vx
@@ -477,8 +550,7 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
   return force
 }
 
-function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
-  const LINK_PULL_SCALE = 90_000
+function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: GraphSimulationSettings) {
   let resolved: Array<[GraphNode, GraphNode, number]> = []
   const force = (alpha: number) => {
     for (const [source, target, weight] of resolved) {
@@ -490,7 +562,7 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
       // There is intentionally no distance ceiling: long links pull harder,
       // as requested, while endpoint-degree normalization still keeps hubs
       // from receiving one full-strength spring per incident edge.
-      const pullMagnitude = (distance * distance) / LINK_PULL_SCALE * weight * alpha
+      const pullMagnitude = (distance * distance) / settings.linkDistanceScale * weight * alpha
       const pullX = dx / distance * pullMagnitude
       const pullY = dy / distance * pullMagnitude
 
@@ -518,9 +590,9 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
     resolved = candidates.map(([source, target]) => {
       const sourceDegree = Math.max(1, articleDegree(source))
       const targetDegree = Math.max(1, articleDegree(target))
-      const degreeWeight = Math.max(0.02, 1 / Math.sqrt(sourceDegree * targetDegree))
-      const bothHubs = hubRepulsionScore(source) > 0 && hubRepulsionScore(target) > 0
-      const hubDamping = bothHubs ? 0.24 : 1
+      const degreeWeight = Math.max(settings.linkWeightFloor, 1 / Math.sqrt(sourceDegree * targetDegree))
+      const bothHubs = hubRepulsionScore(source, settings) > 0 && hubRepulsionScore(target, settings) > 0
+      const hubDamping = bothHubs ? settings.hubLinkDamping : 1
       return [source, target, degreeWeight * hubDamping]
     })
     void simulationNodes
@@ -534,18 +606,18 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
  * "hub versus hub" boundary. We compare only a capped, degree-sorted hub set
  * and give every pair a preferred territory radius.
  */
-function hubRepulsion(largeGraph: boolean) {
+function hubRepulsion(largeGraph: boolean, settings: GraphSimulationSettings) {
   let hubs: GraphNode[] = []
   const force = (alpha: number) => {
-    const maxHubDistance = largeGraph ? 720 : 660
+    const maxHubDistance = settings.hubTerritoryBase + settings.hubTerritoryScale + 100
     for (let sourceIndex = 0; sourceIndex < hubs.length; sourceIndex += 1) {
       const source = hubs[sourceIndex]
       if (source.x == null || source.y == null) continue
-      const sourceScore = hubRepulsionScore(source)
+      const sourceScore = hubRepulsionScore(source, settings)
       for (let targetIndex = sourceIndex + 1; targetIndex < hubs.length; targetIndex += 1) {
         const target = hubs[targetIndex]
         if (target.x == null || target.y == null) continue
-        const targetScore = hubRepulsionScore(target)
+        const targetScore = hubRepulsionScore(target, settings)
         const sourceX = source.x as number
         const sourceY = source.y as number
         let dx = sourceX - (target.x as number)
@@ -560,13 +632,13 @@ function hubRepulsion(largeGraph: boolean) {
           distance = 1
         }
         const pairScore = Math.pow(sourceScore * targetScore, 1.2)
-        const preferredDistance = Math.min(maxHubDistance, 360 + 260 * ((sourceScore + targetScore) / 2))
+        const preferredDistance = Math.min(maxHubDistance, settings.hubTerritoryBase + settings.hubTerritoryScale * ((sourceScore + targetScore) / 2))
         if (distance >= preferredDistance) continue
         const deficit = 1 - distance / preferredDistance
         // This is intentionally much larger than the incident-link spring for
         // visible hubs. It creates an exclusion territory, not just a small
         // nudge, while the cap keeps the simulation finite at alpha=1.
-        const magnitude = Math.min(70, (12 + 260 * pairScore) * deficit) * alpha
+        const magnitude = Math.min(settings.hubForceMax, (settings.hubForceBase + settings.hubForceScale * pairScore) * deficit) * alpha
         const vx = dx / distance * magnitude
         const vy = dy / distance * magnitude
         source.vx = (source.vx ?? 0) + vx
@@ -577,9 +649,9 @@ function hubRepulsion(largeGraph: boolean) {
     }
   }
   force.initialize = (simulationNodes: GraphNode[]) => {
-    const maxHubs = largeGraph ? 320 : 256
+    const maxHubs = largeGraph ? settings.hubMaxNodes : Math.round(settings.hubMaxNodes * 0.8)
     hubs = [...simulationNodes]
-      .filter((node) => hubRepulsionScore(node) > 0)
+      .filter((node) => hubRepulsionScore(node, settings) > 0)
       .sort((a, b) => articleDegree(b) - articleDegree(a) || a.id.localeCompare(b.id))
       .slice(0, maxHubs)
   }

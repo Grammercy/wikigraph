@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import GraphCanvas, { type GraphCanvasHandle } from './components/GraphCanvas'
+import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphSimulationSettings } from './components/GraphCanvas'
 import { fetchWikiGraphProgressive, fetchWikiStats, usesLocalCorpus } from './data/wiki'
 import type { WikiGraph, WikiStats } from './types'
 
@@ -20,6 +20,26 @@ function formatCount(value?: number | null) {
   return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value as number)
 }
 
+type PhysicsSliderProps = {
+  id: string
+  label: string
+  value: number
+  min: number
+  max: number
+  step: number
+  onChange: (value: number) => void
+  format?: (value: number) => string
+}
+
+function PhysicsSlider({ id, label, value, min, max, step, onChange, format }: PhysicsSliderProps) {
+  const progress = `${Math.max(0, Math.min(100, ((value - min) / Math.max(1e-9, max - min)) * 100))}%`
+  const display = format?.(value) ?? (step < 0.01 ? value.toFixed(4) : step < 1 ? value.toFixed(3) : Math.round(value).toLocaleString())
+  return <label className="simulation-control" htmlFor={id}>
+    <span className="simulation-control-label"><span>{label}</span><output>{display}</output></span>
+    <input id={id} className="range simulation-range" type="range" min={min} max={max} step={step} value={value} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${progress}, #d9dde5 ${progress})` }} onChange={(event) => onChange(Number(event.target.value))} />
+  </label>
+}
+
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
   const MAX_LOCAL_ARTICLES = 25_000
@@ -34,9 +54,13 @@ export default function App() {
   const [corpusStats, setCorpusStats] = useState<WikiStats | null>(null)
   const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
   const [largeMapAcknowledged, setLargeMapAcknowledged] = useState(false)
+  const [simulationSettings, setSimulationSettings] = useState<GraphSimulationSettings>(() => ({ ...DEFAULT_SIMULATION_SETTINGS }))
   const requestRef = useRef<AbortController | null>(null)
   const requestVersionRef = useRef(0)
   const canvasRef = useRef<GraphCanvasHandle>(null)
+  const updateSimulationSetting = useCallback(<K extends keyof GraphSimulationSettings>(key: K, value: GraphSimulationSettings[K]) => {
+    setSimulationSettings((previous) => ({ ...previous, [key]: value }))
+  }, [])
 
   const load = useCallback(async (amount: number) => {
     const version = ++requestVersionRef.current
@@ -135,6 +159,43 @@ export default function App() {
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
         <button className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-pressed={showLabels}><span>Article labels</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
+        <details className="simulation-settings" open>
+          <summary><span>Advanced physics</span><span className="settings-live">LIVE</span></summary>
+          <p className="simulation-settings-note">Adjust every major force and cooling value. Changes restart the layout without fetching new articles.</p>
+          <div className="settings-group-title">REPULSION &amp; LINKS</div>
+          <PhysicsSlider id="setting-base-charge" label="Base repulsion" value={simulationSettings.baseCharge} min={0} max={400} step={5} onChange={(value) => updateSimulationSetting('baseCharge', value)} />
+          <PhysicsSlider id="setting-importance-charge" label="Article importance" value={simulationSettings.articleImportanceCharge} min={0} max={500} step={5} onChange={(value) => updateSimulationSetting('articleImportanceCharge', value)} />
+          <PhysicsSlider id="setting-hub-charge" label="Hub repulsion" value={simulationSettings.hubCharge} min={0} max={1500} step={10} onChange={(value) => updateSimulationSetting('hubCharge', value)} />
+          <PhysicsSlider id="setting-charge-distance" label="Charge radius" value={simulationSettings.chargeDistance} min={100} max={2000} step={10} onChange={(value) => updateSimulationSetting('chargeDistance', value)} />
+          <PhysicsSlider id="setting-link-scale" label="Link distance² scale" value={simulationSettings.linkDistanceScale} min={1000} max={300000} step={1000} onChange={(value) => updateSimulationSetting('linkDistanceScale', value)} format={(value) => value.toLocaleString()} />
+          <PhysicsSlider id="setting-link-floor" label="Link weight floor" value={simulationSettings.linkWeightFloor} min={0} max={0.25} step={0.005} onChange={(value) => updateSimulationSetting('linkWeightFloor', value)} />
+          <PhysicsSlider id="setting-hub-damping" label="Hub-link damping" value={simulationSettings.hubLinkDamping} min={0} max={1} step={0.01} onChange={(value) => updateSimulationSetting('hubLinkDamping', value)} />
+          <PhysicsSlider id="setting-unrelated-base" label="Unrelated push" value={simulationSettings.unrelatedBaseStrength} min={0} max={500} step={5} onChange={(value) => updateSimulationSetting('unrelatedBaseStrength', value)} />
+          <PhysicsSlider id="setting-unrelated-hub" label="Unrelated hub push" value={simulationSettings.unrelatedHubStrength} min={0} max={1000} step={10} onChange={(value) => updateSimulationSetting('unrelatedHubStrength', value)} />
+          <PhysicsSlider id="setting-unrelated-distance" label="Unrelated radius" value={simulationSettings.unrelatedDistance} min={100} max={1200} step={10} onChange={(value) => updateSimulationSetting('unrelatedDistance', value)} />
+          <PhysicsSlider id="setting-unrelated-budget" label="Unrelated work budget" value={simulationSettings.unrelatedInteractionBudget} min={20000} max={500000} step={10000} onChange={(value) => updateSimulationSetting('unrelatedInteractionBudget', value)} format={(value) => value.toLocaleString()} />
+          <div className="settings-group-title">HUB TERRITORIES</div>
+          <PhysicsSlider id="setting-hub-threshold" label="Hub degree threshold" value={simulationSettings.hubDegreeThreshold} min={0} max={50} step={1} onChange={(value) => updateSimulationSetting('hubDegreeThreshold', value)} />
+          <PhysicsSlider id="setting-hub-reference" label="Hub score reference" value={simulationSettings.hubDegreeReference} min={10} max={500} step={5} onChange={(value) => updateSimulationSetting('hubDegreeReference', value)} />
+          <PhysicsSlider id="setting-territory-base" label="Territory base" value={simulationSettings.hubTerritoryBase} min={50} max={1000} step={10} onChange={(value) => updateSimulationSetting('hubTerritoryBase', value)} />
+          <PhysicsSlider id="setting-territory-scale" label="Territory degree scale" value={simulationSettings.hubTerritoryScale} min={0} max={1000} step={10} onChange={(value) => updateSimulationSetting('hubTerritoryScale', value)} />
+          <PhysicsSlider id="setting-hub-force-base" label="Hub force base" value={simulationSettings.hubForceBase} min={0} max={100} step={1} onChange={(value) => updateSimulationSetting('hubForceBase', value)} />
+          <PhysicsSlider id="setting-hub-force-scale" label="Hub force scale" value={simulationSettings.hubForceScale} min={0} max={1000} step={10} onChange={(value) => updateSimulationSetting('hubForceScale', value)} />
+          <PhysicsSlider id="setting-hub-force-max" label="Hub force maximum" value={simulationSettings.hubForceMax} min={1} max={200} step={1} onChange={(value) => updateSimulationSetting('hubForceMax', value)} />
+          <PhysicsSlider id="setting-hub-count" label="Hub interaction count" value={simulationSettings.hubMaxNodes} min={16} max={800} step={16} onChange={(value) => updateSimulationSetting('hubMaxNodes', value)} />
+          <div className="settings-group-title">IMPORTANCE &amp; MOTION</div>
+          <PhysicsSlider id="setting-size-weight" label="Article-size weight" value={simulationSettings.articleSizeWeight} min={0} max={1} step={0.05} onChange={(value) => updateSimulationSetting('articleSizeWeight', value)} />
+          <PhysicsSlider id="setting-max-bytes" label="Article-size ceiling" value={simulationSettings.articleMaxBytes} min={100000} max={10000000} step={100000} onChange={(value) => updateSimulationSetting('articleMaxBytes', value)} format={(value) => `${(value / 1000000).toFixed(1)} MB`} />
+          <PhysicsSlider id="setting-degree-cap" label="Degree importance ceiling" value={simulationSettings.articleDegreeCap} min={1} max={500} step={1} onChange={(value) => updateSimulationSetting('articleDegreeCap', value)} />
+          <PhysicsSlider id="setting-collision-padding" label="Collision padding" value={simulationSettings.collisionPadding} min={0} max={40} step={1} onChange={(value) => updateSimulationSetting('collisionPadding', value)} />
+          <PhysicsSlider id="setting-collision-iterations" label="Collision passes" value={simulationSettings.collisionIterations} min={1} max={6} step={1} onChange={(value) => updateSimulationSetting('collisionIterations', value)} />
+          <PhysicsSlider id="setting-center" label="Centering strength" value={simulationSettings.centerStrength} min={0} max={0.2} step={0.005} onChange={(value) => updateSimulationSetting('centerStrength', value)} />
+          <PhysicsSlider id="setting-velocity-decay" label="Velocity damping" value={simulationSettings.velocityDecay} min={0} max={0.9} step={0.01} onChange={(value) => updateSimulationSetting('velocityDecay', value)} />
+          <PhysicsSlider id="setting-alpha-decay" label="Alpha decay" value={simulationSettings.alphaDecay} min={0.001} max={0.1} step={0.001} onChange={(value) => updateSimulationSetting('alphaDecay', value)} />
+          <PhysicsSlider id="setting-alpha-min" label="Alpha minimum" value={simulationSettings.alphaMin} min={0.0001} max={0.02} step={0.0001} onChange={(value) => updateSimulationSetting('alphaMin', value)} />
+          <PhysicsSlider id="setting-alpha-target" label="Running alpha target" value={simulationSettings.alphaTarget} min={0} max={0.2} step={0.005} onChange={(value) => updateSimulationSetting('alphaTarget', value)} />
+          <button type="button" className="settings-reset" onClick={() => setSimulationSettings({ ...DEFAULT_SIMULATION_SETTINGS })}>Reset physics values</button>
+        </details>
         <label className="field-label article-select-label" htmlFor="article-select">SELECT ARTICLE</label>
         <select id="article-select" className="article-select" value={selectedId ?? ''} onChange={(event) => setSelectedId(event.target.value || null)} disabled={!graph.nodes.length}>
           <option value="">Choose an article…</option>
@@ -146,7 +207,7 @@ export default function App() {
       <section className="canvas-panel" aria-label="Wikipedia article graph">
         <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections{corpusStats?.articles && <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></>}{hoveredId && <><i /> <span className="hover-readout">{graph.nodes.find((node) => node.id === hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas ref={canvasRef} graph={graphForCanvas} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} paused={paused} />
+        <GraphCanvas ref={canvasRef} graph={graphForCanvas} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
         <div className="canvas-footer"><span className="legend-key"><i className="node-key" /> Article</span><span className="legend-key"><i className="edge-key" /> Link direction</span><span className="canvas-credit">Wikipedia · public knowledge</span></div>
