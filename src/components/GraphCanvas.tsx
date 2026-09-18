@@ -457,11 +457,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     simulationRef.current = sim
     let framePending = false
     let invalidState = false
-    let validationTicks = 0
+    let simulationTicks = 0
     const protectNumerics = largeGraph || settings.linkDistanceScale < 10_000
     sim.on('tick', () => {
-      if (!invalidState && protectNumerics && validationTicks < 120) {
-        validationTicks += 1
+      simulationTicks += 1
+      if (!invalidState && protectNumerics && (simulationTicks <= 120 || simulationTicks % 32 === 0)) {
         const numericLimit = 1_000_000
         const invalid = graph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy)
           || Math.abs(node.x ?? 0) > numericLimit || Math.abs(node.y ?? 0) > numericLimit
