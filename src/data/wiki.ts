@@ -197,4 +197,54 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
   }
 }
 
+export type WikiGraphProgress = {
+  loaded: number
+  requested: number
+  graph: WikiGraph
+}
+
+/**
+ * Grow a graph in bounded batches so a large map never blocks the UI on one
+ * enormous request. Each batch is emitted as soon as it arrives; callers can
+ * render the partial graph while the remaining Wikipedia pages are fetched.
+ */
+export async function fetchWikiGraphProgressive(
+  count: number,
+  signal?: AbortSignal,
+  onProgress?: (progress: WikiGraphProgress) => void,
+): Promise<WikiGraph> {
+  const requested = Math.max(1, Math.min(Math.floor(count) || 1, 5_000))
+  const merged: WikiGraph = { nodes: [], links: [], source: 'wikipedia' }
+  const nodeIds = new Set<string>()
+  const linkIds = new Set<string>()
+  let completed = 0
+
+  while (completed < requested) {
+    if (signal?.aborted) throw new DOMException('The graph request was cancelled.', 'AbortError')
+    const batchSize = Math.min(MAX_BATCH * 2, requested - completed)
+    const batch = await fetchWikiGraph(batchSize, signal)
+    if (batch.source === 'fallback') merged.source = 'fallback'
+    for (const node of batch.nodes) {
+      if (nodeIds.has(node.id)) continue
+      nodeIds.add(node.id)
+      merged.nodes.push(node)
+    }
+    const available = new Set(merged.nodes.map((node) => node.id))
+    for (const link of batch.links) {
+      const source = typeof link.source === 'string' ? link.source : link.source.id
+      const target = typeof link.target === 'string' ? link.target : link.target.id
+      const key = `${source}\u0000${target}`
+      if (source !== target && available.has(source) && available.has(target) && !linkIds.has(key)) {
+        linkIds.add(key)
+        merged.links.push({ source, target })
+      }
+    }
+    completed += batchSize
+    onProgress?.({ loaded: Math.min(completed, requested), requested, graph: { ...merged, nodes: [...merged.nodes], links: [...merged.links] } })
+    // A fallback graph is finite; avoid repeatedly emitting the same demo map.
+    if (batch.source === 'fallback' && batch.nodes.length < batchSize) break
+  }
+  return merged
+}
+
 export { buildFallbackGraph }

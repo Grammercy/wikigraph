@@ -69,6 +69,8 @@ button, select { -webkit-tap-highlight-color: transparent; }
 .primary-button span { font-size: 18px; margin-right: 9px; vertical-align: -1px; }
 .primary-button:hover:not(:disabled) { background: #1f44d2; }
 .primary-button:disabled { opacity: .65; cursor: wait; }
+.large-map-warning { display: flex; gap: 8px; align-items: flex-start; margin-top: 17px; padding: 10px; border: 1px solid #e5d4b0; background: #fffaf0; color: #78551e; font-size: 11px; line-height: 1.45; }
+.large-map-warning input { flex: 0 0 auto; margin-top: 2px; accent-color: #254fef; }
 .rule { height: 1px; background: #e7e9ed; margin: 31px 0 27px; }
 .toggle-row { background: none; border: 0; color: #555c68; width: 100%; display: flex; justify-content: space-between; padding: 12px 0; font: 12px 'Space Grotesk'; cursor: pointer; text-align: left; }
 .toggle-row:hover { color: #1c2027; }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { type GraphCanvasHandle } from './components/GraphCanvas'
-import { fetchWikiGraph } from './data/wiki'
+import { fetchWikiGraphProgressive } from './data/wiki'
 import type { WikiGraph } from './types'
 
 function formatArticleSize(bytes?: number) {
@@ -16,6 +16,7 @@ function formatArticleSize(bytes?: number) {
 }
 
 export default function App() {
+  const SAFE_NODE_THRESHOLD = 1000
   const [count, setCount] = useState(50)
   const [graph, setGraph] = useState<WikiGraph>({ nodes: [], links: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -24,6 +25,8 @@ export default function App() {
   const [paused, setPaused] = useState(false)
   const [showLabels, setShowLabels] = useState(true)
   const [hoveredId, setHoveredId] = useState<string | null>(null)
+  const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
+  const [largeMapAcknowledged, setLargeMapAcknowledged] = useState(false)
   const requestRef = useRef<AbortController | null>(null)
   const requestVersionRef = useRef(0)
   const canvasRef = useRef<GraphCanvasHandle>(null)
@@ -34,9 +37,14 @@ export default function App() {
     const controller = new AbortController()
     requestRef.current = controller
     setLoading(true)
+    setLoadProgress({ loaded: 0, requested: amount })
     setError(null)
     try {
-      const next = await fetchWikiGraph(amount, controller.signal)
+      const next = await fetchWikiGraphProgressive(amount, controller.signal, ({ loaded, requested, graph: partial }) => {
+        if (version !== requestVersionRef.current) return
+        setLoadProgress({ loaded, requested })
+        setGraph(partial)
+      })
       if (version !== requestVersionRef.current) return
       setGraph(next)
       setSelectedId(null)
@@ -87,7 +95,11 @@ export default function App() {
     links: graph.links,
   }), [graph, showLabels])
   const statusLabel = loading ? 'FETCHING' : graph.source === 'fallback' ? 'DEMO DATA' : graph.nodes.length ? 'WIKIPEDIA' : 'READY'
-  const rangeProgress = `${Math.round(((count - 10) / 490) * 100)}%`
+  const rangeProgress = `${Math.round(((count - 10) / 4_990) * 100)}%`
+  const largeMap = count > SAFE_NODE_THRESHOLD
+  const progressLabel = loading && loadProgress.requested > 500
+    ? `Loading ${loadProgress.loaded.toLocaleString()} / ${loadProgress.requested.toLocaleString()}…`
+    : 'Loading graph…'
 
   return <main className="app-shell">
     <header className="topbar">
@@ -99,9 +111,10 @@ export default function App() {
       <aside className="control-panel">
         <div className="panel-heading"><div><div className="eyebrow">CONTROL DECK</div><h2>Shape your map</h2></div><span className={`status-pill ${graph.source === 'fallback' ? 'offline' : ''}`}>● {statusLabel}</span></div>
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
-        <input id="article-count" className="range" type="range" min="10" max="500" step="10" value={count} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${rangeProgress}, #d9dde5 ${rangeProgress})` }} onChange={(event) => setCount(Number(event.target.value))} />
-        <div className="range-labels"><span>10</span><span>500</span></div>
-        <button className="primary-button" onClick={() => void load(count)} disabled={loading}><span>{loading ? '◌' : '↻'}</span>{loading ? 'Loading graph…' : 'Generate new map'}</button>
+        <input id="article-count" className="range" type="range" min="10" max="5000" step="10" value={count} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${rangeProgress}, #d9dde5 ${rangeProgress})` }} onChange={(event) => { setCount(Number(event.target.value)); setLargeMapAcknowledged(false) }} />
+        <div className="range-labels"><span>10</span><span>5,000</span></div>
+        {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and GPU time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
+        <button className="primary-button" onClick={() => void load(count)} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
         <div className="rule" />
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
@@ -118,7 +131,7 @@ export default function App() {
         <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections{hoveredId && <><i /> <span className="hover-readout">{graph.nodes.find((node) => node.id === hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
         <GraphCanvas ref={canvasRef} graph={graphForCanvas} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} paused={paused} />
-        {loading && <div className="loading-overlay"><span className="spinner" />Mapping Wikipedia…</div>}
+        {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
         <div className="canvas-footer"><span className="legend-key"><i className="node-key" /> Article</span><span className="legend-key"><i className="edge-key" /> Link direction</span><span className="canvas-credit">Wikipedia · public knowledge</span></div>
       </section>
