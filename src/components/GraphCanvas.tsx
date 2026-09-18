@@ -76,6 +76,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const webglCanvasRef = useRef<HTMLCanvasElement>(null)
+  const webglRef = useRef<WebGL2RenderingContext | null>(null)
+  const webglProgramRef = useRef<WebGLProgram | null>(null)
+  const webglBuffersRef = useRef<{ positions: WebGLBuffer; colors: WebGLBuffer } | null>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   const simulationRef = useRef<Simulation<GraphNode, undefined> | null>(null)
   const viewRef = useRef<View>({ x: 0, y: 0, scale: 1 })
@@ -95,6 +99,58 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   colorResolverRef.current = getNodeColor
   pausedRef.current = paused
 
+  const renderWebGL = (gl: WebGL2RenderingContext, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
+    const program = webglProgramRef.current
+    const buffers = webglBuffersRef.current
+    if (!program || !buffers) return
+    const { width, height, dpr } = sizeRef.current
+    const view = viewRef.current
+    const toClip = (x: number, y: number) => [((x * view.scale + view.x) / width) * 2 - 1, 1 - ((y * view.scale + view.y) / height) * 2]
+    const positions: number[] = []
+    const colors: number[] = []
+    const pushColor = (color: string, alpha: number) => {
+      const hex = color.startsWith('#') ? color.slice(1) : ''
+      const value = hex.length === 6 ? Number.parseInt(hex, 16) : 0x73777f
+      colors.push(((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255, alpha)
+    }
+    const stride = links.length > 250_000 ? Math.ceil(links.length / 250_000) : 1
+    for (let index = 0; index < links.length; index += stride) {
+      const edge = links[index]
+      const source = linkNode(edge.source, nodeMap)
+      const target = linkNode(edge.target, nodeMap)
+      if (!source || !target || source.x == null || source.y == null || target.x == null || target.y == null) continue
+      const related = source === selected || target === selected
+      positions.push(...toClip(source.x, source.y), ...toClip(target.x, target.y))
+      pushColor('#254fef', related ? 0.72 : 0.16); pushColor('#254fef', related ? 0.72 : 0.16)
+    }
+    const lineVertexCount = positions.length / 2
+    for (const node of nodes) {
+      if (node.x == null || node.y == null) continue
+      positions.push(...toClip(node.x, node.y))
+      const active = node === selected || node === hovered
+      const color = active || node === selected ? '#254fef' : (colorResolverRef.current?.(node) ?? node.color ?? '#9aabf8')
+      pushColor(color, 1)
+    }
+    gl.viewport(0, 0, Math.round(width * dpr), Math.round(height * dpr))
+    gl.clearColor(1, 1, 1, 0)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.useProgram(program)
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.positions)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.DYNAMIC_DRAW)
+    const positionLocation = gl.getAttribLocation(program, 'a_position')
+    gl.enableVertexAttribArray(positionLocation); gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0)
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.colors)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.DYNAMIC_DRAW)
+    const colorLocation = gl.getAttribLocation(program, 'a_color')
+    gl.enableVertexAttribArray(colorLocation); gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, 0, 0)
+    gl.lineWidth(1)
+    gl.drawArrays(gl.LINES, 0, lineVertexCount)
+    const nodeVertexCount = positions.length / 2 - lineVertexCount
+    const pointSize = gl.getUniformLocation(program, 'u_point_size')
+    gl.uniform1f(pointSize, Math.max(3, Math.min(24, 8 * view.scale * dpr)))
+    gl.drawArrays(gl.POINTS, lineVertexCount, nodeVertexCount)
+  }
+
   const draw = () => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -113,6 +169,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const nodeMap = new Map(nodes.map((node) => [node.id, node]))
     const selected = selectedIdRef.current ? nodeMap.get(selectedIdRef.current) : undefined
     const hovered = hoverRef.current
+    if (largeGraph && webglRef.current && webglProgramRef.current) {
+      renderWebGL(webglRef.current, nodes, currentGraph.links, selected, hovered, nodeMap)
+      ctx.clearRect(0, 0, width, height)
+      return
+    }
     const linkStride = largeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
 
     ctx.lineCap = 'round'
@@ -197,6 +258,29 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }), [graph.nodes])
 
   useEffect(() => {
+    const canvas = webglCanvasRef.current
+    if (!canvas) return
+    const gl = canvas.getContext('webgl2', { antialias: false, alpha: true })
+    if (!gl) return
+    const vertex = gl.createShader(gl.VERTEX_SHADER)
+    const fragment = gl.createShader(gl.FRAGMENT_SHADER)
+    if (!vertex || !fragment) return
+    gl.shaderSource(vertex, '#version 300 es\nin vec2 a_position; in vec4 a_color; uniform float u_point_size; out vec4 v_color; void main(){gl_Position=vec4(a_position,0.0,1.0); gl_PointSize=u_point_size; v_color=a_color;}')
+    gl.shaderSource(fragment, '#version 300 es\nprecision mediump float; in vec4 v_color; out vec4 outColor; void main(){outColor=v_color;}')
+    gl.compileShader(vertex); gl.compileShader(fragment)
+    if (!gl.getShaderParameter(vertex, gl.COMPILE_STATUS) || !gl.getShaderParameter(fragment, gl.COMPILE_STATUS)) return
+    const program = gl.createProgram()
+    if (!program) return
+    gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program)
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return
+    const positions = gl.createBuffer(); const colors = gl.createBuffer()
+    if (!positions || !colors) return
+    webglRef.current = gl; webglProgramRef.current = program; webglBuffersRef.current = { positions, colors }
+    drawRef.current()
+    return () => { webglRef.current = null; webglProgramRef.current = null; webglBuffersRef.current = null }
+  }, [])
+
+  useEffect(() => {
     const { width, height } = sizeRef.current
     if (width > 1 && height > 1) viewRef.current = { x: width / 2, y: height / 2, scale: 1 }
     const largeGraph = graph.nodes.length > LARGE_GRAPH_THRESHOLD
@@ -247,6 +331,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const dpr = Math.min(window.devicePixelRatio || 1, 2)
       sizeRef.current = { width: Math.max(1, rect.width), height: Math.max(1, rect.height), dpr }
       canvas.width = Math.round(rect.width * dpr); canvas.height = Math.round(rect.height * dpr)
+      const webglCanvas = webglCanvasRef.current
+      if (webglCanvas) { webglCanvas.width = Math.round(rect.width * dpr); webglCanvas.height = Math.round(rect.height * dpr); webglCanvas.style.width = `${rect.width}px`; webglCanvas.style.height = `${rect.height}px` }
       if (!viewInitializedRef.current) {
         viewRef.current = { x: rect.width / 2, y: rect.height / 2, scale: 1 }
         viewInitializedRef.current = true
@@ -265,7 +351,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const hit = (point: Point) => graph.nodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (nodeRadius(node) + 7) / viewRef.current.scale)
 
   return <div ref={hostRef} className={className} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
-    <canvas ref={canvasRef} aria-label="Wikipedia article graph" style={{ display: 'block', width: '100%', height: '100%', cursor: dragRef.current ? 'grabbing' : 'grab', touchAction: 'none' }}
+    <canvas ref={webglCanvasRef} aria-hidden="true" style={{ position: 'absolute', inset: 0, display: graph.nodes.length > LARGE_GRAPH_THRESHOLD ? 'block' : 'none', width: '100%', height: '100%', pointerEvents: 'none' }} />
+    <canvas ref={canvasRef} aria-label="Wikipedia article graph" style={{ position: 'relative', display: 'block', width: '100%', height: '100%', cursor: dragRef.current ? 'grabbing' : 'grab', touchAction: 'none', background: 'transparent' }}
       onPointerDown={(event) => { const point = localPoint(event); const node = hit(point); event.currentTarget.setPointerCapture(event.pointerId); if (node) { dragRef.current = { node, offset: { x: (node.x as number) - point.x, y: (node.y as number) - point.y } }; node.fx = node.x; node.fy = node.y } else panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } } }}
       onPointerMove={(event) => { const point = localPoint(event); const drag = dragRef.current; const node = drag?.node; if (node && drag) { node.fx = point.x + drag.offset.x; node.fy = point.y + drag.offset.y; if (!pausedRef.current) simulationRef.current?.alpha(0.12).restart(); draw(); return } const pan = panRef.current; if (pan) { viewRef.current.x = pan.x + event.clientX - pan.start.x; viewRef.current.y = pan.y + event.clientY - pan.start.y; draw(); return } const next = hit(point) ?? null; if (next !== hoverRef.current) { hoverRef.current = next; onHover?.(next); draw() } }}
       onPointerUp={(event) => { const drag = dragRef.current; if (drag) { drag.node.fx = null; drag.node.fy = null; onSelect?.(drag.node) } dragRef.current = null; panRef.current = null; event.currentTarget.releasePointerCapture(event.pointerId); draw() }}
