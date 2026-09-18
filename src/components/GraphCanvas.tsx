@@ -58,6 +58,13 @@ const articleImportance = (node: GraphNode) => {
   const bytes = Math.min(Math.max(articleBytes(node), 0), 2_000_000)
   return Math.min(1, Math.log1p(bytes) / Math.log1p(2_000_000)) * 0.45 + Math.sqrt(degree / 56) * 0.55
 }
+// Degree is intentionally normalized separately from visual importance. A
+// page can be a small article but still be a structural hub, and those hubs
+// need to create a much stronger boundary around other structural hubs.
+const hubRepulsionScore = (node: GraphNode) => {
+  const degree = articleDegree(node)
+  return Math.min(1, Math.log1p(degree) / Math.log1p(2_500))
+}
 // More connected articles are visually larger, with a cap so hubs never swallow
 // nearby nodes. Keeping this in one helper also keeps hit testing/collision aligned.
 const nodeRadius = (node: GraphNode) => {
@@ -294,8 +301,12 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       // Hubs need more breathing room: their repulsion grows with degree, but is
       // capped to keep a single highly-linked page from dominating the whole map.
       .force('charge', forceManyBody<GraphNode>()
-        .strength((node) => -115 - articleImportance(node) * 126)
+        // The cubic hub term makes high-degree pages repel the whole graph
+        // strongly enough to expose topic islands, while the dedicated
+        // hub-repulsion force below handles hub-to-hub separation directly.
+        .strength((node) => -115 - articleImportance(node) * 126 - hubRepulsionScore(node) ** 3 * 520)
         .distanceMax(480))
+      .force('hub-repulsion', hubRepulsion(graph.nodes, largeGraph))
       .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + (largeGraph ? 5 : 10)).iterations(largeGraph ? 1 : 2))
       .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))
       // Wikipedia links are directed: the source article moves toward its target,
@@ -381,6 +392,71 @@ function directedAttraction(links: GraphLink[], nodes: GraphNode[]) {
     resolved = candidates.map(([source, target]) => [source, target, 1 / Math.sqrt(outDegrees.get(source) ?? 1)])
     void simulationNodes
   }
+  return force
+}
+
+/**
+ * Extra local force for structural hubs. d3's many-body force is excellent at
+ * scaling to large graphs, but its per-node charge cannot express the desired
+ * "hub versus hub" boundary. A spatial hash keeps this pairwise term bounded:
+ * only nearby hubs are compared, and low-degree pages are ignored entirely.
+ */
+function hubRepulsion(initialNodes: GraphNode[], largeGraph: boolean) {
+  let nodes = initialNodes
+  const cellSize = largeGraph ? 260 : 220
+  const maxDistance = largeGraph ? 520 : 460
+  const maxDistanceSquared = maxDistance * maxDistance
+  const force = (alpha: number) => {
+    const cells = new Map<string, GraphNode[]>()
+    const active = nodes.filter((node) => node.x != null && node.y != null && hubRepulsionScore(node) >= 0.12)
+    for (const node of active) {
+      const key = `${Math.floor((node.x as number) / cellSize)},${Math.floor((node.y as number) / cellSize)}`
+      const bucket = cells.get(key)
+      if (bucket) bucket.push(node)
+      else cells.set(key, [node])
+    }
+
+    let interactions = 0
+    const interactionBudget = largeGraph ? 160_000 : 240_000
+    for (const source of active) {
+      if (interactions >= interactionBudget) break
+      const sourceX = source.x as number
+      const sourceY = source.y as number
+      const sourceCellX = Math.floor(sourceX / cellSize)
+      const sourceCellY = Math.floor(sourceY / cellSize)
+      const sourceScore = hubRepulsionScore(source)
+      for (let cellX = sourceCellX - 2; cellX <= sourceCellX + 2; cellX += 1) {
+        for (let cellY = sourceCellY - 2; cellY <= sourceCellY + 2; cellY += 1) {
+          const bucket = cells.get(`${cellX},${cellY}`)
+          if (!bucket) continue
+          for (const target of bucket) {
+            if (target.id <= source.id) continue
+            const dx = sourceX - (target.x as number)
+            const dy = sourceY - (target.y as number)
+            const distanceSquared = dx * dx + dy * dy
+            if (distanceSquared > maxDistanceSquared) continue
+            interactions += 1
+            const distance = Math.sqrt(distanceSquared) || 1
+            const targetScore = hubRepulsionScore(target)
+            const pairScore = sourceScore * sourceScore * targetScore * targetScore
+            // A hard floor keeps two hubs from collapsing together; the
+            // quadratic score makes the strongest hubs repel super-linearly.
+            const magnitude = Math.min(10, (18 + 560 * pairScore) / Math.max(34, distance)) * alpha
+            const vx = dx / distance * magnitude
+            const vy = dy / distance * magnitude
+            source.vx = (source.vx ?? 0) + vx
+            source.vy = (source.vy ?? 0) + vy
+            target.vx = (target.vx ?? 0) - vx
+            target.vy = (target.vy ?? 0) - vy
+            if (interactions >= interactionBudget) break
+          }
+          if (interactions >= interactionBudget) break
+        }
+        if (interactions >= interactionBudget) break
+      }
+    }
+  }
+  force.initialize = (simulationNodes: GraphNode[]) => { nodes = simulationNodes }
   return force
 }
 
