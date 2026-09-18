@@ -201,7 +201,7 @@ export default function App() {
         <div className="panel-heading"><div><div className="eyebrow">CONTROL DECK</div><h2>Shape your map</h2></div><span className={`status-pill ${graph.source === 'fallback' ? 'offline' : ''}`}>● {statusLabel}</span></div>
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
         <LogSlider id="article-count" label="" value={count} min={10} max={MAX_LOCAL_ARTICLES} step={10} center={1_000} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} />
-        <div className="range-labels"><span>10</span><span>{MAX_LOCAL_ARTICLES.toLocaleString()}</span></div>
+        <div className="range-labels"><span>10</span><span>1,000</span><span>{MAX_LOCAL_ARTICLES.toLocaleString()}</span></div>
         {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and GPU time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
         <button className="primary-button" onClick={() => void load(count)} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
         <div className="rule" />
