@@ -13,7 +13,10 @@ const sampleFile = resolve(dataRoot, 'index', 'sample.json')
 const port = Number(process.env.WIKIGRAPH_PORT || 8787)
 const fallback = { nodes: [{ id: 'Physics', title: 'Physics', url: 'https://en.wikipedia.org/wiki/Physics' }, { id: 'Mathematics', title: 'Mathematics', url: 'https://en.wikipedia.org/wiki/Mathematics' }], links: [{ source: 'Physics', target: 'Mathematics' }] }
 let jsonlCache = null
-const CACHE_LIMIT = 500
+let corpusStatsCache = null
+// Keep the existing 500-node default, while allowing bounded larger tiers
+// for GPU-backed clients without ever attempting a full-corpus response.
+const CACHE_LIMIT = Math.max(500, Math.min(25000, Number(process.env.WIKIGRAPH_MAX_GRAPH_NODES || 10000) || 10000))
 const key = (value) => String(value).trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US')
 const refValue = (value) => value && typeof value === 'object' ? value.id ?? value.title ?? '' : value
 const hash = (value) => { let h = 2166136261; for (const c of String(value)) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0 }
@@ -69,6 +72,60 @@ async function sampleJsonl(count) {
   jsonlCache = { mtimeMs: stat.mtimeMs, size: stat.size, graph }
   return sample(graph, count)
 }
+
+async function scanCorpus() {
+  if (!existsSync(jsonlFile)) return null
+  const stat = statSync(jsonlFile)
+  if (corpusStatsCache && corpusStatsCache.mtimeMs === stat.mtimeMs && corpusStatsCache.size === stat.size) return corpusStatsCache.value
+  let articles = 0; let links = 0; let totalArticleBytes = 0
+  const input = createInterface({ input: createReadStream(jsonlFile), crlfDelay: Infinity })
+  for await (const line of input) {
+    if (!line.trim()) continue
+    try {
+      const article = JSON.parse(line)
+      if (typeof article.title !== 'string') continue
+      articles += 1
+      totalArticleBytes += Number.isFinite(article.byteLength) ? article.byteLength : 0
+      links += Array.isArray(article.links) ? article.links.length : 0
+    } catch { /* skip malformed rows */ }
+  }
+  const value = { articles, links, totalArticleBytes, indexed: true, source: 'jsonl', updatedAt: new Date(stat.mtimeMs).toISOString() }
+  corpusStatsCache = { mtimeMs: stat.mtimeMs, size: stat.size, value }
+  return value
+}
+
+async function searchCorpus(query, limit) {
+  if (!existsSync(jsonlFile)) return []
+  const needle = key(query)
+  if (!needle) return []
+  const matches = []
+  const input = createInterface({ input: createReadStream(jsonlFile), crlfDelay: Infinity })
+  for await (const line of input) {
+    try {
+      const article = JSON.parse(line)
+      if (typeof article.title !== 'string' || !key(article.title).includes(needle)) continue
+      matches.push({ id: String(article.id || article.title), title: article.title, url: article.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title).replaceAll('%20', '_')}`, articleSize: article.byteLength ?? null })
+      matches.sort((a, b) => (a.title.length - b.title.length) || a.title.localeCompare(b.title))
+      if (matches.length > limit) matches.pop()
+    } catch { /* skip malformed rows */ }
+  }
+  return matches
+}
+
+async function findArticle(value) {
+  if (!existsSync(jsonlFile)) return null
+  const needle = key(value)
+  const input = createInterface({ input: createReadStream(jsonlFile), crlfDelay: Infinity })
+  for await (const line of input) {
+    try {
+      const article = JSON.parse(line)
+      if (key(article.id) !== needle && key(article.title) !== needle) continue
+      const { links, ...node } = article
+      return { ...node, id: String(node.id || node.title), url: node.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(node.title).replaceAll('%20', '_')}`, links: Array.isArray(links) ? links : [] }
+    } catch { /* skip malformed rows */ }
+  }
+  return null
+}
 function withDegrees(graph) {
   const nodes = graph.nodes.map((node) => ({ ...node, inDegree: 0, outDegree: 0 }))
   const byId = new Map(nodes.map((node) => [key(node.id), node]))
@@ -83,11 +140,25 @@ function withDegrees(graph) {
 createServer(async (req, res) => {
   const request = new URL(req.url || '/', `http://127.0.0.1:${port}`)
   if (request.pathname === '/health') return send(res, 200, { ok: true, indexed: existsSync(indexFile) || existsSync(jsonlFile) || existsSync(sampleFile), dataRoot })
-  if (request.pathname !== '/api/graph') return send(res, 404, { error: 'Use GET /api/graph?count=50' })
-  const count = Math.max(1, Math.min(500, Number(request.searchParams.get('count') || 50) || 50))
   try {
+    if (request.pathname === '/api/stats') {
+      const stats = await scanCorpus()
+      return send(res, 200, stats || { articles: 0, links: 0, totalArticleBytes: 0, indexed: false, source: 'fallback' })
+    }
+    if (request.pathname === '/api/search') {
+      const limit = Math.max(1, Math.min(100, Number(request.searchParams.get('limit') || 20) || 20))
+      return send(res, 200, { query: request.searchParams.get('q') || '', results: await searchCorpus(request.searchParams.get('q') || '', limit) })
+    }
+    if (request.pathname === '/api/article') {
+      const article = await findArticle(request.searchParams.get('id') || request.searchParams.get('title') || '')
+      return send(res, article ? 200 : 404, article || { error: 'Article not found' })
+    }
+    if (request.pathname !== '/api/graph') return send(res, 404, { error: 'Use GET /api/graph?count=50, /api/stats, /api/search?q=physics, or /api/article?title=Physics' })
+    const count = Math.max(1, Math.min(CACHE_LIMIT, Number(request.searchParams.get('count') || 50) || 50))
     let graph = null
-    if (existsSync(sampleFile)) { try { graph = sample(JSON.parse(readFileSync(sampleFile, 'utf8')), count) } catch { graph = null } }
+    // The compact sample is intentionally only used for the backwards-
+    // compatible 500-node path; larger tiers come from the complete JSONL.
+    if (count <= 500 && existsSync(sampleFile)) { try { graph = sample(JSON.parse(readFileSync(sampleFile, 'utf8')), count) } catch { graph = null } }
     if (!graph && existsSync(indexFile)) { try { graph = sample(JSON.parse(readFileSync(indexFile, 'utf8')), count) } catch { graph = null } }
     if (!graph) graph = await sampleJsonl(count)
     send(res, 200, graph || { ...withDegrees(fallback), source: 'fallback', indexed: false })
