@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphSimulationSettings } from './components/GraphCanvas'
-import { fetchWikiGraphProgressive, fetchWikiStats, usesLocalCorpus } from './data/wiki'
-import type { WikiGraph, WikiStats } from './types'
+import { fetchWikiGraphProgressive, usesLocalCorpus } from './data/wiki'
+import type { WikiGraph } from './types'
 
 function formatArticleSize(bytes?: number) {
   if (!Number.isFinite(bytes) || (bytes ?? 0) <= 0) return 'unknown'
@@ -13,11 +13,6 @@ function formatArticleSize(bytes?: number) {
     unit += 1
   }
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`
-}
-
-function formatCount(value?: number | null) {
-  if (!Number.isFinite(value)) return '—'
-  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value as number)
 }
 
 type PhysicsSliderProps = {
@@ -82,7 +77,6 @@ function LogSlider({ id, label, value, min, max, step, center, onChange, format 
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
   const MAX_LOCAL_ARTICLES = 100_000
-  const ARTICLE_SELECT_LIMIT = 1_000
   const [count, setCount] = useState(50)
   const [graph, setGraph] = useState<WikiGraph>({ nodes: [], links: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -92,7 +86,6 @@ export default function App() {
   const [showLabels, setShowLabels] = useState(true)
   const [graphMode, setGraphMode] = useState<GraphCanvasMode>('2d')
   const [hoveredId, setHoveredId] = useState<string | null>(null)
-  const [corpusStats, setCorpusStats] = useState<WikiStats | null>(null)
   const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
   const [largeMapAcknowledged, setLargeMapAcknowledged] = useState(false)
   const [simulationSettings, setSimulationSettings] = useState<GraphSimulationSettings>(() => ({ ...DEFAULT_SIMULATION_SETTINGS }))
@@ -140,14 +133,6 @@ export default function App() {
     }
   }, [load])
 
-  useEffect(() => {
-    const controller = new AbortController()
-    void fetchWikiStats(controller.signal).then((stats) => {
-      if (!controller.signal.aborted) setCorpusStats(stats)
-    }).catch(() => undefined)
-    return () => controller.abort()
-  }, [])
-
   const nodeById = useMemo(() => new Map(graph.nodes.map((node) => [node.id, node])), [graph.nodes])
   const selected = selectedId ? nodeById.get(selectedId) : undefined
   const selectedLinks = selected ? graph.links.filter((edge) => {
@@ -166,14 +151,6 @@ export default function App() {
     }
     return [...relatedIds].slice(0, 5).map((id) => nodeById.get(id)).filter((node): node is WikiGraph['nodes'][number] => Boolean(node))
   }, [graph.links, nodeById, selected])
-  const articleOptions = useMemo(() => {
-    const options = graph.nodes.slice(0, ARTICLE_SELECT_LIMIT)
-    if (selectedId && !options.some((node) => node.id === selectedId)) {
-      const selectedOption = nodeById.get(selectedId)
-      if (selectedOption) options.unshift(selectedOption)
-    }
-    return options
-  }, [graph.nodes, nodeById, selectedId])
   const graphForCanvas = useMemo(() => ({
     nodes: graph.nodes.map((node) => {
       const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
@@ -186,7 +163,6 @@ export default function App() {
     links: graph.links,
   }), [graph, showLabels])
   const averageLinks = graph.nodes.length ? graph.links.length / graph.nodes.length : 0
-  const statusLabel = loading ? 'FETCHING' : graph.source === 'fallback' ? 'DEMO DATA' : graph.nodes.length ? 'WIKIPEDIA' : 'READY'
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
     ? `Loading ${loadProgress.loaded.toLocaleString()} / ${loadProgress.requested.toLocaleString()}…`
@@ -201,11 +177,9 @@ export default function App() {
         <circle className="brand-mark-node brand-mark-node-secondary" cx="22" cy="22" r="4" />
       </svg>
       <div><div className="eyebrow">EXPLORATORY GRAPH</div><h1>Wiki<span>/Graph</span></h1></div>
-      <div className="topbar-meta"><span className="live-dot" /> {graph.source === 'fallback' ? 'LOCAL DEMO DATA' : 'LIVE SIMULATION'} <span className="divider" /> <span className="muted">{corpusStats?.building ? `INDEXING ${formatCount(corpusStats.articles)} ARTICLES` : corpusStats?.articles ? `${formatCount(corpusStats.articles)} ARTICLE CORPUS` : 'Wikipedia knowledge map'}</span></div>
     </header>
     <section className="workspace">
       <aside className="control-panel">
-        <div className="panel-heading"><div><div className="eyebrow">CONTROL DECK</div><h2>Shape your map</h2></div><span className={`status-pill ${graph.source === 'fallback' ? 'offline' : ''}`}>● {statusLabel}</span></div>
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
         <LogSlider id="article-count" label="" value={count} min={10} max={MAX_LOCAL_ARTICLES} step={10} center={1_000} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} />
         <div className="range-labels"><span>10</span><span>1,000</span><span>{MAX_LOCAL_ARTICLES.toLocaleString()}</span></div>
@@ -270,21 +244,13 @@ export default function App() {
           <PhysicsSlider id="setting-alpha-target" label="Running alpha target" value={simulationSettings.alphaTarget} min={0} max={0.2} step={0.005} onChange={(value) => updateSimulationSetting('alphaTarget', value)} />
           <button type="button" className="settings-reset" onClick={() => setSimulationSettings({ ...DEFAULT_SIMULATION_SETTINGS })}>Reset physics values</button>
         </details>
-        <label className="field-label article-select-label" htmlFor="article-select"><span>SELECT ARTICLE</span>{graph.nodes.length > ARTICLE_SELECT_LIMIT && <output>FIRST {ARTICLE_SELECT_LIMIT.toLocaleString()}</output>}</label>
-        <select id="article-select" className="article-select" value={selectedId ?? ''} onChange={(event) => setSelectedId(event.target.value || null)} disabled={!graph.nodes.length}>
-          <option value="">Choose an article…</option>
-          {articleOptions.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}
-        </select>
-        <div className="legend"><div className="field-label">HOW IT WORKS</div><p><b>Repulsion</b> keeps every article apart.</p><p><b>Links</b> pull connected articles together.</p></div>
-        <div className="panel-footer">Drag to explore <span>·</span> Scroll to zoom</div>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{corpusStats?.articles ? <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></> : null}{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
+        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas ref={canvasRef} graph={graphForCanvas} mode={graphMode} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
+        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} mode={graphMode} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
-        <div className="canvas-footer"><span className="legend-key"><i className="node-key" /> Article</span><span className="legend-key"><i className="edge-key" /> Link direction</span><span className="canvas-credit">Wikipedia · public knowledge</span></div>
       </section>
     </section>
   </main>

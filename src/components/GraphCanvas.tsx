@@ -7,6 +7,12 @@ import {
   type Simulation,
   type SimulationNodeDatum,
 } from 'd3-force'
+import {
+  forceCenter as forceCenter3D,
+  forceCollide as forceCollide3D,
+  forceManyBody as forceManyBody3D,
+  forceSimulation as forceSimulation3D,
+} from 'd3-force-3d'
 
 export type GraphNode = SimulationNodeDatum & {
   id: string
@@ -14,13 +20,15 @@ export type GraphNode = SimulationNodeDatum & {
   label?: string
   group?: string | number
   color?: string
-  /** Stable depth used by the optional orbiting 3D view. */
+  /** Third coordinate used by the 3D force layout. */
   z?: number
   /** Link degree is also used as a lightweight article-importance signal. */
   inDegree?: number
   outDegree?: number
   articleSize?: number
   byteLength?: number
+  vz?: number
+  fz?: number | null
 }
 
 export type GraphLink = {
@@ -126,9 +134,12 @@ export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
 }
 
 type Point = { x: number; y: number }
+type ForceVector = { x: number; y: number; z: number }
 type View = { x: number; y: number; scale: number }
 type Bounds = { minX: number; maxX: number; minY: number; maxY: number }
 type Orbit = { yaw: number; pitch: number }
+type LayoutGraph = { nodes: GraphNode[]; links: GraphLink[] }
+type LayoutCache = { graph: GraphData | null; twoD: LayoutGraph | null; threeD: LayoutGraph | null }
 
 const articleDegree = (node: GraphNode) => Math.max(0, (node.inDegree ?? 0) + (node.outDegree ?? 0))
 const articleBytes = (node: GraphNode) => {
@@ -163,15 +174,26 @@ const LARGE_GRAPH_THRESHOLD = 2_000
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
 
-function depthForId(id: string) {
-  let hash = 2166136261
-  for (let index = 0; index < id.length; index += 1) {
-    hash ^= id.charCodeAt(index)
-    hash = Math.imul(hash, 16777619)
-  }
-  // A deterministic depth keeps a mode switch stable while still giving the
-  // graph a visible third axis before the user starts orbiting it.
-  return ((hash >>> 0) / 4_294_967_295) * 2 - 1
+function createLayoutGraph(graph: GraphData): LayoutGraph {
+  const nodes = graph.nodes.map((node) => {
+    const copy = { ...node }
+    delete copy.index
+    delete copy.x
+    delete copy.y
+    delete copy.z
+    delete copy.vx
+    delete copy.vy
+    delete copy.vz
+    delete copy.fx
+    delete copy.fy
+    delete copy.fz
+    return copy
+  })
+  const links = graph.links.map((link) => ({
+    source: typeof link.source === 'string' ? link.source : link.source.id,
+    target: typeof link.target === 'string' ? link.target : link.target.id,
+  }))
+  return { nodes, links }
 }
 
 function graphBounds(nodes: GraphNode[]): Bounds | null {
@@ -192,8 +214,9 @@ function graphBounds(nodes: GraphNode[]): Bounds | null {
 }
 
 /**
- * A responsive, canvas-rendered force graph. `graph.nodes` are mutated by d3-force
- * (x/y/vx/vy/fx/fy), so callers should treat those fields as simulation state.
+ * A responsive, canvas-rendered force graph. The active cached layout nodes are
+ * mutated by d3-force (x/y/z/vx/vy/vz/fx/fy/fz), so callers should treat those
+ * fields as simulation state.
  */
 const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
   { graph, mode = '2d', selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS },
@@ -206,6 +229,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const webglBuffersRef = useRef<{ positions: WebGLBuffer; colors: WebGLBuffer } | null>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   const simulationRef = useRef<Simulation<GraphNode, undefined> | null>(null)
+  const layoutCacheRef = useRef<LayoutCache>({ graph: null, twoD: null, threeD: null })
+  const activeLayoutRef = useRef<LayoutGraph | null>(null)
   const viewRef = useRef<View>({ x: 0, y: 0, scale: 1 })
   const orbitRef = useRef<Orbit>({ yaw: -0.45, pitch: 0.24 })
   const sizeRef = useRef({ width: 1, height: 1, dpr: 1 })
@@ -237,6 +262,21 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   simulationGuardRef.current = onSimulationGuard
   settingsRef.current = settings
   pausedRef.current = paused
+
+  const getLayoutGraph = (requestedMode: GraphCanvasMode) => {
+    const cache = layoutCacheRef.current
+    if (cache.graph !== graph) {
+      cache.graph = graph
+      cache.twoD = null
+      cache.threeD = null
+    }
+    if (requestedMode === '3d') {
+      cache.threeD ??= createLayoutGraph(graph)
+      return cache.threeD
+    }
+    cache.twoD ??= createLayoutGraph(graph)
+    return cache.twoD
+  }
 
   const renderWebGL = (gl: WebGL2RenderingContext, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
     const program = webglProgramRef.current
@@ -309,8 +349,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const orbit = orbitRef.current
     const x = node.x ?? 0
     const y = node.y ?? 0
-    const depthScale = 260 + Math.min(280, Math.sqrt(graphRef.current.nodes.length) * 8)
-    const z = (node.z ?? depthForId(node.id)) * depthScale
+    const z = node.z ?? 0
     const cosYaw = Math.cos(orbit.yaw)
     const sinYaw = Math.sin(orbit.yaw)
     const yawX = x * cosYaw - z * sinYaw
@@ -416,7 +455,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.save()
     ctx.translate(view.x, view.y)
     ctx.scale(view.scale, view.scale)
-    const currentGraph = graphRef.current
+    const currentGraph = activeLayoutRef.current ?? graphRef.current
     const nodes = currentGraph.nodes
     const largeGraph = nodes.length > LARGE_GRAPH_THRESHOLD
     const cachedNodeMap = nodeMapRef.current?.graph === currentGraph
@@ -512,7 +551,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   useImperativeHandle(ref, () => ({
     fit: () => {
-      const bounds = graphBounds(graph.nodes)
+      const bounds = graphBounds(activeLayoutRef.current?.nodes ?? graph.nodes)
       if (!bounds) return
       const { width, height } = sizeRef.current
       const scale = Math.max(0.2, Math.min(2.2, 0.86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80))))
@@ -524,7 +563,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       orbitRef.current = { yaw: -0.45, pitch: 0.24 }
       drawRef.current()
     },
-  }), [graph.nodes])
+  }), [graph.nodes, mode])
 
   useEffect(() => {
     const canvas = webglCanvasRef.current
@@ -550,40 +589,51 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }, [])
 
   useEffect(() => {
-    for (const node of graph.nodes) {
-      if (!Number.isFinite(node.z)) node.z = depthForId(node.id)
-    }
+    const layoutGraph = getLayoutGraph(mode)
+    activeLayoutRef.current = layoutGraph
     const { width, height } = sizeRef.current
     if (width > 1 && height > 1) viewRef.current = { x: width / 2, y: height / 2, scale: 1 }
-    const largeGraph = graph.nodes.length > LARGE_GRAPH_THRESHOLD
+    const largeGraph = layoutGraph.nodes.length > LARGE_GRAPH_THRESHOLD
     // Keep every edge available for rendering, but cap the per-tick attraction
     // work in large maps. The representative stride preserves the overall
     // topology while preventing a dense dump tier from freezing the tab.
-    const attractionLinks = largeGraph && graph.links.length > 50_000
-      ? graph.links.filter((_, index) => index % Math.ceil(graph.links.length / 50_000) === 0)
-      : graph.links
-    const sim = forceSimulation(graph.nodes)
-      // Hubs need more breathing room: their repulsion grows with degree, but is
-      // capped to keep a single highly-linked page from dominating the whole map.
-      .force('charge', forceManyBody<GraphNode>()
-        // The cubic hub term makes high-degree pages repel the whole graph
-        // strongly enough to expose topic islands, while the dedicated
-        // hub-repulsion force below handles hub-to-hub separation directly.
-        .strength((node) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge - hubRepulsionScore(node, settings) ** 3 * settings.hubCharge)
-        .distanceMax(settings.chargeDistance))
-      // A direct link is allowed to pull its endpoints together, but a nearby
-      // pair with no loaded link in either direction receives an extra push.
-      // This makes disconnected topic islands separate instead of relying on
-      // the same generic charge for every relationship.
-      .force('unrelated-repulsion', unrelatedRepulsion(graph.links, graph.nodes, largeGraph, settings))
-      .force('hub-repulsion', hubRepulsion(largeGraph, settings))
-      .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + (largeGraph ? Math.max(5, settings.collisionPadding / 2) : settings.collisionPadding)).iterations(largeGraph ? Math.max(1, Math.round(settings.collisionIterations / 2)) : Math.max(1, Math.round(settings.collisionIterations))))
-      .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
-      // The arrow remains directed in the renderer, but the physical spring is
-      // symmetric: both articles move toward one another for every link.
-      // Applying equal-and-opposite velocity keeps the map stable and prevents
-      // a one-way link from making its target appear artificially anchored.
-      .force('link-attraction', symmetricAttraction(attractionLinks, graph.nodes, settings))
+    const attractionLinks = largeGraph && layoutGraph.links.length > 50_000
+      ? layoutGraph.links.filter((_, index) => index % Math.ceil(layoutGraph.links.length / 50_000) === 0)
+      : layoutGraph.links
+    const sim = (mode === '3d'
+      ? forceSimulation3D(layoutGraph.nodes, 3)
+      : forceSimulation(layoutGraph.nodes)) as unknown as Simulation<GraphNode, undefined>
+    if (mode === '3d') {
+      sim
+        .force('charge', forceManyBody3D()
+          .strength((node: GraphNode) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge - hubRepulsionScore(node, settings) ** 3 * settings.hubCharge)
+          .distanceMax(settings.chargeDistance))
+        .force('collision', forceCollide3D()
+          .radius((node: GraphNode) => nodeRadius(node, settings) + (largeGraph ? Math.max(5, settings.collisionPadding / 2) : settings.collisionPadding))
+          .iterations(largeGraph ? Math.max(1, Math.round(settings.collisionIterations / 2)) : Math.max(1, Math.round(settings.collisionIterations))))
+        .force('center', forceCenter3D(0, 0, 0).strength(settings.centerStrength))
+        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 3))
+    } else {
+      sim
+        // Hubs need more breathing room: their repulsion grows with degree, but is
+        // capped to keep a single highly-linked page from dominating the whole map.
+        .force('charge', forceManyBody<GraphNode>()
+          // The cubic hub term makes high-degree pages repel the whole graph
+          // strongly enough to expose topic islands, while the dedicated
+          // hub-repulsion force below handles hub-to-hub separation directly.
+          .strength((node) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge - hubRepulsionScore(node, settings) ** 3 * settings.hubCharge)
+          .distanceMax(settings.chargeDistance))
+        // A direct link is allowed to pull its endpoints together, but a nearby
+        // pair with no loaded link in either direction receives an extra push.
+        // This makes disconnected topic islands separate instead of relying on
+        // the same generic charge for every relationship.
+        .force('unrelated-repulsion', unrelatedRepulsion(layoutGraph.links, layoutGraph.nodes, largeGraph, settings))
+        .force('hub-repulsion', hubRepulsion(largeGraph, settings))
+        .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + (largeGraph ? Math.max(5, settings.collisionPadding / 2) : settings.collisionPadding)).iterations(largeGraph ? Math.max(1, Math.round(settings.collisionIterations / 2)) : Math.max(1, Math.round(settings.collisionIterations))))
+        .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
+        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings))
+    }
+    sim
       .velocityDecay(settings.velocityDecay)
       .alphaDecay(settings.alphaDecay)
       .alphaMin(settings.alphaMin)
@@ -605,16 +655,20 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       simulationTicks += 1
       if (!invalidState && protectNumerics && (simulationTicks <= 120 || simulationTicks % 32 === 0)) {
         const numericLimit = 1_000_000
-        const invalid = graph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy)
+        const invalid = layoutGraph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || (mode === '3d' && !Number.isFinite(node.z)) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy) || (mode === '3d' && !Number.isFinite(node.vz))
           || Math.abs(node.x ?? 0) > numericLimit || Math.abs(node.y ?? 0) > numericLimit
-          || Math.abs(node.vx ?? 0) > numericLimit || Math.abs(node.vy ?? 0) > numericLimit)
+          || (mode === '3d' && Math.abs(node.z ?? 0) > numericLimit)
+          || Math.abs(node.vx ?? 0) > numericLimit || Math.abs(node.vy ?? 0) > numericLimit
+          || (mode === '3d' && Math.abs(node.vz ?? 0) > numericLimit))
         if (invalid) {
           invalidState = true
           sim.stop()
           invalid.x = Number.isFinite(invalid.x) && Math.abs(invalid.x as number) <= numericLimit ? invalid.x : 0
           invalid.y = Number.isFinite(invalid.y) && Math.abs(invalid.y as number) <= numericLimit ? invalid.y : 0
+          invalid.z = mode === '3d' && Number.isFinite(invalid.z) && Math.abs(invalid.z as number) <= numericLimit ? invalid.z : mode === '3d' ? 0 : invalid.z
           invalid.vx = Number.isFinite(invalid.vx) && Math.abs(invalid.vx as number) <= numericLimit ? invalid.vx : 0
           invalid.vy = Number.isFinite(invalid.vy) && Math.abs(invalid.vy as number) <= numericLimit ? invalid.vy : 0
+          invalid.vz = mode === '3d' && Number.isFinite(invalid.vz) && Math.abs(invalid.vz as number) <= numericLimit ? invalid.vz : mode === '3d' ? 0 : invalid.vz
           simulationGuardRef.current?.()
           drawRef.current()
           return
@@ -630,7 +684,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       // long force tick. Run one tick, yield to input/rendering, then continue
       // at a bounded cadence so the page remains interruptible.
       sim.stop()
-      const tickDelay = Math.min(250, Math.max(50, Math.round(graph.nodes.length / 500)))
+      const tickDelay = Math.min(250, Math.max(50, Math.round(layoutGraph.nodes.length / 500)))
       const runLargeTick = () => {
         if (pausedRef.current || invalidState) return
         sim.tick()
@@ -646,7 +700,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       manualTickRef.current = null
       simulationRef.current = null
     }
-  }, [graph, settings])
+  }, [graph, settings, mode])
 
   useEffect(() => { drawRef.current() }, [selectedId])
 
@@ -714,19 +768,20 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     return { x: (point.x - view.x) / view.scale, y: (point.y - view.y) / view.scale }
   }
   const hit = (point: Point) => {
+    const nodes = activeLayoutRef.current?.nodes ?? graph.nodes
     if (modeRef.current === '3d') {
-      return graph.nodes.map((node) => ({ node, projected: project3D(node) }))
+      return nodes.map((node) => ({ node, projected: project3D(node) }))
         .filter(({ projected }) => Number.isFinite(projected.x) && Number.isFinite(projected.y))
         .sort((first, second) => first.projected.depth - second.projected.depth)
         .find(({ node, projected }) => Math.hypot(projected.x - point.x, projected.y - point.y) <= nodeRadius(node, settingsRef.current) * projected.perspective + 8)?.node
     }
-    return graph.nodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (nodeRadius(node, settingsRef.current) + 7) / viewRef.current.scale)
+    return nodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (nodeRadius(node, settingsRef.current) + 7) / viewRef.current.scale)
   }
 
   return <div ref={hostRef} className={className} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
     <canvas ref={webglCanvasRef} aria-hidden="true" style={{ position: 'absolute', inset: 0, display: graph.nodes.length > LARGE_GRAPH_THRESHOLD && mode === '2d' ? 'block' : 'none', width: '100%', height: '100%', pointerEvents: 'none' }} />
     <canvas ref={canvasRef} aria-label={mode === '3d' ? 'Wikipedia article graph in 3D. Drag to orbit and scroll to zoom.' : 'Wikipedia article graph'} style={{ position: 'relative', display: 'block', width: '100%', height: '100%', cursor: dragRef.current ? 'grabbing' : 'grab', touchAction: 'none', background: 'transparent' }}
-      onPointerDown={(event) => { const point = localPoint(event); const screen = screenPoint(event); const node = hit(screen); event.currentTarget.setPointerCapture(event.pointerId); pressedNodeRef.current = node ?? null; if (modeRef.current === '3d') { if (node) return; if (event.shiftKey) panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } }; else rotateRef.current = { start: { x: event.clientX, y: event.clientY }, orbit: { ...orbitRef.current } }; return } if (node) { dragRef.current = { node, offset: { x: (node.x as number) - point.x, y: (node.y as number) - point.y } }; node.fx = node.x; node.fy = node.y } else panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } } }}
+      onPointerDown={(event) => { const point = localPoint(event); const screen = screenPoint(event); const node = hit(modeRef.current === '3d' ? screen : point); event.currentTarget.setPointerCapture(event.pointerId); pressedNodeRef.current = node ?? null; if (modeRef.current === '3d') { if (node) return; if (event.shiftKey) panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } }; else rotateRef.current = { start: { x: event.clientX, y: event.clientY }, orbit: { ...orbitRef.current } }; return } if (node) { dragRef.current = { node, offset: { x: (node.x as number) - point.x, y: (node.y as number) - point.y } }; node.fx = node.x; node.fy = node.y } else panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } } }}
       onPointerMove={(event) => { const point = localPoint(event); const screen = screenPoint(event); if (modeRef.current === '3d') { const rotate = rotateRef.current; if (rotate) { orbitRef.current.yaw = rotate.orbit.yaw + (event.clientX - rotate.start.x) * 0.008; orbitRef.current.pitch = Math.max(-1.2, Math.min(1.2, rotate.orbit.pitch + (event.clientY - rotate.start.y) * 0.006)); draw(); return } const pan = panRef.current; if (pan) { viewRef.current.x = pan.x + event.clientX - pan.start.x; viewRef.current.y = pan.y + event.clientY - pan.start.y; draw(); return } } const drag = dragRef.current; const node = drag?.node; if (node && drag) { node.fx = point.x + drag.offset.x; node.fy = point.y + drag.offset.y; if (!pausedRef.current) simulationRef.current?.alpha(0.12).restart(); draw(); return } const pan = panRef.current; if (pan) { viewRef.current.x = pan.x + event.clientX - pan.start.x; viewRef.current.y = pan.y + event.clientY - pan.start.y; draw(); return } const next = hit(modeRef.current === '3d' ? screen : point) ?? null; if (next !== hoverRef.current) { hoverRef.current = next; onHover?.(next); draw() } }}
       onPointerUp={(event) => { const drag = dragRef.current; if (drag) { drag.node.fx = null; drag.node.fy = null; onSelect?.(drag.node) } else if (pressedNodeRef.current && !rotateRef.current && !panRef.current) onSelect?.(pressedNodeRef.current); dragRef.current = null; pressedNodeRef.current = null; panRef.current = null; rotateRef.current = null; event.currentTarget.releasePointerCapture(event.pointerId); draw() }}
       onPointerCancel={() => { dragRef.current = null; pressedNodeRef.current = null; panRef.current = null; rotateRef.current = null }}
@@ -829,7 +884,7 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
   return force
 }
 
-function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: GraphSimulationSettings) {
+function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: GraphSimulationSettings, dimensions: 2 | 3 = 2) {
   // A force that grows with distance²/³ is useful for making long links
   // noticeable, but it is not a stable spring by itself. Once a node drifts
   // far enough away, an uncapped impulse can overwhelm velocity decay and
@@ -841,19 +896,21 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: G
   const maxNodeImpulse = 1_024
   const forceDistanceLimit = 1_024
   let resolved: Array<[GraphNode, GraphNode, number]> = []
-  const impulses = new Map<GraphNode, Point>()
+  const impulses = new Map<GraphNode, ForceVector>()
   const force = (alpha: number) => {
     impulses.clear()
     const maxImpulse = maxNodeImpulse * Math.max(0, alpha)
     for (const [source, target, weight] of resolved) {
-      if (source.x == null || target.x == null || source.y == null || target.y == null) continue
+      if (source.x == null || target.x == null || source.y == null || target.y == null || (dimensions === 3 && (source.z == null || target.z == null))) continue
       const dx = target.x - source.x
       const dy = target.y - source.y
-      if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+      const dz = dimensions === 3 ? (target.z as number) - (source.z as number) : 0
+      if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(dz)) {
         source.vx = 0; source.vy = 0; target.vx = 0; target.vy = 0
+        if (dimensions === 3) { source.vz = 0; target.vz = 0 }
         continue
       }
-      const distance = Math.hypot(dx, dy) || 1
+      const distance = Math.hypot(dx, dy, dz) || 1
       const safeDistance = Math.min(distance, forceDistanceLimit)
       const exponent = settings.linkDistanceExponent === 3 ? 3 : 2
       const distanceScale = Number.isFinite(settings.linkDistanceScale)
@@ -872,25 +929,29 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: G
       }
       const pullX = dx / distance * pullMagnitude
       const pullY = dy / distance * pullMagnitude
+      const pullZ = dz / distance * pullMagnitude
 
       // Accumulate equal-and-opposite impulses first so link direction remains
       // semantic rather than anchoring the target. The aggregate safety cap is
       // applied only after all incident links have been collected.
-      const sourceImpulse = impulses.get(source) ?? { x: 0, y: 0 }
+      const sourceImpulse = impulses.get(source) ?? { x: 0, y: 0, z: 0 }
       sourceImpulse.x += pullX
       sourceImpulse.y += pullY
+      sourceImpulse.z += pullZ
       impulses.set(source, sourceImpulse)
-      const targetImpulse = impulses.get(target) ?? { x: 0, y: 0 }
+      const targetImpulse = impulses.get(target) ?? { x: 0, y: 0, z: 0 }
       targetImpulse.x -= pullX
       targetImpulse.y -= pullY
+      targetImpulse.z -= pullZ
       impulses.set(target, targetImpulse)
     }
     for (const [node, impulse] of impulses) {
-      const magnitude = Math.hypot(impulse.x, impulse.y)
+      const magnitude = Math.hypot(impulse.x, impulse.y, impulse.z)
       if (!Number.isFinite(magnitude) || magnitude < Number.EPSILON) continue
       const scale = Math.min(1, maxImpulse / magnitude)
       node.vx = (node.vx ?? 0) + impulse.x * scale
       node.vy = (node.vy ?? 0) + impulse.y * scale
+      if (dimensions === 3) node.vz = (node.vz ?? 0) + impulse.z * scale
     }
   }
   force.initialize = (simulationNodes: GraphNode[]) => {
