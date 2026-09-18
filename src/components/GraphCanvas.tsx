@@ -103,8 +103,8 @@ export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
   hubForceScale: 260,
   hubForceMax: 70,
   hubMaxNodes: 320,
-  linkDistanceScale: 1_000,
-  linkDistanceExponent: 2,
+  linkDistanceScale: 150_000,
+  linkDistanceExponent: 3,
   linkWeightFloor: 0.02,
   hubLinkDamping: 0.24,
   collisionPadding: 10,
@@ -113,8 +113,8 @@ export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
   velocityDecay: 0.4,
   // Give the layout enough heat to cross shallow barriers, then let alpha
   // decay to alphaMin so it can settle instead of running hot forever.
-  initialTemperature: 0.15,
-  alphaDecay: 0.0228,
+  initialTemperature: 0.8,
+  alphaDecay: 0.01,
   alphaMin: 0.001,
   alphaTarget: 0,
 }
@@ -461,7 +461,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     // shallow high-energy arrangement without creating a runaway first tick.
     const initialTemperature = Number.isFinite(settings.initialTemperature)
       ? Math.max(settings.alphaMin, Math.min(1, settings.initialTemperature))
-      : 0.15
+      : 0.8
     sim.alpha(initialTemperature)
     simulationRef.current = sim
     let framePending = false
@@ -534,7 +534,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       if (simulation && simulation.alpha() < settings.alphaMin) {
         const resumeTemperature = Number.isFinite(settings.initialTemperature)
           ? Math.max(settings.alphaMin, Math.min(1, settings.initialTemperature))
-          : 0.15
+          : 0.8
         simulation.alpha(resumeTemperature)
       }
       simulation?.restart()
@@ -677,8 +677,21 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
 }
 
 function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: GraphSimulationSettings) {
+  // A force that grows with distance²/³ is useful for making long links
+  // noticeable, but it is not a stable spring by itself. Once a node drifts
+  // far enough away, an uncapped impulse can overwhelm velocity decay and
+  // launch the whole layout into non-finite coordinates. Keep the selected
+  // curve while giving every node a finite per-tick impulse budget.
+  // Keep the safety ceiling above ordinary squared-link impulses while
+  // preventing a small distance scale from injecting a destabilizing kick.
+  const maxBaseImpulse = 256
+  const maxNodeImpulse = 1_024
+  const forceDistanceLimit = 1_024
   let resolved: Array<[GraphNode, GraphNode, number]> = []
+  const impulses = new Map<GraphNode, Point>()
   const force = (alpha: number) => {
+    impulses.clear()
+    const maxImpulse = maxNodeImpulse * Math.max(0, alpha)
     for (const [source, target, weight] of resolved) {
       if (source.x == null || target.x == null || source.y == null || target.y == null) continue
       const dx = target.x - source.x
@@ -688,26 +701,43 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: G
         continue
       }
       const distance = Math.hypot(dx, dy) || 1
-      // Make the spring strength grow exactly with the selected power of
-      // separation. There is intentionally no distance ceiling: long links
-      // pull harder, while endpoint-degree normalization still keeps hubs
-      // from receiving one full-strength spring per incident edge.
-      const pullMagnitude = Math.pow(distance, settings.linkDistanceExponent) / settings.linkDistanceScale * weight * alpha
+      const safeDistance = Math.min(distance, forceDistanceLimit)
+      const exponent = settings.linkDistanceExponent === 3 ? 3 : 2
+      const distanceScale = Number.isFinite(settings.linkDistanceScale)
+        ? Math.max(1, settings.linkDistanceScale)
+        : DEFAULT_SIMULATION_SETTINGS.linkDistanceScale
+      // Cap the base impulse before applying the edge weight. `resolved`
+      // retains the endpoint-degree weighting, while the aggregate cap below
+      // bounds the total impulse received by a high-degree node.
+      const baseImpulse = Math.min(
+        maxBaseImpulse,
+        Math.pow(safeDistance, exponent) / distanceScale * Math.max(0, alpha),
+      )
+      const pullMagnitude = baseImpulse * weight
       if (!Number.isFinite(pullMagnitude)) {
-        source.vx = 0; source.vy = 0; target.vx = 0; target.vy = 0
         continue
       }
       const pullX = dx / distance * pullMagnitude
       const pullY = dy / distance * pullMagnitude
 
-      // Equal and opposite impulses make this a true spring: the source moves
-      // toward the target and the target moves toward the source. Keeping the
-      // same impulse magnitude also preserves momentum when link direction is
-      // only a semantic Wikipedia property rather than a physical constraint.
-      source.vx = (source.vx ?? 0) + pullX
-      source.vy = (source.vy ?? 0) + pullY
-      target.vx = (target.vx ?? 0) - pullX
-      target.vy = (target.vy ?? 0) - pullY
+      // Accumulate equal-and-opposite impulses first so link direction remains
+      // semantic rather than anchoring the target. The aggregate safety cap is
+      // applied only after all incident links have been collected.
+      const sourceImpulse = impulses.get(source) ?? { x: 0, y: 0 }
+      sourceImpulse.x += pullX
+      sourceImpulse.y += pullY
+      impulses.set(source, sourceImpulse)
+      const targetImpulse = impulses.get(target) ?? { x: 0, y: 0 }
+      targetImpulse.x -= pullX
+      targetImpulse.y -= pullY
+      impulses.set(target, targetImpulse)
+    }
+    for (const [node, impulse] of impulses) {
+      const magnitude = Math.hypot(impulse.x, impulse.y)
+      if (!Number.isFinite(magnitude) || magnitude < Number.EPSILON) continue
+      const scale = Math.min(1, maxImpulse / magnitude)
+      node.vx = (node.vx ?? 0) + impulse.x * scale
+      node.vy = (node.vy ?? 0) + impulse.y * scale
     }
   }
   force.initialize = (simulationNodes: GraphNode[]) => {
@@ -717,17 +747,18 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: G
       const target = linkNode(link.target, map)
       return source && target ? [[source, target] as [GraphNode, GraphNode]] : []
     })
-    // Normalize by both endpoints. A high-indegree hub should not collect one
-    // full-strength spring from every low-degree article and collapse the map
-    // into a shared barycenter. Hub-to-hub links still pull, but their spring is
-    // deliberately softer so the strong hub-territory force can separate them.
+    // Weight by both endpoint degrees. A high-indegree hub should not collect
+    // one full-strength spring from every low-degree article and collapse the
+    // map into a shared barycenter. Hub-to-hub links still pull, but their
+    // spring is deliberately softer so the strong hub-territory force can
+    // separate them.
     resolved = candidates.map(([source, target]) => {
       const sourceDegree = Math.max(1, articleDegree(source))
       const targetDegree = Math.max(1, articleDegree(target))
       const degreeWeight = Math.max(settings.linkWeightFloor, 1 / Math.sqrt(sourceDegree * targetDegree))
       const bothHubs = hubRepulsionScore(source, settings) > 0 && hubRepulsionScore(target, settings) > 0
       const hubDamping = bothHubs ? settings.hubLinkDamping : 1
-      return [source, target, degreeWeight * hubDamping]
+      return [source, target, Math.max(0, degreeWeight * Math.max(0, hubDamping))]
     })
     void simulationNodes
   }

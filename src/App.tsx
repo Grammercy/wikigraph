@@ -208,7 +208,7 @@ export default function App() {
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
         <button className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-pressed={showLabels}><span>Article labels</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
-        <details className="simulation-settings" open>
+        <details className="simulation-settings">
           <summary><span>Advanced physics</span><span className="settings-live">LIVE</span></summary>
           <p className="simulation-settings-note">Adjust every major force and cooling value. Changes restart the layout without fetching new articles.</p>
           <div className="settings-group-title">REPULSION &amp; LINKS</div>
