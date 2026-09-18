@@ -4,6 +4,7 @@ import { buildFallbackGraph } from './fallback'
 const API = 'https://en.wikipedia.org/w/api.php'
 const REQUEST_TIMEOUT = 12_000
 const MAX_BATCH = 50
+const PUBLIC_MAX_NODES = 500
 const MAX_LINKS_PER_PAGE = 45
 // Keep the browser crawl deliberately small. Each page already contributes a
 // useful sample of outgoing links; following every continuation quickly trips
@@ -47,9 +48,19 @@ export const usesLocalCorpus = Boolean(LOCAL_INDEX_URL)
 function isWikiGraph(value: unknown): value is WikiGraph {
   if (!value || typeof value !== 'object') return false
   const candidate = value as Partial<WikiGraph>
-  return Array.isArray(candidate.nodes) && Array.isArray(candidate.links)
-    && candidate.nodes.every((node) => node && typeof node.id === 'string' && typeof node.title === 'string')
-    && candidate.links.every((link) => link && link.source != null && link.target != null)
+  if (!Array.isArray(candidate.nodes) || !Array.isArray(candidate.links)) return false
+  // Full tiers can contain hundreds of thousands of nodes and many more
+  // links. Validate a deterministic sample plus the endpoints instead of
+  // walking every object on the main thread before rendering anything.
+  const sampled = <T>(items: T[], valid: (item: T) => boolean) => {
+    const step = Math.max(1, Math.ceil(items.length / 2_000))
+    for (let index = 0; index < items.length; index += step) {
+      if (!valid(items[index])) return false
+    }
+    return (items.length === 0 || valid(items[items.length - 1]))
+  }
+  return sampled(candidate.nodes, (node) => Boolean(node && typeof node.id === 'string' && typeof node.title === 'string'))
+    && sampled(candidate.links, (link) => Boolean(link && link.source != null && link.target != null))
 }
 
 async function fetchLocalGraph(count: number, signal?: AbortSignal): Promise<WikiGraph | null> {
@@ -65,7 +76,7 @@ async function fetchLocalGraph(count: number, signal?: AbortSignal): Promise<Wik
   // of truth instead of mislabeling synthetic edges as Wikipedia data.
   const metadata = graph as WikiGraph & { indexed?: boolean }
   if (metadata.source === 'fallback' || metadata.indexed === false) return null
-  return { ...graph, source: 'wikipedia' }
+  return { ...graph, source: 'wikipedia', local: true }
 }
 
 function titleKey(title: string): string {
@@ -130,7 +141,7 @@ async function pageBatch(titles: string[], signal?: AbortSignal): Promise<PageBa
 
 /** Fetch a bounded graph grown from random article seeds; falls back gracefully offline. */
 export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promise<WikiGraph> {
-  const wanted = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : 500))
+  const wanted = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : PUBLIC_MAX_NODES))
   try {
     // Prefer a dump-backed local service when configured. It can serve the
     // complete corpus while preserving the same UI contract and slider.
@@ -143,14 +154,19 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
       // to demo data. Preserve cancellation semantics for the active request.
       if (signal?.aborted) throw localError
     }
-    const seeds = await randomTitles(Math.min(Math.max(5, Math.ceil(wanted / 8)), 50), signal)
+    // A local endpoint can be present while its dump is still being parsed or
+    // indexed. Never turn that temporary state into a huge public-API crawl.
+    // The public API remains intentionally bounded and is only a preview until
+    // the local tiers become available.
+    const publicWanted = Math.min(wanted, PUBLIC_MAX_NODES)
+    const seeds = await randomTitles(Math.min(Math.max(5, Math.ceil(publicWanted / 8)), 50), signal)
     const queue = [...new Map(seeds.map((title) => [titleId(title), title])).values()]
     const queued = new Set(queue.map(titleId))
     const aliases = new Map<string, string>()
     const seen = new Set<string>()
     const pages = new Map<string, ApiPage>()
     const rawLinks: Array<[string, string]> = []
-    while (queue.length && seen.size < wanted) {
+    while (queue.length && seen.size < publicWanted) {
       const batch = queue.splice(0, MAX_BATCH).filter((title) => {
         queued.delete(titleId(title))
         return !seen.has(titleId(title))
@@ -170,14 +186,14 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
           const targetCanonical = aliases.get(titleId(target)) ?? target
           const targetId = titleId(targetCanonical)
           rawLinks.push([source, targetCanonical])
-          if (!seen.has(targetId) && !queued.has(targetId) && queue.length + seen.size < wanted * 2) {
+          if (!seen.has(targetId) && !queued.has(targetId) && queue.length + seen.size < publicWanted * 2) {
             queue.push(targetCanonical)
             queued.add(targetId)
           }
         }
       }
     }
-    const nodes: WikiNode[] = [...pages.entries()].slice(0, wanted).map(([title, page]) => ({ id: title, title, url: articleUrl(title), extract: page.extract, byteLength: page.length }))
+    const nodes: WikiNode[] = [...pages.entries()].slice(0, publicWanted).map(([title, page]) => ({ id: title, title, url: articleUrl(title), extract: page.extract, byteLength: page.length }))
     const canonicalById = new Map(nodes.map((node) => [titleId(node.id), node.id]))
     const uniqueLinks = new Map<string, [string, string]>()
     for (const [source, target] of rawLinks) {
@@ -196,10 +212,10 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
       if (source) source.outDegree = (source.outDegree ?? 0) + 1
       if (target) target.inDegree = (target.inDegree ?? 0) + 1
     }
-    return nodes.length ? { nodes, links, source: 'wikipedia' } : { ...buildFallbackGraph(wanted), source: 'fallback' }
+    return nodes.length ? { nodes, links, source: 'wikipedia', local: false } : { ...buildFallbackGraph(publicWanted), source: 'fallback', local: false }
   } catch (error) {
     if (signal?.aborted) throw error
-    return { ...buildFallbackGraph(wanted), source: 'fallback' }
+    return { ...buildFallbackGraph(Math.min(wanted, PUBLIC_MAX_NODES)), source: 'fallback', local: false }
   }
 }
 
@@ -237,7 +253,23 @@ export async function fetchWikiGraphProgressive(
   signal?: AbortSignal,
   onProgress?: (progress: WikiGraphProgress) => void,
 ): Promise<WikiGraph> {
-  const requested = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : 500))
+  const requested = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : PUBLIC_MAX_NODES))
+
+  if (LOCAL_INDEX_URL) {
+    // Local tiers are nested snapshots. A small preview makes the interface
+    // useful immediately, then one requested-size response replaces it with
+    // the complete graph and correct degree metadata. Repeatedly fetching and
+    // merging every intermediate tier made a 100k request needlessly parse
+    // more than twice as many records and restart the simulation each time.
+    const previewTarget = Math.min(requested, 1_000)
+    const preview = await fetchWikiGraph(previewTarget, signal)
+    onProgress?.({ loaded: Math.min(preview.nodes.length, requested), requested, graph: preview })
+    if (!preview.local || previewTarget >= requested) return preview
+    const full = await fetchWikiGraph(requested, signal)
+    onProgress?.({ loaded: Math.min(full.nodes.length, requested), requested, graph: full })
+    return full
+  }
+
   const merged: WikiGraph = { nodes: [], links: [], source: 'wikipedia' }
   const nodeIds = new Set<string>()
   const linkIds = new Set<string>()
@@ -245,12 +277,8 @@ export async function fetchWikiGraphProgressive(
 
   while (completed < requested) {
     if (signal?.aborted) throw new DOMException('The graph request was cancelled.', 'AbortError')
-    // Local tiers are deterministic and nested. Ask for cumulative sizes so
-    // each response can add nodes without re-downloading the same small batch.
     // The public API remains bounded to independent random batches.
-    const nextTarget = LOCAL_INDEX_URL
-      ? Math.min(requested, Math.max(500, completed ? completed * 2 : 500))
-      : Math.min(MAX_BATCH * 2, requested - completed)
+    const nextTarget = Math.min(MAX_BATCH * 2, requested - completed)
     const batch = await fetchWikiGraph(nextTarget, signal)
     if (batch.source === 'fallback') merged.source = 'fallback'
     for (const node of batch.nodes) {
@@ -268,12 +296,10 @@ export async function fetchWikiGraphProgressive(
         merged.links.push({ source, target })
       }
     }
-    const previousCompleted = completed
-    completed = LOCAL_INDEX_URL ? Math.max(completed, batch.nodes.length) : completed + nextTarget
+    completed += nextTarget
     onProgress?.({ loaded: Math.min(completed, requested), requested, graph: { ...merged, nodes: [...merged.nodes], links: [...merged.links] } })
     // A fallback graph is finite; avoid repeatedly emitting the same demo map.
     if (batch.source === 'fallback' && batch.nodes.length < nextTarget) break
-    if (LOCAL_INDEX_URL && completed <= previousCompleted) break
   }
   return merged
 }

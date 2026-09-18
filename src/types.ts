@@ -24,6 +24,8 @@ export interface WikiGraph {
   links: WikiLink[]
   /** Identifies whether this graph came from Wikipedia or the offline seed graph. */
   source?: 'wikipedia' | 'fallback'
+  /** True when the graph was served by the local dump-backed corpus. */
+  local?: boolean
 }
 
 /** Corpus-level metadata returned by the local dump-backed API. */

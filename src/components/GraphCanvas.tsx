@@ -174,6 +174,9 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const colorResolverRef = useRef(getNodeColor)
   const settingsRef = useRef(settings)
   const drawRef = useRef<() => void>(() => undefined)
+  const nodeMapRef = useRef<{ graph: GraphData; map: Map<string, GraphNode> } | null>(null)
+  const lastWebglDrawRef = useRef(0)
+  const webglGeometryRef = useRef({ positions: new Float32Array(0), colors: new Float32Array(0) })
   graphRef.current = graph
   selectedIdRef.current = selectedId
   colorResolverRef.current = getNodeColor
@@ -186,28 +189,42 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     if (!program || !buffers) return
     const { width, height, dpr } = sizeRef.current
     const view = viewRef.current
-    const toClip = (x: number, y: number) => [((x * view.scale + view.x) / width) * 2 - 1, 1 - ((y * view.scale + view.y) / height) * 2]
-    const positions: number[] = []
-    const colors: number[] = []
+    const clipX = (x: number) => ((x * view.scale + view.x) / width) * 2 - 1
+    const clipY = (y: number) => 1 - ((y * view.scale + view.y) / height) * 2
+    const stride = links.length > 250_000 ? Math.ceil(links.length / 250_000) : 1
+    const maxVertices = Math.ceil(links.length / stride) * 2 + nodes.length
+    const geometry = webglGeometryRef.current
+    if (geometry.positions.length < maxVertices * 2) geometry.positions = new Float32Array(maxVertices * 2)
+    if (geometry.colors.length < maxVertices * 4) geometry.colors = new Float32Array(maxVertices * 4)
+    const positions = geometry.positions
+    const colors = geometry.colors
+    let positionCursor = 0
+    let colorCursor = 0
+    const pushVertex = (x: number, y: number) => {
+      positions[positionCursor++] = clipX(x)
+      positions[positionCursor++] = clipY(y)
+    }
     const pushColor = (color: string, alpha: number) => {
       const hex = color.startsWith('#') ? color.slice(1) : ''
       const value = hex.length === 6 ? Number.parseInt(hex, 16) : 0x73777f
-      colors.push(((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255, alpha)
+      colors[colorCursor++] = ((value >> 16) & 255) / 255
+      colors[colorCursor++] = ((value >> 8) & 255) / 255
+      colors[colorCursor++] = (value & 255) / 255
+      colors[colorCursor++] = alpha
     }
-    const stride = links.length > 250_000 ? Math.ceil(links.length / 250_000) : 1
     for (let index = 0; index < links.length; index += stride) {
       const edge = links[index]
       const source = linkNode(edge.source, nodeMap)
       const target = linkNode(edge.target, nodeMap)
       if (!source || !target || source.x == null || source.y == null || target.x == null || target.y == null) continue
       const related = source === selected || target === selected
-      positions.push(...toClip(source.x, source.y), ...toClip(target.x, target.y))
+      pushVertex(source.x, source.y); pushVertex(target.x, target.y)
       pushColor('#254fef', related ? 0.72 : 0.16); pushColor('#254fef', related ? 0.72 : 0.16)
     }
-    const lineVertexCount = positions.length / 2
+    const lineVertexCount = positionCursor / 2
     for (const node of nodes) {
       if (node.x == null || node.y == null) continue
-      positions.push(...toClip(node.x, node.y))
+      pushVertex(node.x, node.y)
       const active = node === selected || node === hovered
       const color = active || node === selected ? '#254fef' : (colorResolverRef.current?.(node) ?? node.color ?? '#9aabf8')
       pushColor(color, 1)
@@ -217,16 +234,16 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     gl.clear(gl.COLOR_BUFFER_BIT)
     gl.useProgram(program)
     gl.bindBuffer(gl.ARRAY_BUFFER, buffers.positions)
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.DYNAMIC_DRAW)
+    gl.bufferData(gl.ARRAY_BUFFER, positions.subarray(0, positionCursor), gl.DYNAMIC_DRAW)
     const positionLocation = gl.getAttribLocation(program, 'a_position')
     gl.enableVertexAttribArray(positionLocation); gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0)
     gl.bindBuffer(gl.ARRAY_BUFFER, buffers.colors)
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.DYNAMIC_DRAW)
+    gl.bufferData(gl.ARRAY_BUFFER, colors.subarray(0, colorCursor), gl.DYNAMIC_DRAW)
     const colorLocation = gl.getAttribLocation(program, 'a_color')
     gl.enableVertexAttribArray(colorLocation); gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, 0, 0)
     gl.lineWidth(1)
     gl.drawArrays(gl.LINES, 0, lineVertexCount)
-    const nodeVertexCount = positions.length / 2 - lineVertexCount
+    const nodeVertexCount = positionCursor / 2 - lineVertexCount
     const pointSize = gl.getUniformLocation(program, 'u_point_size')
     gl.uniform1f(pointSize, Math.max(3, Math.min(24, 8 * view.scale * dpr)))
     gl.drawArrays(gl.POINTS, lineVertexCount, nodeVertexCount)
@@ -247,10 +264,20 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const currentGraph = graphRef.current
     const nodes = currentGraph.nodes
     const largeGraph = nodes.length > LARGE_GRAPH_THRESHOLD
-    const nodeMap = new Map(nodes.map((node) => [node.id, node]))
+    const cachedNodeMap = nodeMapRef.current?.graph === currentGraph
+      ? nodeMapRef.current.map
+      : new Map(nodes.map((node) => [node.id, node]))
+    nodeMapRef.current = { graph: currentGraph, map: cachedNodeMap }
+    const nodeMap = cachedNodeMap
     const selected = selectedIdRef.current ? nodeMap.get(selectedIdRef.current) : undefined
     const hovered = hoverRef.current
     if (largeGraph && webglRef.current && webglProgramRef.current) {
+      const now = typeof performance === 'undefined' ? Date.now() : performance.now()
+      if (now - lastWebglDrawRef.current < 32) {
+        ctx.restore()
+        return
+      }
+      lastWebglDrawRef.current = now
       renderWebGL(webglRef.current, nodes, currentGraph.links, selected, hovered, nodeMap)
       // The overlay was saved/transformed above. Restore it before returning so
       // repeated WebGL frames do not accumulate canvas state or leave stale
@@ -399,9 +426,33 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       .velocityDecay(settings.velocityDecay)
       .alphaDecay(settings.alphaDecay)
       .alphaMin(settings.alphaMin)
+    // The squared-distance spring is intentionally uncapped, but starting a
+    // strong-link layout at alpha=1 creates an avoidable first-tick impulse.
+    // A low initial temperature lets the same force law integrate instead of
+    // launching endpoints beyond the numeric range. This applies below the
+    // large-graph threshold too, since the 1,000 default is intentionally hot.
+    if (largeGraph || settings.linkDistanceScale < 10_000) {
+      sim.alpha(Math.min(0.15, Math.max(0.02, settings.alphaTarget * 4)))
+    }
     simulationRef.current = sim
     let framePending = false
+    let invalidState = false
+    let validationTicks = 0
     sim.on('tick', () => {
+      if (!invalidState && largeGraph && validationTicks < 120) {
+        validationTicks += 1
+        const invalid = graph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy))
+        if (invalid) {
+          invalidState = true
+          sim.stop()
+          invalid.x = Number.isFinite(invalid.x) ? invalid.x : 0
+          invalid.y = Number.isFinite(invalid.y) ? invalid.y : 0
+          invalid.vx = 0
+          invalid.vy = 0
+          drawRef.current()
+          return
+        }
+      }
       if (!largeGraph) { drawRef.current(); return }
       if (framePending) return
       framePending = true
@@ -473,6 +524,7 @@ function pairKey(first: string, second: string) {
  * budget and rotating traversal keep dense 25k-node tiers responsive.
  */
 function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], largeGraph: boolean, settings: GraphSimulationSettings) {
+  const relatedLinkBudget = largeGraph ? 250_000 : Number.POSITIVE_INFINITY
   let orderedNodes = initialNodes
   let nodeOrder = new Map<GraphNode, number>()
   let relatedPairs = new Set<string>()
@@ -490,7 +542,7 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
       else cells.set(key, [node])
     }
 
-    let interactions = 0
+    let examinedPairs = 0
     const interactionBudget = orderedNodes.length < LARGE_GRAPH_THRESHOLD
       ? Number.POSITIVE_INFINITY
       : largeGraph ? settings.unrelatedInteractionBudget : settings.unrelatedInteractionBudget * 1.45
@@ -506,6 +558,8 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
           const bucket = cells.get(`${cellX},${cellY}`)
           if (!bucket) continue
           for (const target of bucket) {
+            examinedPairs += 1
+            if (examinedPairs > interactionBudget) break outer
             const targetIndex = nodeOrder.get(target)
             if (targetIndex == null || targetIndex <= sourceIndex) continue
             if (relatedPairs.has(pairKey(source.id, target.id))) continue
@@ -519,7 +573,6 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
               distance = 1
             }
             if (distance > maxDistance) continue
-            interactions += 1
             const falloff = 1 - distance / maxDistance
             const hubBoost = 0.6 + 1.4 * Math.max(hubRepulsionScore(source, settings), hubRepulsionScore(target, settings))
             const magnitude = Math.min(14, ((settings.unrelatedBaseStrength + settings.unrelatedHubStrength * hubBoost) / Math.max(28, distance)) * falloff) * alpha
@@ -529,7 +582,6 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
             source.vy = (source.vy ?? 0) + vy
             target.vx = (target.vx ?? 0) - vx
             target.vy = (target.vy ?? 0) - vy
-            if (interactions >= interactionBudget) break outer
           }
         }
       }
@@ -541,7 +593,10 @@ function unrelatedRepulsion(links: GraphLink[], initialNodes: GraphNode[], large
     nodeOrder = new Map(orderedNodes.map((node, index) => [node, index]))
     const byId = new Map(orderedNodes.map((node) => [node.id, node]))
     relatedPairs = new Set<string>()
-    for (const link of links) {
+    const relatedLinks = links.length > relatedLinkBudget
+      ? links.filter((_, index) => index % Math.ceil(links.length / relatedLinkBudget) === 0)
+      : links
+    for (const link of relatedLinks) {
       const source = linkNode(link.source, byId)
       const target = linkNode(link.target, byId)
       if (source && target && source !== target) relatedPairs.add(pairKey(source.id, target.id))
@@ -557,12 +612,20 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[], settings: G
       if (source.x == null || target.x == null || source.y == null || target.y == null) continue
       const dx = target.x - source.x
       const dy = target.y - source.y
+      if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+        source.vx = 0; source.vy = 0; target.vx = 0; target.vy = 0
+        continue
+      }
       const distance = Math.hypot(dx, dy) || 1
       // Make the spring strength grow exactly with the square of separation.
       // There is intentionally no distance ceiling: long links pull harder,
       // as requested, while endpoint-degree normalization still keeps hubs
       // from receiving one full-strength spring per incident edge.
       const pullMagnitude = (distance * distance) / settings.linkDistanceScale * weight * alpha
+      if (!Number.isFinite(pullMagnitude)) {
+        source.vx = 0; source.vy = 0; target.vx = 0; target.vy = 0
+        continue
+      }
       const pullX = dx / distance * pullMagnitude
       const pullY = dy / distance * pullMagnitude
 

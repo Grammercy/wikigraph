@@ -43,6 +43,7 @@ function PhysicsSlider({ id, label, value, min, max, step, onChange, format }: P
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
   const MAX_LOCAL_ARTICLES = 100_000
+  const ARTICLE_SELECT_LIMIT = 1_000
   const [count, setCount] = useState(50)
   const [graph, setGraph] = useState<WikiGraph>({ nodes: [], links: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -81,6 +82,7 @@ export default function App() {
       setSelectedId(null)
       setHoveredId(null)
       if (next.source === 'fallback') setError('Wikipedia is unavailable — showing a local demo graph (up to 51 articles).')
+      else if (amount > 500 && usesLocalCorpus && next.local !== true) setError('The local Wikipedia index is still building — showing a 500-article preview until its tiers are ready.')
       else if (amount > 500 && !usesLocalCorpus) setError('The hosted public API is limited to 500 articles. Run the local D: host for the full indexed corpus.')
     } catch (cause) {
       if (controller.signal.aborted || (cause instanceof DOMException && cause.name === 'AbortError')) return
@@ -123,6 +125,14 @@ export default function App() {
     }
     return [...relatedIds].map((id) => graph.nodes.find((node) => node.id === id)).filter((node): node is WikiGraph['nodes'][number] => Boolean(node)).slice(0, 5)
   }, [graph.links, graph.nodes, selected])
+  const articleOptions = useMemo(() => {
+    const options = graph.nodes.slice(0, ARTICLE_SELECT_LIMIT)
+    if (selectedId && !options.some((node) => node.id === selectedId)) {
+      const selectedOption = graph.nodes.find((node) => node.id === selectedId)
+      if (selectedOption) options.unshift(selectedOption)
+    }
+    return options
+  }, [graph.nodes, selectedId])
   const graphForCanvas = useMemo(() => ({
     nodes: graph.nodes.map((node) => {
       const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
@@ -196,10 +206,10 @@ export default function App() {
           <PhysicsSlider id="setting-alpha-target" label="Running alpha target" value={simulationSettings.alphaTarget} min={0} max={0.2} step={0.005} onChange={(value) => updateSimulationSetting('alphaTarget', value)} />
           <button type="button" className="settings-reset" onClick={() => setSimulationSettings({ ...DEFAULT_SIMULATION_SETTINGS })}>Reset physics values</button>
         </details>
-        <label className="field-label article-select-label" htmlFor="article-select">SELECT ARTICLE</label>
+        <label className="field-label article-select-label" htmlFor="article-select"><span>SELECT ARTICLE</span>{graph.nodes.length > ARTICLE_SELECT_LIMIT && <output>FIRST {ARTICLE_SELECT_LIMIT.toLocaleString()}</output>}</label>
         <select id="article-select" className="article-select" value={selectedId ?? ''} onChange={(event) => setSelectedId(event.target.value || null)} disabled={!graph.nodes.length}>
           <option value="">Choose an article…</option>
-          {graph.nodes.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}
+          {articleOptions.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}
         </select>
         <div className="legend"><div className="field-label">HOW IT WORKS</div><p><b>Repulsion</b> keeps every article apart.</p><p><b>Links</b> pull connected articles together.</p></div>
         <div className="panel-footer">Drag to explore <span>·</span> Scroll to zoom</div>
