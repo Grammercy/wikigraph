@@ -113,13 +113,16 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const nodeMap = new Map(nodes.map((node) => [node.id, node]))
     const selected = selectedIdRef.current ? nodeMap.get(selectedIdRef.current) : undefined
     const hovered = hoverRef.current
+    const linkStride = largeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
 
     ctx.lineCap = 'round'
-    for (const edge of currentGraph.links) {
+    for (let edgeIndex = 0; edgeIndex < currentGraph.links.length; edgeIndex += 1) {
+      const edge = currentGraph.links[edgeIndex]
       const source = linkNode(edge.source, nodeMap)
       const target = linkNode(edge.target, nodeMap)
       if (!source || !target || source.x == null || target.x == null || source.y == null || target.y == null) continue
       const isRelated = source === selected || target === selected
+      if (largeGraph && !isRelated && edgeIndex % linkStride !== 0) continue
       ctx.strokeStyle = isRelated ? 'rgba(37, 79, 239, .72)' : largeGraph ? 'rgba(115, 119, 127, .16)' : 'rgba(115, 119, 127, .22)'
       ctx.lineWidth = isRelated ? 1.7 : largeGraph ? 0.65 : 1
       ctx.beginPath()

@@ -22,6 +22,7 @@ function formatCount(value?: number | null) {
 
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
+  const MAX_LOCAL_ARTICLES = 25_000
   const [count, setCount] = useState(50)
   const [graph, setGraph] = useState<WikiGraph>({ nodes: [], links: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -109,7 +110,7 @@ export default function App() {
     links: graph.links,
   }), [graph, showLabels])
   const statusLabel = loading ? 'FETCHING' : graph.source === 'fallback' ? 'DEMO DATA' : graph.nodes.length ? 'WIKIPEDIA' : 'READY'
-  const rangeProgress = `${Math.round(((count - 10) / 4_990) * 100)}%`
+  const rangeProgress = `${Math.round(((count - 10) / (MAX_LOCAL_ARTICLES - 10)) * 100)}%`
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
     ? `Loading ${loadProgress.loaded.toLocaleString()} / ${loadProgress.requested.toLocaleString()}…`
@@ -125,8 +126,8 @@ export default function App() {
       <aside className="control-panel">
         <div className="panel-heading"><div><div className="eyebrow">CONTROL DECK</div><h2>Shape your map</h2></div><span className={`status-pill ${graph.source === 'fallback' ? 'offline' : ''}`}>● {statusLabel}</span></div>
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
-        <input id="article-count" className="range" type="range" min="10" max="5000" step="10" value={count} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${rangeProgress}, #d9dde5 ${rangeProgress})` }} onChange={(event) => { setCount(Number(event.target.value)); setLargeMapAcknowledged(false) }} />
-        <div className="range-labels"><span>10</span><span>5,000</span></div>
+        <input id="article-count" className="range" type="range" min="10" max={MAX_LOCAL_ARTICLES} step="10" value={count} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${rangeProgress}, #d9dde5 ${rangeProgress})` }} onChange={(event) => { setCount(Number(event.target.value)); setLargeMapAcknowledged(false) }} />
+        <div className="range-labels"><span>10</span><span>{MAX_LOCAL_ARTICLES.toLocaleString()}</span></div>
         {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and GPU time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
         <button className="primary-button" onClick={() => void load(count)} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
         <div className="rule" />
