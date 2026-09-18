@@ -178,7 +178,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const hovered = hoverRef.current
     if (largeGraph && webglRef.current && webglProgramRef.current) {
       renderWebGL(webglRef.current, nodes, currentGraph.links, selected, hovered, nodeMap)
-      ctx.clearRect(0, 0, width, height)
+      // The overlay was saved/transformed above. Restore it before returning so
+      // repeated WebGL frames do not accumulate canvas state or leave stale
+      // interaction pixels behind.
+      ctx.restore()
       return
     }
     const linkStride = largeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
