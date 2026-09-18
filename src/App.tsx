@@ -108,7 +108,8 @@ export default function App() {
     return () => controller.abort()
   }, [])
 
-  const selected = useMemo(() => graph.nodes.find((node) => node.id === selectedId), [graph.nodes, selectedId])
+  const nodeById = useMemo(() => new Map(graph.nodes.map((node) => [node.id, node])), [graph.nodes])
+  const selected = selectedId ? nodeById.get(selectedId) : undefined
   const selectedLinks = selected ? graph.links.filter((edge) => {
     const source = typeof edge.source === 'string' ? edge.source : edge.source.id
     const target = typeof edge.target === 'string' ? edge.target : edge.target.id
@@ -123,16 +124,16 @@ export default function App() {
       if (source === selected.id) relatedIds.add(target)
       if (target === selected.id) relatedIds.add(source)
     }
-    return [...relatedIds].map((id) => graph.nodes.find((node) => node.id === id)).filter((node): node is WikiGraph['nodes'][number] => Boolean(node)).slice(0, 5)
-  }, [graph.links, graph.nodes, selected])
+    return [...relatedIds].slice(0, 5).map((id) => nodeById.get(id)).filter((node): node is WikiGraph['nodes'][number] => Boolean(node))
+  }, [graph.links, nodeById, selected])
   const articleOptions = useMemo(() => {
     const options = graph.nodes.slice(0, ARTICLE_SELECT_LIMIT)
     if (selectedId && !options.some((node) => node.id === selectedId)) {
-      const selectedOption = graph.nodes.find((node) => node.id === selectedId)
+      const selectedOption = nodeById.get(selectedId)
       if (selectedOption) options.unshift(selectedOption)
     }
     return options
-  }, [graph.nodes, selectedId])
+  }, [graph.nodes, nodeById, selectedId])
   const graphForCanvas = useMemo(() => ({
     nodes: graph.nodes.map((node) => {
       const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
@@ -215,7 +216,7 @@ export default function App() {
         <div className="panel-footer">Drag to explore <span>·</span> Scroll to zoom</div>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections{corpusStats?.articles && <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></>}{hoveredId && <><i /> <span className="hover-readout">{graph.nodes.find((node) => node.id === hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
+        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections{corpusStats?.articles && <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></>}{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
         <GraphCanvas ref={canvasRef} graph={graphForCanvas} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce Link distance² scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
