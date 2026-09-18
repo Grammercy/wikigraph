@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphSimulationSettings } from './components/GraphCanvas'
+import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphSimulationSettings } from './components/GraphCanvas'
 import { fetchWikiGraphProgressive, fetchWikiStats, usesLocalCorpus } from './data/wiki'
 import type { WikiGraph, WikiStats } from './types'
 
@@ -90,6 +90,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [paused, setPaused] = useState(false)
   const [showLabels, setShowLabels] = useState(true)
+  const [graphMode, setGraphMode] = useState<GraphCanvasMode>('2d')
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const [corpusStats, setCorpusStats] = useState<WikiStats | null>(null)
   const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
@@ -193,7 +194,12 @@ export default function App() {
 
   return <main className="app-shell">
     <header className="topbar">
-      <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
+      <svg className="brand-mark" viewBox="0 0 27 27" role="img" aria-label="WikiGraph logo">
+        <path className="brand-mark-link" d="M5 14L22 5M5 14L22 22" />
+        <circle className="brand-mark-node brand-mark-node-primary" cx="5" cy="14" r="4" />
+        <circle className="brand-mark-node brand-mark-node-secondary" cx="22" cy="5" r="4" />
+        <circle className="brand-mark-node brand-mark-node-secondary" cx="22" cy="22" r="4" />
+      </svg>
       <div><div className="eyebrow">EXPLORATORY GRAPH</div><h1>Wiki<span>/Graph</span></h1></div>
       <div className="topbar-meta"><span className="live-dot" /> {graph.source === 'fallback' ? 'LOCAL DEMO DATA' : 'LIVE SIMULATION'} <span className="divider" /> <span className="muted">{corpusStats?.building ? `INDEXING ${formatCount(corpusStats.articles)} ARTICLES` : corpusStats?.articles ? `${formatCount(corpusStats.articles)} ARTICLE CORPUS` : 'Wikipedia knowledge map'}</span></div>
     </header>
@@ -209,6 +215,13 @@ export default function App() {
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
         <button className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-pressed={showLabels}><span>Article labels</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
+        <div className="view-mode-control" role="group" aria-label="Graph view">
+          <span className="view-mode-label">Graph view</span>
+          <div className="view-mode-options">
+            <button type="button" className={graphMode === '2d' ? 'active' : ''} aria-pressed={graphMode === '2d'} onClick={() => setGraphMode('2d')}>2D</button>
+            <button type="button" className={graphMode === '3d' ? 'active' : ''} aria-pressed={graphMode === '3d'} onClick={() => setGraphMode('3d')}>3D</button>
+          </div>
+        </div>
         <details className="simulation-settings">
           <summary><span>Advanced physics</span><span className="settings-live">LIVE</span></summary>
           <p className="simulation-settings-note">Adjust every major force and cooling value. Changes restart the layout without fetching new articles.</p>
@@ -266,9 +279,9 @@ export default function App() {
         <div className="panel-footer">Drag to explore <span>·</span> Scroll to zoom</div>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{corpusStats?.articles ? <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></> : null}{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">SCROLL TO ZOOM</span></span></div>
+        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{corpusStats?.articles ? <><i /> <span className="muted">{formatCount(corpusStats.articles)} indexed</span></> : null}{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas ref={canvasRef} graph={graphForCanvas} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
+        <GraphCanvas ref={canvasRef} graph={graphForCanvas} mode={graphMode} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
         <div className="canvas-footer"><span className="legend-key"><i className="node-key" /> Article</span><span className="legend-key"><i className="edge-key" /> Link direction</span><span className="canvas-credit">Wikipedia · public knowledge</span></div>
