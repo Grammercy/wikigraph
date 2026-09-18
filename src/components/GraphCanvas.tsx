@@ -179,6 +179,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const nodeMapRef = useRef<{ graph: GraphData; map: Map<string, GraphNode> } | null>(null)
   const lastWebglDrawRef = useRef(0)
   const webglGeometryRef = useRef({ positions: new Float32Array(0), colors: new Float32Array(0) })
+  const largeTickTimerRef = useRef<number | null>(null)
+  const manualTickRef = useRef<(() => void) | null>(null)
   graphRef.current = graph
   selectedIdRef.current = selectedId
   colorResolverRef.current = getNodeColor
@@ -466,16 +468,40 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       framePending = true
       requestAnimationFrame(() => { framePending = false; drawRef.current() })
     })
-    if (pausedRef.current) sim.stop()
-    return () => { sim.stop(); simulationRef.current = null }
+    if (largeGraph) {
+      // A d3 timer can monopolize the main thread when a dense tier needs a
+      // long force tick. Run one tick, yield to input/rendering, then continue
+      // at a bounded cadence so the page remains interruptible.
+      sim.stop()
+      const runLargeTick = () => {
+        if (pausedRef.current || invalidState) return
+        sim.tick()
+        if (!pausedRef.current && !invalidState) largeTickTimerRef.current = window.setTimeout(runLargeTick, 50)
+      }
+      manualTickRef.current = runLargeTick
+      if (!pausedRef.current) largeTickTimerRef.current = window.setTimeout(runLargeTick, 0)
+    } else if (pausedRef.current) sim.stop()
+    return () => {
+      sim.stop()
+      if (largeTickTimerRef.current != null) window.clearTimeout(largeTickTimerRef.current)
+      largeTickTimerRef.current = null
+      manualTickRef.current = null
+      simulationRef.current = null
+    }
   }, [graph, settings])
 
   useEffect(() => { drawRef.current() }, [selectedId])
 
   useEffect(() => {
     simulationRef.current?.alphaTarget(paused ? 0 : settings.alphaTarget)
-    if (paused) simulationRef.current?.stop()
-    else simulationRef.current?.restart()
+    if (paused) {
+      simulationRef.current?.stop()
+      if (largeTickTimerRef.current != null) window.clearTimeout(largeTickTimerRef.current)
+      largeTickTimerRef.current = null
+    } else if (manualTickRef.current) {
+      simulationRef.current?.stop()
+      if (largeTickTimerRef.current == null) manualTickRef.current()
+    } else simulationRef.current?.restart()
   }, [paused, settings.alphaTarget])
 
   useEffect(() => {
