@@ -63,7 +63,11 @@ const articleImportance = (node: GraphNode) => {
 // need to create a much stronger boundary around other structural hubs.
 const hubRepulsionScore = (node: GraphNode) => {
   const degree = articleDegree(node)
-  return Math.min(1, Math.log1p(degree) / Math.log1p(2_500))
+  // The UI marks degree-10 articles as blue hubs. Calibrate the physics to
+  // that same visible threshold instead of waiting until degree 2,500 before
+  // the special force becomes meaningful.
+  if (degree < 10) return 0
+  return Math.min(1, Math.log1p(degree) / Math.log1p(60))
 }
 // More connected articles are visually larger, with a cap so hubs never swallow
 // nearby nodes. Keeping this in one helper also keeps hit testing/collision aligned.
@@ -309,7 +313,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
         // hub-repulsion force below handles hub-to-hub separation directly.
         .strength((node) => -115 - articleImportance(node) * 126 - hubRepulsionScore(node) ** 3 * 520)
         .distanceMax(480))
-      .force('hub-repulsion', hubRepulsion(graph.nodes, largeGraph))
+      .force('hub-repulsion', hubRepulsion(largeGraph))
       .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node) + (largeGraph ? 5 : 10)).iterations(largeGraph ? 1 : 2))
       .force('center', forceCenter<GraphNode>(0, 0).strength(0.035))
       // The arrow remains directed in the renderer, but the physical spring is
@@ -382,6 +386,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 })
 
 function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
+  const LINK_PULL_SCALE = 90_000
+  const MAX_LINK_PULL = 48
   let resolved: Array<[GraphNode, GraphNode, number]> = []
   const force = (alpha: number) => {
     for (const [source, target, weight] of resolved) {
@@ -389,9 +395,12 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
       const dx = target.x - source.x
       const dy = target.y - source.y
       const distance = Math.hypot(dx, dy) || 1
-      const strength = Math.min(0.028, 0.007 + distance / 260000) * weight
-      const pullX = dx / distance * distance * strength * alpha
-      const pullY = dy / distance * distance * strength * alpha
+      // Make the spring strength grow with the square of separation. The cap
+      // keeps a newly streamed tier with a very long edge from ejecting nodes
+      // out of the viewport in one tick.
+      const pullMagnitude = Math.min(MAX_LINK_PULL, (distance * distance) / LINK_PULL_SCALE) * weight * alpha
+      const pullX = dx / distance * pullMagnitude
+      const pullY = dy / distance * pullMagnitude
 
       // Equal and opposite impulses make this a true spring: the source moves
       // toward the target and the target moves toward the source. Keeping the
@@ -410,77 +419,78 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
       const target = linkNode(link.target, map)
       return source && target ? [[source, target] as [GraphNode, GraphNode]] : []
     })
-    const outDegrees = new Map<GraphNode, number>()
-    for (const [source] of candidates) outDegrees.set(source, (outDegrees.get(source) ?? 0) + 1)
-    // Keep high-outdegree pages influential without letting one hub dominate the whole map.
-    resolved = candidates.map(([source, target]) => [source, target, 1 / Math.sqrt(outDegrees.get(source) ?? 1)])
+    // Normalize by both endpoints. A high-indegree hub should not collect one
+    // full-strength spring from every low-degree article and collapse the map
+    // into a shared barycenter. Hub-to-hub links still pull, but their spring is
+    // deliberately softer so the strong hub-territory force can separate them.
+    resolved = candidates.map(([source, target]) => {
+      const sourceDegree = Math.max(1, articleDegree(source))
+      const targetDegree = Math.max(1, articleDegree(target))
+      const degreeWeight = Math.max(0.02, 1 / Math.sqrt(sourceDegree * targetDegree))
+      const bothHubs = hubRepulsionScore(source) > 0 && hubRepulsionScore(target) > 0
+      const hubDamping = bothHubs ? 0.24 : 1
+      return [source, target, degreeWeight * hubDamping]
+    })
     void simulationNodes
   }
   return force
 }
 
 /**
- * Extra local force for structural hubs. d3's many-body force is excellent at
+ * Extra force for structural hubs. d3's many-body force is excellent at
  * scaling to large graphs, but its per-node charge cannot express the desired
- * "hub versus hub" boundary. A spatial hash keeps this pairwise term bounded:
- * only nearby hubs are compared, and low-degree pages are ignored entirely.
+ * "hub versus hub" boundary. We compare only a capped, degree-sorted hub set
+ * and give every pair a preferred territory radius.
  */
-function hubRepulsion(initialNodes: GraphNode[], largeGraph: boolean) {
-  let nodes = initialNodes
-  const cellSize = largeGraph ? 260 : 220
-  const maxDistance = largeGraph ? 520 : 460
-  const maxDistanceSquared = maxDistance * maxDistance
+function hubRepulsion(largeGraph: boolean) {
+  let hubs: GraphNode[] = []
   const force = (alpha: number) => {
-    const cells = new Map<string, GraphNode[]>()
-    const active = nodes.filter((node) => node.x != null && node.y != null && hubRepulsionScore(node) >= 0.12)
-    for (const node of active) {
-      const key = `${Math.floor((node.x as number) / cellSize)},${Math.floor((node.y as number) / cellSize)}`
-      const bucket = cells.get(key)
-      if (bucket) bucket.push(node)
-      else cells.set(key, [node])
-    }
-
-    let interactions = 0
-    const interactionBudget = largeGraph ? 160_000 : 240_000
-    for (const source of active) {
-      if (interactions >= interactionBudget) break
-      const sourceX = source.x as number
-      const sourceY = source.y as number
-      const sourceCellX = Math.floor(sourceX / cellSize)
-      const sourceCellY = Math.floor(sourceY / cellSize)
+    const maxHubDistance = largeGraph ? 720 : 660
+    for (let sourceIndex = 0; sourceIndex < hubs.length; sourceIndex += 1) {
+      const source = hubs[sourceIndex]
+      if (source.x == null || source.y == null) continue
       const sourceScore = hubRepulsionScore(source)
-      for (let cellX = sourceCellX - 2; cellX <= sourceCellX + 2; cellX += 1) {
-        for (let cellY = sourceCellY - 2; cellY <= sourceCellY + 2; cellY += 1) {
-          const bucket = cells.get(`${cellX},${cellY}`)
-          if (!bucket) continue
-          for (const target of bucket) {
-            if (target.id <= source.id) continue
-            const dx = sourceX - (target.x as number)
-            const dy = sourceY - (target.y as number)
-            const distanceSquared = dx * dx + dy * dy
-            if (distanceSquared > maxDistanceSquared) continue
-            interactions += 1
-            const distance = Math.sqrt(distanceSquared) || 1
-            const targetScore = hubRepulsionScore(target)
-            const pairScore = sourceScore * sourceScore * targetScore * targetScore
-            // A hard floor keeps two hubs from collapsing together; the
-            // quadratic score makes the strongest hubs repel super-linearly.
-            const magnitude = Math.min(10, (18 + 560 * pairScore) / Math.max(34, distance)) * alpha
-            const vx = dx / distance * magnitude
-            const vy = dy / distance * magnitude
-            source.vx = (source.vx ?? 0) + vx
-            source.vy = (source.vy ?? 0) + vy
-            target.vx = (target.vx ?? 0) - vx
-            target.vy = (target.vy ?? 0) - vy
-            if (interactions >= interactionBudget) break
-          }
-          if (interactions >= interactionBudget) break
+      for (let targetIndex = sourceIndex + 1; targetIndex < hubs.length; targetIndex += 1) {
+        const target = hubs[targetIndex]
+        if (target.x == null || target.y == null) continue
+        const targetScore = hubRepulsionScore(target)
+        const sourceX = source.x as number
+        const sourceY = source.y as number
+        let dx = sourceX - (target.x as number)
+        let dy = sourceY - (target.y as number)
+        let distance = Math.hypot(dx, dy)
+        // D3 can initialize multiple nodes at the same coordinate. A stable
+        // pair-specific direction avoids a zero vector without adding jitter.
+        if (distance < 0.001) {
+          const angle = ((sourceIndex * 92821 + targetIndex * 68917) % 360) * Math.PI / 180
+          dx = Math.cos(angle)
+          dy = Math.sin(angle)
+          distance = 1
         }
-        if (interactions >= interactionBudget) break
+        const pairScore = Math.pow(sourceScore * targetScore, 1.2)
+        const preferredDistance = Math.min(maxHubDistance, 360 + 260 * ((sourceScore + targetScore) / 2))
+        if (distance >= preferredDistance) continue
+        const deficit = 1 - distance / preferredDistance
+        // This is intentionally much larger than the incident-link spring for
+        // visible hubs. It creates an exclusion territory, not just a small
+        // nudge, while the cap keeps the simulation finite at alpha=1.
+        const magnitude = Math.min(70, (12 + 260 * pairScore) * deficit) * alpha
+        const vx = dx / distance * magnitude
+        const vy = dy / distance * magnitude
+        source.vx = (source.vx ?? 0) + vx
+        source.vy = (source.vy ?? 0) + vy
+        target.vx = (target.vx ?? 0) - vx
+        target.vy = (target.vy ?? 0) - vy
       }
     }
   }
-  force.initialize = (simulationNodes: GraphNode[]) => { nodes = simulationNodes }
+  force.initialize = (simulationNodes: GraphNode[]) => {
+    const maxHubs = largeGraph ? 320 : 256
+    hubs = [...simulationNodes]
+      .filter((node) => hubRepulsionScore(node) > 0)
+      .sort((a, b) => articleDegree(b) - articleDegree(a) || a.id.localeCompare(b.id))
+      .slice(0, maxHubs)
+  }
   return force
 }
 
