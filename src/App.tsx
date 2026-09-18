@@ -40,6 +40,45 @@ function PhysicsSlider({ id, label, value, min, max, step, onChange, format }: P
   </label>
 }
 
+type LogSliderProps = PhysicsSliderProps & { center: number }
+
+function logSliderPosition(value: number, min: number, max: number, center: number) {
+  const safeMin = Math.max(Number.MIN_VALUE, min)
+  const safeMax = Math.max(safeMin, max)
+  const safeCenter = Math.max(safeMin, Math.min(safeMax, center))
+  if (safeMax === safeMin) return 0
+  if (value <= safeCenter) {
+    const lowerSpan = Math.max(Number.EPSILON, Math.log(safeCenter / safeMin))
+    return Math.max(0, Math.min(0.5, 0.5 * Math.log(Math.max(safeMin, value) / safeMin) / lowerSpan))
+  }
+  const upperSpan = Math.max(Number.EPSILON, Math.log(safeMax / safeCenter))
+  return Math.max(0.5, Math.min(1, 0.5 + 0.5 * Math.log(Math.min(safeMax, value) / safeCenter) / upperSpan))
+}
+
+function logSliderValue(position: number, min: number, max: number, center: number, step: number) {
+  const safeMin = Math.max(Number.MIN_VALUE, min)
+  const safeMax = Math.max(safeMin, max)
+  const safeCenter = Math.max(safeMin, Math.min(safeMax, center))
+  const boundedPosition = Math.max(0, Math.min(1, position))
+  const raw = boundedPosition <= 0.5
+    ? safeMin * Math.exp((boundedPosition / 0.5) * Math.log(Math.max(Number.EPSILON, safeCenter / safeMin)))
+    : safeCenter * Math.exp(((boundedPosition - 0.5) / 0.5) * Math.log(Math.max(Number.EPSILON, safeMax / safeCenter)))
+  const snapped = Math.round(raw / step) * step
+  return Math.max(min, Math.min(max, snapped))
+}
+
+function LogSlider({ id, label, value, min, max, step, center, onChange, format }: LogSliderProps) {
+  const sliderPosition = logSliderPosition(value, min, max, center)
+  const sliderUnits = Math.round(sliderPosition * 1_000)
+  const display = format?.(value) ?? (step < 1 ? value.toFixed(3) : Math.round(value).toLocaleString())
+  const input = <input id={id} className={`range${label ? ' simulation-range' : ''}`} type="range" min="0" max="1000" step="1" value={sliderUnits} aria-valuetext={display} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${sliderUnits / 10}%, #d9dde5 ${sliderUnits / 10}%)` }} onChange={(event) => onChange(logSliderValue(Number(event.target.value) / 1_000, min, max, center, step))} />
+  if (!label) return input
+  return <label className="simulation-control" htmlFor={id}>
+    <span className="simulation-control-label"><span>{label}</span><output>{display}</output></span>
+    {input}
+  </label>
+}
+
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
   const MAX_LOCAL_ARTICLES = 100_000
@@ -146,7 +185,6 @@ export default function App() {
     links: graph.links,
   }), [graph, showLabels])
   const statusLabel = loading ? 'FETCHING' : graph.source === 'fallback' ? 'DEMO DATA' : graph.nodes.length ? 'WIKIPEDIA' : 'READY'
-  const rangeProgress = `${Math.round(((count - 10) / (MAX_LOCAL_ARTICLES - 10)) * 100)}%`
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
     ? `Loading ${loadProgress.loaded.toLocaleString()} / ${loadProgress.requested.toLocaleString()}…`
@@ -162,7 +200,7 @@ export default function App() {
       <aside className="control-panel">
         <div className="panel-heading"><div><div className="eyebrow">CONTROL DECK</div><h2>Shape your map</h2></div><span className={`status-pill ${graph.source === 'fallback' ? 'offline' : ''}`}>● {statusLabel}</span></div>
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
-        <input id="article-count" className="range" type="range" min="10" max={MAX_LOCAL_ARTICLES} step="10" value={count} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${rangeProgress}, #d9dde5 ${rangeProgress})` }} onChange={(event) => { setCount(Number(event.target.value)); setLargeMapAcknowledged(false) }} />
+        <LogSlider id="article-count" label="" value={count} min={10} max={MAX_LOCAL_ARTICLES} step={10} center={1_000} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} />
         <div className="range-labels"><span>10</span><span>{MAX_LOCAL_ARTICLES.toLocaleString()}</span></div>
         {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and GPU time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
         <button className="primary-button" onClick={() => void load(count)} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
@@ -178,7 +216,7 @@ export default function App() {
           <PhysicsSlider id="setting-importance-charge" label="Article importance" value={simulationSettings.articleImportanceCharge} min={0} max={500} step={5} onChange={(value) => updateSimulationSetting('articleImportanceCharge', value)} />
           <PhysicsSlider id="setting-hub-charge" label="Hub repulsion" value={simulationSettings.hubCharge} min={0} max={1500} step={10} onChange={(value) => updateSimulationSetting('hubCharge', value)} />
           <PhysicsSlider id="setting-charge-distance" label="Charge radius" value={simulationSettings.chargeDistance} min={100} max={2000} step={10} onChange={(value) => updateSimulationSetting('chargeDistance', value)} />
-          <PhysicsSlider id="setting-link-scale" label="Link distance² scale" value={simulationSettings.linkDistanceScale} min={1} max={300000} step={1} onChange={(value) => updateSimulationSetting('linkDistanceScale', value)} format={(value) => value.toLocaleString()} />
+          <LogSlider id="setting-link-scale" label="Link distance² scale" value={simulationSettings.linkDistanceScale} min={1} max={300000} step={1} center={1_000} onChange={(value) => updateSimulationSetting('linkDistanceScale', value)} format={(value) => value.toLocaleString()} />
           <PhysicsSlider id="setting-link-floor" label="Link weight floor" value={simulationSettings.linkWeightFloor} min={0} max={0.25} step={0.005} onChange={(value) => updateSimulationSetting('linkWeightFloor', value)} />
           <PhysicsSlider id="setting-hub-damping" label="Hub-link damping" value={simulationSettings.hubLinkDamping} min={0} max={1} step={0.01} onChange={(value) => updateSimulationSetting('hubLinkDamping', value)} />
           <PhysicsSlider id="setting-unrelated-base" label="Unrelated push" value={simulationSettings.unrelatedBaseStrength} min={0} max={500} step={5} onChange={(value) => updateSimulationSetting('unrelatedBaseStrength', value)} />

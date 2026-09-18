@@ -118,7 +118,16 @@ function connectedOrder(nodes, links) {
 function sample(value, count) {
   if (!value || !Array.isArray(value.nodes) || !Array.isArray(value.links)) return null
   const allNodes = normalizedNodes(value)
-  const allLinks = resolvedEdges(value, allNodes)
+  // Connected tier files already store canonical IDs and deduplicated edges;
+  // avoid rebuilding title aliases and a multi-million-entry edge set for
+  // every 100k request. Legacy files still use the defensive resolver.
+  const allLinks = value.order === 'connected'
+    ? value.links.flatMap((edge) => {
+      const source = edge?.source == null ? '' : String(edge.source)
+      const target = edge?.target == null ? '' : String(edge.target)
+      return source && target && source !== target ? [{ source, target }] : []
+    })
+    : resolvedEdges(value, allNodes)
   const order = value.order === 'connected'
     ? allNodes.map((node) => node.id)
     : connectedOrder(allNodes, allLinks)
