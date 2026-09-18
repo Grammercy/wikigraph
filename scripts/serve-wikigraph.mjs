@@ -10,6 +10,7 @@ const dataRoot = resolve(process.env.WIKIGRAPH_DATA_DIR || (process.platform ===
 const indexFile = resolve(dataRoot, 'index.json')
 const jsonlFile = resolve(dataRoot, 'index', 'articles.jsonl')
 const sampleFile = resolve(dataRoot, 'index', 'sample.json')
+const indexManifestFile = resolve(dataRoot, 'index', 'manifest.json')
 const tiersDir = resolve(dataRoot, 'index', 'tiers')
 const parserCheckpoint = resolve(dataRoot, 'articles.checkpoint.json')
 const port = Number(process.env.WIKIGRAPH_PORT || 8787)
@@ -144,6 +145,27 @@ async function scanCorpus() {
   }
   if (!existsSync(jsonlFile)) {
     return null
+  }
+  // The index manifest already has the exact record count. Avoid rescanning a
+  // multi-gigabyte JSONL file on every browser startup while the progressive
+  // tier builder is still finishing; links and byte totals can be populated
+  // later by the tier manifest without blocking the API event loop.
+  if (existsSync(indexManifestFile)) {
+    try {
+      const manifest = JSON.parse(readFileSync(indexManifestFile, 'utf8'))
+      if (Number.isFinite(manifest.records)) {
+        const stat = statSync(indexManifestFile)
+        return {
+          articles: manifest.records,
+          links: null,
+          totalArticleBytes: null,
+          indexed: true,
+          source: 'jsonl',
+          tiers: readTierManifest()?.tiers ?? [],
+          updatedAt: manifest.completedAt ?? new Date(stat.mtimeMs).toISOString(),
+        }
+      }
+    } catch { /* fall through to the exhaustive scan for older indexes */ }
   }
   const stat = statSync(jsonlFile)
   if (corpusStatsCache && corpusStatsCache.mtimeMs === stat.mtimeMs && corpusStatsCache.size === stat.size) return corpusStatsCache.value
