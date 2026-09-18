@@ -3,7 +3,7 @@
 // It never downloads or parses raw Wikimedia XML.
 import { createServer } from 'node:http'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { extname, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 
 const dataRoot = resolve(process.env.WIKIGRAPH_DATA_DIR || (process.platform === 'win32' ? 'D:\\WikiGraphData' : '/mnt/d/WikiGraphData'))
@@ -11,6 +11,7 @@ const indexFile = resolve(dataRoot, 'index.json')
 const jsonlFile = resolve(dataRoot, 'index', 'articles.jsonl')
 const sampleFile = resolve(dataRoot, 'index', 'sample.json')
 const port = Number(process.env.WIKIGRAPH_PORT || 8787)
+const webRoot = resolve(process.env.WIKIGRAPH_WEB_ROOT || 'dist')
 const fallback = { nodes: [{ id: 'Physics', title: 'Physics', url: 'https://en.wikipedia.org/wiki/Physics' }, { id: 'Mathematics', title: 'Mathematics', url: 'https://en.wikipedia.org/wiki/Mathematics' }], links: [{ source: 'Physics', target: 'Mathematics' }] }
 let jsonlCache = null
 let corpusStatsCache = null
@@ -21,6 +22,24 @@ const key = (value) => String(value).trim().replace(/\s+/g, ' ').toLocaleLowerCa
 const refValue = (value) => value && typeof value === 'object' ? value.id ?? value.title ?? '' : value
 const hash = (value) => { let h = 2166136261; for (const c of String(value)) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0 }
 const send = (res, code, body) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(body)) }
+const contentTypes = { '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2' }
+function serveFile(res, filePath) {
+  if (!existsSync(filePath) || !statSync(filePath).isFile()) return false
+  const stat = statSync(filePath)
+  res.writeHead(200, { 'content-type': contentTypes[extname(filePath).toLowerCase()] || 'application/octet-stream', 'content-length': stat.size, 'access-control-allow-origin': '*' })
+  if (res.req?.method === 'HEAD') return res.end(), true
+  createReadStream(filePath).pipe(res)
+  return true
+}
+function serveWeb(res, pathname) {
+  if (!existsSync(webRoot)) return false
+  let decoded
+  try { decoded = decodeURIComponent(pathname) } catch { return false }
+  const requested = resolve(webRoot, `.${decoded === '/' ? '/index.html' : decoded}`)
+  const rootPrefix = webRoot.endsWith(sep) ? webRoot : `${webRoot}${sep}`
+  if (requested !== webRoot && !requested.startsWith(rootPrefix)) return false
+  return serveFile(res, requested) || serveFile(res, resolve(webRoot, 'index.html'))
+}
 function sample(value, count) {
   if (!value || !Array.isArray(value.nodes) || !Array.isArray(value.links)) return null
   const nodes = value.nodes.filter((n) => n && typeof n.title === 'string').sort((a, b) => hash(a.id || a.title) - hash(b.id || b.title)).slice(0, count)
@@ -139,6 +158,8 @@ function withDegrees(graph) {
 }
 createServer(async (req, res) => {
   const request = new URL(req.url || '/', `http://127.0.0.1:${port}`)
+  if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS' }); return res.end() }
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, { allow: 'GET, HEAD, OPTIONS' }); return res.end() }
   if (request.pathname === '/health') return send(res, 200, { ok: true, indexed: existsSync(indexFile) || existsSync(jsonlFile) || existsSync(sampleFile), dataRoot })
   try {
     if (request.pathname === '/api/stats') {
@@ -153,7 +174,10 @@ createServer(async (req, res) => {
       const article = await findArticle(request.searchParams.get('id') || request.searchParams.get('title') || '')
       return send(res, article ? 200 : 404, article || { error: 'Article not found' })
     }
-    if (request.pathname !== '/api/graph') return send(res, 404, { error: 'Use GET /api/graph?count=50, /api/stats, /api/search?q=physics, or /api/article?title=Physics' })
+    if (request.pathname !== '/api/graph') {
+      if (serveWeb(res, request.pathname)) return
+      return send(res, 404, { error: existsSync(webRoot) ? 'Not found' : 'Build the app first with `npm run build` (or use an /api endpoint)' })
+    }
     const count = Math.max(1, Math.min(CACHE_LIMIT, Number(request.searchParams.get('count') || 50) || 50))
     let graph = null
     // The compact sample is intentionally only used for the backwards-
@@ -165,4 +189,4 @@ createServer(async (req, res) => {
   } catch (error) {
     send(res, 503, { error: 'Local Wikipedia index is unavailable', detail: error instanceof Error ? error.message : String(error) })
   }
-}).listen(port, '127.0.0.1', () => console.log(`WikiGraph local API listening at http://127.0.0.1:${port}; data root: ${dataRoot}`))
+}).listen(port, '127.0.0.1', () => console.log(`WikiGraph host listening at http://127.0.0.1:${port}; web root: ${webRoot}; data root: ${dataRoot}`))

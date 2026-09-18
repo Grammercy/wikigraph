@@ -49,6 +49,12 @@ The browser intentionally samples at most 500 articles per view so the force
 layout stays interactive; the complete English corpus remains on disk and
 queryable by the local service.
 
+To serve the production website and local API from one origin, run
+`npm run wiki:host` after setting `VITE_WIKIGRAPH_INDEX_URL=/api/graph` before
+the build. Open `http://127.0.0.1:8787/`; the host serves `dist/` with SPA
+fallback plus `/health`, `/api/stats`, `/api/search`, `/api/article`, and
+`/api/graph`.
+
 ## Run locally
 
 Requirements: Node.js 18+.
