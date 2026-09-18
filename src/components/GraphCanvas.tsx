@@ -387,7 +387,6 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
 function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
   const LINK_PULL_SCALE = 90_000
-  const MAX_LINK_PULL = 48
   let resolved: Array<[GraphNode, GraphNode, number]> = []
   const force = (alpha: number) => {
     for (const [source, target, weight] of resolved) {
@@ -395,10 +394,11 @@ function symmetricAttraction(links: GraphLink[], nodes: GraphNode[]) {
       const dx = target.x - source.x
       const dy = target.y - source.y
       const distance = Math.hypot(dx, dy) || 1
-      // Make the spring strength grow with the square of separation. The cap
-      // keeps a newly streamed tier with a very long edge from ejecting nodes
-      // out of the viewport in one tick.
-      const pullMagnitude = Math.min(MAX_LINK_PULL, (distance * distance) / LINK_PULL_SCALE) * weight * alpha
+      // Make the spring strength grow exactly with the square of separation.
+      // There is intentionally no distance ceiling: long links pull harder,
+      // as requested, while endpoint-degree normalization still keeps hubs
+      // from receiving one full-strength spring per incident edge.
+      const pullMagnitude = (distance * distance) / LINK_PULL_SCALE * weight * alpha
       const pullX = dx / distance * pullMagnitude
       const pullY = dy / distance * pullMagnitude
 
