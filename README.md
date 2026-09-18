@@ -1,5 +1,12 @@
 # WikiGraph
 
+## Hosted demo
+
+The static frontend is deployed at [grammercy.github.io/wikigraph](https://grammercy.github.io/wikigraph/).
+The hosted build uses Wikipedia's public API. The optional full-dump index server remains local because
+GitHub Pages does not run backend processes; use `npm run wiki:serve` on the machine that stores the dump
+under `D:\WikiGraphData` when you want the full local corpus.
+
 WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one another while directed Wikipedia links attract their source toward their target, producing an emergent view of related knowledge.
 
 ## Controls
