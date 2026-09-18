@@ -47,24 +47,85 @@ function serveWeb(res, pathname) {
   if (requested !== webRoot && !requested.startsWith(rootPrefix)) return false
   return serveFile(res, requested) || serveFile(res, resolve(webRoot, 'index.html'))
 }
-function sample(value, count) {
-  if (!value || !Array.isArray(value.nodes) || !Array.isArray(value.links)) return null
-  const nodes = value.nodes.filter((n) => n && typeof n.title === 'string').sort((a, b) => hash(a.id || a.title) - hash(b.id || b.title)).slice(0, count)
-  const byRef = new Map(nodes.flatMap((n) => {
-    const id = String(n.id || n.title)
-    return [[key(id), id], [key(n.title), id]]
-  }))
+function normalizedNodes(value) {
+  return value.nodes
+    .filter((node) => node && typeof node.title === 'string')
+    .map((node) => ({ ...node, id: String(node.id || node.title), url: node.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(node.title).replaceAll('%20', '_')}` }))
+}
+
+function resolvedEdges(value, nodes) {
+  // Tier edges are normally IDs. Resolve IDs before title aliases so a
+  // numeric article title such as "569" cannot shadow article ID 569.
+  const byId = new Map(nodes.map((node) => [key(node.id), node.id]))
+  const byTitle = new Map(nodes.map((node) => [key(node.title), node.id]))
+  const resolveRef = (value) => byId.get(key(value)) ?? byTitle.get(key(value))
   const edgeKeys = new Set()
-  const links = value.links.flatMap((edge) => {
-    const source = byRef.get(key(refValue(edge?.source)))
-    const target = byRef.get(key(refValue(edge?.target)))
+  return value.links.flatMap((edge) => {
+    const source = resolveRef(refValue(edge?.source))
+    const target = resolveRef(refValue(edge?.target))
     if (!source || !target || source === target) return []
     const edgeKey = `${source}\u0000${target}`
     if (edgeKeys.has(edgeKey)) return []
     edgeKeys.add(edgeKey)
     return [{ source, target }]
   })
-  return withDegrees({ nodes: nodes.map((n) => ({ ...n, id: String(n.id || n.title), url: n.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(n.title).replaceAll('%20', '_')}` })), links })
+}
+
+// Produce a deterministic node order in which every admitted node after the
+// first pair is reached over an existing undirected edge. This is used for
+// legacy/sample files and for arbitrary slider values between disk tiers.
+function connectedOrder(nodes, links) {
+  const byId = new Map(nodes.map((node) => [node.id, node]))
+  const neighbors = new Map(nodes.map((node) => [node.id, new Set()]))
+  for (const edge of links) {
+    if (!neighbors.has(edge.source) || !neighbors.has(edge.target)) continue
+    neighbors.get(edge.source).add(edge.target)
+    neighbors.get(edge.target).add(edge.source)
+  }
+  const ordered = []
+  const seen = new Set()
+  const starts = nodes
+    .filter((node) => (neighbors.get(node.id)?.size || 0) > 0)
+    .sort((a, b) => hash(a.id) - hash(b.id) || a.id.localeCompare(b.id))
+  for (const start of starts) {
+    if (seen.has(start.id)) continue
+    const componentQueue = [start.id]
+    seen.add(start.id)
+    const firstNeighbor = [...(neighbors.get(start.id) || [])]
+      .filter((id) => !seen.has(id))
+      .sort((a, b) => hash(a) - hash(b) || a.localeCompare(b))[0]
+    if (firstNeighbor) {
+      seen.add(firstNeighbor)
+      componentQueue.push(firstNeighbor)
+    }
+    while (componentQueue.length) {
+      const current = componentQueue.shift()
+      ordered.push(current)
+      const next = [...(neighbors.get(current) || [])]
+        .filter((id) => !seen.has(id))
+        .sort((a, b) => hash(a) - hash(b) || a.localeCompare(b))
+      for (const id of next) {
+        seen.add(id)
+        componentQueue.push(id)
+      }
+    }
+  }
+  // Isolated records are deliberately left out. Returning fewer records is
+  // more truthful than presenting unrelated dots as a connected map.
+  return ordered.filter((id) => byId.has(id))
+}
+
+function sample(value, count) {
+  if (!value || !Array.isArray(value.nodes) || !Array.isArray(value.links)) return null
+  const allNodes = normalizedNodes(value)
+  const allLinks = resolvedEdges(value, allNodes)
+  const order = value.order === 'connected'
+    ? allNodes.map((node) => node.id)
+    : connectedOrder(allNodes, allLinks)
+  const chosenIds = new Set(order.slice(0, Math.max(1, count)))
+  const nodes = allNodes.filter((node) => chosenIds.has(node.id))
+  const links = allLinks.filter((edge) => chosenIds.has(edge.source) && chosenIds.has(edge.target))
+  return withDegrees({ order: 'connected', nodes, links })
 }
 function readTierManifest() {
   const file = resolve(tiersDir, 'manifest.json')
@@ -227,7 +288,7 @@ function withDegrees(graph) {
     source.outDegree += 1; target.inDegree += 1
     return [{ source: source.id, target: target.id }]
   })
-  return { nodes, links }
+  return { ...(graph.order ? { order: graph.order } : {}), nodes, links }
 }
 createServer(async (req, res) => {
   const request = new URL(req.url || '/', `http://127.0.0.1:${port}`)
@@ -253,14 +314,13 @@ createServer(async (req, res) => {
     }
     const count = Math.max(1, Math.min(CACHE_LIMIT, Number(request.searchParams.get('count') || 50) || 50))
     let graph = null
-    // The compact sample is intentionally only used for the backwards-
-    // compatible 500-node path; larger tiers come from the complete JSONL.
-    let tier = null
-    if (count > 500) {
-      tier = readTier(count)
-      if (tier) graph = sample(tier.graph, count)
-    }
-    if (count <= 500 && existsSync(sampleFile)) { try { graph = sample(JSON.parse(readFileSync(sampleFile, 'utf8')), count) } catch { graph = null } }
+    // Use the connected tier for every slider value when it exists. Small
+    // requests take a prefix of the 1k tier, while larger requests take a
+    // prefix of the smallest adequate tier. This avoids reintroducing
+    // isolated nodes through the old hash-random sample path.
+    let tier = readTier(count)
+    if (tier) graph = sample(tier.graph, count)
+    if (!graph && count <= 500 && existsSync(sampleFile)) { try { graph = sample(JSON.parse(readFileSync(sampleFile, 'utf8')), count) } catch { graph = null } }
     if (!graph && existsSync(indexFile)) { try { graph = sample(JSON.parse(readFileSync(indexFile, 'utf8')), count) } catch { graph = null } }
     if (!graph) graph = await sampleJsonl(count)
     send(res, 200, graph ? { ...graph, source: 'wikipedia', indexed: true, tier: tier?.count ?? null } : { ...withDegrees(fallback), source: 'fallback', indexed: false })

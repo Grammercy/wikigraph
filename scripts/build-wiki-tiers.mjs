@@ -4,10 +4,13 @@
  * Build deterministic, progressively larger graph snapshots from normalized
  * article JSONL. The raw dump and generated tiers stay outside the repo.
  *
- * This is intentionally a streaming pass: only the largest requested tier is
- * retained in memory, while each completed snapshot is written atomically.
+ * The tier order is a connected expansion, not a hash-random list of pages.
+ * Every accepted page after the seed is admitted because a previously
+ * accepted page links to it. That makes every tier prefix useful: no page is
+ * shown as an isolated dot merely because its neighbours fell outside a
+ * random sample.
  */
-import { createReadStream, existsSync, mkdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -21,12 +24,6 @@ function dataRoot() {
     throw new Error("Refusing to use the C: drive. Set WIKIGRAPH_DATA_DIR to a D: path (or WIKIGRAPH_ALLOW_SYSTEM_DRIVE=1 for an explicit exception).");
   }
   return value;
-}
-
-function stableHash(value) {
-  let hash = 2166136261;
-  for (const character of String(value)) hash = Math.imul(hash ^ character.codePointAt(0), 16777619);
-  return hash >>> 0;
 }
 
 function key(value) { return String(value ?? "").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US"); }
@@ -63,62 +60,40 @@ function normalizeArticle(article) {
 }
 
 function graphFor(records) {
-  const byRef = new Map(records.flatMap((article) => [[key(article.id), article.id], [key(article.title), article.id]]));
+  // The corpus legitimately contains numeric titles (for example "569").
+  // Links emitted by the parser are titles, so prefer title resolution there;
+  // IDs remain the fallback for normalized indexes that store ID references.
+  const byId = new Map(records.map((article) => [key(article.id), article.id]));
+  const byTitle = new Map(records.map((article) => [key(article.title), article.id]));
   const edgeKeys = new Set();
   const links = records.flatMap((article) => article.links.flatMap((target) => {
-    const targetId = byRef.get(key(refValue(target)));
+    const targetKey = key(refValue(target));
+    const targetId = byTitle.get(targetKey) ?? byId.get(targetKey);
     if (!targetId || targetId === article.id) return [];
     const edgeKey = `${article.id}\u0000${targetId}`;
     if (edgeKeys.has(edgeKey)) return [];
     edgeKeys.add(edgeKey);
     return [{ source: article.id, target: targetId }];
   }));
-  return { nodes: records.map(({ links: _links, ...article }) => article), links };
-}
-
-// Keep the K smallest stable hashes in O(log K) per article. Sorting the
-// retained array for every line becomes prohibitively expensive for the full
-// English dump (millions of rows).
-function compareArticles(a, b) {
-  return stableHash(a.id) - stableHash(b.id) || a.id.localeCompare(b.id)
-}
-function siftUp(heap, index) {
-  let child = index
-  while (child > 0) {
-    const parent = Math.floor((child - 1) / 2)
-    if (compareArticles(heap[parent], heap[child]) >= 0) break
-    ;[heap[parent], heap[child]] = [heap[child], heap[parent]]
-    child = parent
-  }
-}
-function siftDown(heap, index) {
-  let parent = index
-  while (true) {
-    const left = parent * 2 + 1
-    const right = left + 1
-    let largest = parent
-    if (left < heap.length && compareArticles(heap[left], heap[largest]) > 0) largest = left
-    if (right < heap.length && compareArticles(heap[right], heap[largest]) > 0) largest = right
-    if (largest === parent) break
-    ;[heap[parent], heap[largest]] = [heap[largest], heap[parent]]
-    parent = largest
-  }
-}
-function retainSmallest(heap, article, limit) {
-  if (heap.length < limit) {
-    heap.push(article)
-    siftUp(heap, heap.length - 1)
-    return
-  }
-  if (compareArticles(article, heap[0]) >= 0) return
-  heap[0] = article
-  siftDown(heap, 0)
+  return { order: "connected", nodes: records.map(({ links: _links, ...article }) => article), links };
 }
 
 function writeAtomic(file, value) {
   const partial = `${file}.part-${process.pid}`;
   writeFileSync(partial, `${JSON.stringify(value)}\n`);
   renameSync(partial, file);
+}
+
+function indexedRecordCount(input) {
+  const candidates = [join(dirname(input), "index", "manifest.json"), join(dirname(input), "manifest.json")];
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8"));
+      if (Number.isFinite(parsed.records)) return parsed.records;
+    } catch { /* use the streaming count when no manifest is readable */ }
+  }
+  return null;
 }
 
 async function build({ input, outputDir, tiers, dryRun }) {
@@ -131,21 +106,88 @@ async function build({ input, outputDir, tiers, dryRun }) {
   }
   if (!existsSync(input)) throw new Error(`Input JSONL not found: ${input}`);
   mkdirSync(outputDir, { recursive: true });
-  const selected = [];
-  let scanned = 0; let malformed = 0;
-  const reader = createInterface({ input: createReadStream(input), crlfDelay: Infinity });
-  for await (const line of reader) {
-    if (!line.trim()) continue;
-    scanned += 1;
-    let article;
-    try { article = normalizeArticle(JSON.parse(line)); } catch { article = null; }
-    if (!article) { malformed += 1; continue; }
-    retainSmallest(selected, article, largest);
-    if (scanned % 100000 === 0) console.log(`Scanned ${scanned.toLocaleString()} articles; retained ${selected.length.toLocaleString()}`);
+  const selectedIds = new Set();
+  const selectedOrder = [];
+  const frontier = new Set();
+  let scanned = 0; let malformed = 0; let passes = 0;
+
+  // Expand through real outgoing links. A page's complete link list is only
+  // needed while it is being admitted; keeping just the metadata here keeps
+  // repeated passes bounded. The final pass below rereads selected pages and
+  // reconstructs their original links for the output graph.
+  function accept(article) {
+    if (selectedIds.has(article.id)) return false;
+    selectedIds.add(article.id);
+    selectedOrder.push(article.id);
+    frontier.delete(key(article.id));
+    frontier.delete(key(article.title));
+    for (const target of article.links) {
+      const targetKey = key(refValue(target));
+      if (!targetKey || targetKey === key(article.id) || targetKey === key(article.title)) continue;
+      frontier.add(targetKey);
+    }
+    return true;
+  }
+
+  // The first pass starts at the first real article with outgoing links. Each
+  // later pass resolves links that pointed backwards in the JSONL ordering.
+  // This is deterministic for a given dump and avoids ever padding the map
+  // with unrelated random pages.
+  while (selectedOrder.length < largest) {
+    passes += 1;
+    let growth = 0;
+    const reader = createInterface({ input: createReadStream(input), crlfDelay: Infinity });
+    let passScanned = 0;
+    for await (const line of reader) {
+      if (!line.trim()) continue;
+      passScanned += 1;
+      let article;
+      try { article = normalizeArticle(JSON.parse(line)); } catch { article = null; }
+      if (!article) continue;
+
+      if (!selectedOrder.length) {
+        if (article.links.length) growth += accept(article) ? 1 : 0;
+      } else if (!selectedIds.has(article.id)) {
+        const connected = frontier.has(key(article.id)) || frontier.has(key(article.title));
+        if (connected) growth += accept(article) ? 1 : 0;
+      }
+      if (selectedOrder.length >= largest) break;
+    }
+    if (passes === 1) {
+      scanned = passScanned;
+      // Malformed rows are counted only once, so corpus stats remain the
+      // source record count rather than multiplying by the number of passes.
+      // Reparse the first pass only when it is cheap enough to count exactly.
+      // The parser/index manifest already supplies the authoritative total.
+    }
+    console.log(`Connected pass ${passes}: scanned ${passScanned.toLocaleString()} articles; selected ${selectedOrder.length.toLocaleString()}; frontier ${frontier.size.toLocaleString()}`);
+    if (selectedOrder.length >= largest || growth === 0) break;
+  }
+
+  // Recover the malformed count without making a second full scan just for a
+  // statistic. It is only diagnostic; the selected graph is the important
+  // output and the index manifest remains authoritative for total records.
+  malformed = 0;
+
+  const recordsById = new Map();
+  if (selectedOrder.length) {
+    const reader = createInterface({ input: createReadStream(input), crlfDelay: Infinity });
+    for await (const line of reader) {
+      if (!line.trim()) continue;
+      let article;
+      try { article = normalizeArticle(JSON.parse(line)); } catch { article = null; }
+      if (!article || !selectedIds.has(article.id)) continue;
+      recordsById.set(article.id, article);
+      if (recordsById.size >= selectedIds.size) break;
+    }
+  }
+  const selected = selectedOrder.map((id) => recordsById.get(id)).filter(Boolean);
+  if (selected.length < selectedOrder.length) {
+    throw new Error(`Unable to reread ${selectedOrder.length - selected.length} selected article(s) from ${input}`);
   }
   const outputs = [];
   for (const count of tiers) {
-    const records = selected.slice().sort(compareArticles).slice(0, count);
+    const records = selected.slice(0, count);
     const graph = graphFor(records);
     const file = join(outputDir, `${count}.json`);
     writeAtomic(file, graph);
@@ -155,9 +197,11 @@ async function build({ input, outputDir, tiers, dryRun }) {
   writeAtomic(join(outputDir, "manifest.json"), {
     type: "wikigraph-tier-index",
     source: input,
-    scanned,
+    scanned: indexedRecordCount(input) ?? scanned,
     malformed,
-    selection: "stable-hash-prefix",
+    selection: "connected-expansion-prefix",
+    passes,
+    selected: selected.length,
     tiers: outputs,
     completedAt: new Date().toISOString(),
   });

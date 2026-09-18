@@ -85,11 +85,13 @@ node .\scripts\build-wiki-tiers.mjs --tiers 100,500,1000
 ```
 
 Outputs are written to `D:\WikiGraphData\index\tiers\<count>.json` with a
-`manifest.json`. Selection uses a stable hash of article IDs, so rebuilding
-the same source produces nested, repeatable tiers instead of a request-order
-dependent sample. These files are external data and must not be committed to
-Git; the browser/API can load them incrementally and warn before selecting a
-large tier.
+`manifest.json`. Selection starts from a deterministic article and expands
+over real Wikipedia links, so every tier prefix is connected and every page
+has at least one neighbour (except the unavoidable one-page request). The
+same source produces nested, repeatable tiers instead of a request-order
+dependent random sample. These files are external data and must not be
+committed to Git; the browser/API can load them incrementally and warn before
+selecting a large tier.
 
 ## Local API
 
@@ -102,8 +104,9 @@ npm run wiki:serve
 
 The service reads either `D:\WikiGraphData\index.json`, the JSONL index at
 `D:\WikiGraphData\index\articles.jsonl`, or progressive tiers at
-`D:\WikiGraphData\index\tiers`. It samples deterministically up to the
-requested local slider count, exposes `/health`, and serves the built frontend
-when run through `npm run wiki:host`. Without an index it serves a tiny
-deterministic graph for endpoint testing; it never downloads, parses raw XML,
-or loads the full corpus into the browser.
+`D:\WikiGraphData\index\tiers`. With tiers available it takes connected
+prefixes for every slider count, including values between tier boundaries.
+It exposes `/health`, and serves the built frontend when run through
+`npm run wiki:host`. Without an index it serves a tiny deterministic graph for
+endpoint testing; it never downloads, parses raw XML, or loads the full
+corpus into the browser.

@@ -118,6 +118,55 @@ interface PageBatchResult {
   aliases: Map<string, string>
 }
 
+/**
+ * Return a deterministic edge-backed order for pages discovered by the
+ * public crawl. Random seeds are useful for coverage, but they must not leak
+ * into the rendered map as isolated dots when their link neighbourhood was
+ * not fetched. Components are traversed through undirected adjacency so the
+ * directed Wikipedia links still produce a connected visual neighbourhood.
+ */
+function connectedPageOrder(pages: Map<string, ApiPage>, rawLinks: Array<[string, string]>): string[] {
+  const titles = [...pages.keys()]
+  const byTitle = new Map(titles.map((title) => [titleId(title), title]))
+  const neighbors = new Map(titles.map((title) => [title, new Set<string>()]))
+  for (const [source, target] of rawLinks) {
+    const sourceTitle = byTitle.get(titleId(source))
+    const targetTitle = byTitle.get(titleId(target))
+    if (!sourceTitle || !targetTitle || sourceTitle === targetTitle) continue
+    neighbors.get(sourceTitle)?.add(targetTitle)
+    neighbors.get(targetTitle)?.add(sourceTitle)
+  }
+  const starts = titles
+    .filter((title) => (neighbors.get(title)?.size ?? 0) > 0)
+    .sort((a, b) => titleId(a).localeCompare(titleId(b)) || a.localeCompare(b))
+  const order: string[] = []
+  const seen = new Set<string>()
+  for (const start of starts) {
+    if (seen.has(start)) continue
+    const queue = [start]
+    seen.add(start)
+    const firstNeighbor = [...(neighbors.get(start) ?? [])]
+      .filter((title) => !seen.has(title))
+      .sort((a, b) => titleId(a).localeCompare(titleId(b)) || a.localeCompare(b))[0]
+    if (firstNeighbor) {
+      seen.add(firstNeighbor)
+      queue.push(firstNeighbor)
+    }
+    while (queue.length) {
+      const current = queue.shift()!
+      order.push(current)
+      const next = [...(neighbors.get(current) ?? [])]
+        .filter((title) => !seen.has(title))
+        .sort((a, b) => titleId(a).localeCompare(titleId(b)) || a.localeCompare(b))
+      for (const title of next) {
+        seen.add(title)
+        queue.push(title)
+      }
+    }
+  }
+  return order
+}
+
 async function pageBatch(titles: string[], signal?: AbortSignal): Promise<PageBatchResult> {
   if (!titles.length) return { pages: [], aliases: new Map() }
   const pages: ApiPage[] = []
@@ -193,7 +242,11 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
         }
       }
     }
-    const nodes: WikiNode[] = [...pages.entries()].slice(0, publicWanted).map(([title, page]) => ({ id: title, title, url: articleUrl(title), extract: page.extract, byteLength: page.length }))
+    const orderedTitles = connectedPageOrder(pages, rawLinks)
+    const nodes: WikiNode[] = orderedTitles.slice(0, publicWanted).map((title) => {
+      const page = pages.get(title)!
+      return { id: title, title, url: articleUrl(title), extract: page.extract, byteLength: page.length }
+    })
     const canonicalById = new Map(nodes.map((node) => [titleId(node.id), node.id]))
     const uniqueLinks = new Map<string, [string, string]>()
     for (const [source, target] of rawLinks) {

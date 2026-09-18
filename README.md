@@ -19,7 +19,7 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 
 ## Data and fallback behavior
 
-The hosted Pages build requests random main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). The local build automatically uses the D:-drive API when it is available, progressively loading deterministic 1k/5k/25k/100k tiers while the page remains open. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
+The hosted Pages build requests main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). The local build automatically uses the D:-drive API when it is available, progressively loading deterministic, link-connected 1k/5k/25k/100k tiers while the page remains open. Slider values between tiers are connected prefixes, so the local map does not pad a request with unrelated isolated pages. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
 
 ## Optional full-dump storage
 
