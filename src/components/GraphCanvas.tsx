@@ -113,6 +113,7 @@ export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
 
 type Point = { x: number; y: number }
 type View = { x: number; y: number; scale: number }
+type Bounds = { minX: number; maxX: number; minY: number; maxY: number }
 
 const articleDegree = (node: GraphNode) => Math.max(0, (node.inDegree ?? 0) + (node.outDegree ?? 0))
 const articleBytes = (node: GraphNode) => {
@@ -146,6 +147,23 @@ const nodeRadius = (node: GraphNode, settings: GraphSimulationSettings = DEFAULT
 const LARGE_GRAPH_THRESHOLD = 2_000
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
+
+function graphBounds(nodes: GraphNode[]): Bounds | null {
+  let bounds: Bounds | null = null
+  for (const node of nodes) {
+    if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) continue
+    const x = node.x as number
+    const y = node.y as number
+    if (!bounds) bounds = { minX: x, maxX: x, minY: y, maxY: y }
+    else {
+      bounds.minX = Math.min(bounds.minX, x)
+      bounds.maxX = Math.max(bounds.maxX, x)
+      bounds.minY = Math.min(bounds.minY, y)
+      bounds.maxY = Math.max(bounds.maxY, y)
+    }
+  }
+  return bounds
+}
 
 /**
  * A responsive, canvas-rendered force graph. `graph.nodes` are mutated by d3-force
@@ -357,11 +375,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   useImperativeHandle(ref, () => ({
     fit: () => {
-      const points = graph.nodes.filter((node) => node.x != null && node.y != null)
-      if (!points.length) return
-      const xs = points.map((node) => node.x as number)
-      const ys = points.map((node) => node.y as number)
-      const bounds = { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) }
+      const bounds = graphBounds(graph.nodes)
+      if (!bounds) return
       const { width, height } = sizeRef.current
       const scale = Math.max(0.2, Math.min(2.2, 0.86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80))))
       viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }
@@ -473,10 +488,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       // long force tick. Run one tick, yield to input/rendering, then continue
       // at a bounded cadence so the page remains interruptible.
       sim.stop()
+      const tickDelay = Math.min(250, Math.max(50, Math.round(graph.nodes.length / 500)))
       const runLargeTick = () => {
         if (pausedRef.current || invalidState) return
         sim.tick()
-        if (!pausedRef.current && !invalidState) largeTickTimerRef.current = window.setTimeout(runLargeTick, 50)
+        if (!pausedRef.current && !invalidState) largeTickTimerRef.current = window.setTimeout(runLargeTick, tickDelay)
       }
       manualTickRef.current = runLargeTick
       if (!pausedRef.current) largeTickTimerRef.current = window.setTimeout(runLargeTick, 0)
@@ -544,7 +560,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       onWheel={(event) => { event.preventDefault(); const before = localPoint(event); const factor = Math.max(.75, Math.min(1.25, Math.exp(-event.deltaY * .001))); const view = viewRef.current; const rect = event.currentTarget.getBoundingClientRect(); view.scale = Math.max(.18, Math.min(4, view.scale * factor)); view.x = event.clientX - rect.left - before.x * view.scale; view.y = event.clientY - rect.top - before.y * view.scale; draw() }}
       tabIndex={0}
       role="application"
-      onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.18, viewRef.current.scale / 1.15); draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const points = graphRef.current.nodes.filter((node) => node.x != null && node.y != null); if (points.length) { const xs = points.map((node) => node.x as number); const ys = points.map((node) => node.y as number); const bounds = { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) }; const { width, height } = sizeRef.current; const scale = Math.max(.2, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
+      onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.18, viewRef.current.scale / 1.15); draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const bounds = graphBounds(graphRef.current.nodes); if (bounds) { const { width, height } = sizeRef.current; const scale = Math.max(.2, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
   </div>
 })
 
