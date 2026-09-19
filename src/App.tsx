@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphSimulationSettings } from './components/GraphCanvas'
 import { fetchWikiGraphProgressive, usesLocalCorpus } from './data/wiki'
+import { selectHubIds } from './graph/hubs'
 import type { WikiGraph } from './types'
 
 function formatArticleSize(bytes?: number) {
@@ -151,17 +152,20 @@ export default function App() {
     }
     return [...relatedIds].slice(0, 5).map((id) => nodeById.get(id)).filter((node): node is WikiGraph['nodes'][number] => Boolean(node))
   }, [graph.links, nodeById, selected])
-  const graphForCanvas = useMemo(() => ({
-    nodes: graph.nodes.map((node) => {
-      const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
-      return {
-        ...node,
-        label: showLabels ? node.title : '',
-        color: degree >= 10 ? '#254fef' : degree >= 4 ? '#6e86f2' : '#b6c4ff',
-      }
-    }),
-    links: graph.links,
-  }), [graph, showLabels])
+  const graphForCanvas = useMemo(() => {
+    const hubIds = selectHubIds(graph.nodes, graph.links)
+    return {
+      nodes: graph.nodes.map((node) => {
+        const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
+        return {
+          ...node,
+          label: showLabels ? node.title : '',
+          color: hubIds.has(node.id) ? '#254fef' : degree >= 4 ? '#6e86f2' : '#b6c4ff',
+        }
+      }),
+      links: graph.links,
+    }
+  }, [graph, showLabels])
   const averageLinks = graph.nodes.length ? graph.links.length / graph.nodes.length : 0
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
@@ -202,7 +206,7 @@ export default function App() {
           <div className="settings-group-title">REPULSION &amp; LINKS</div>
           <PhysicsSlider id="setting-base-charge" label="Base repulsion" value={simulationSettings.baseCharge} min={0} max={400} step={5} onChange={(value) => updateSimulationSetting('baseCharge', value)} />
           <PhysicsSlider id="setting-importance-charge" label="Article importance" value={simulationSettings.articleImportanceCharge} min={0} max={500} step={5} onChange={(value) => updateSimulationSetting('articleImportanceCharge', value)} />
-          <PhysicsSlider id="setting-hub-charge" label="Hub repulsion" value={simulationSettings.hubCharge} min={0} max={1500} step={10} onChange={(value) => updateSimulationSetting('hubCharge', value)} />
+          <PhysicsSlider id="setting-hub-charge" label="Hub repulsion" value={simulationSettings.hubCharge} min={0} max={3000} step={10} onChange={(value) => updateSimulationSetting('hubCharge', value)} />
           <PhysicsSlider id="setting-charge-distance" label="Charge radius" value={simulationSettings.chargeDistance} min={100} max={2000} step={10} onChange={(value) => updateSimulationSetting('chargeDistance', value)} />
           <LogSlider id="setting-link-scale" label={`Link distance${simulationSettings.linkDistanceExponent === 3 ? '³' : '²'} scale`} value={simulationSettings.linkDistanceScale} min={1} max={300000} step={1} center={1_000} onChange={(value) => updateSimulationSetting('linkDistanceScale', value)} format={(value) => value.toLocaleString()} />
           <button
@@ -216,20 +220,17 @@ export default function App() {
             <span className={`toggle ${simulationSettings.linkDistanceExponent === 3 ? 'on' : ''}`}><i /></span>
           </button>
           <PhysicsSlider id="setting-link-floor" label="Link weight floor" value={simulationSettings.linkWeightFloor} min={0} max={0.25} step={0.005} onChange={(value) => updateSimulationSetting('linkWeightFloor', value)} />
-          <PhysicsSlider id="setting-hub-damping" label="Hub-link damping" value={simulationSettings.hubLinkDamping} min={0} max={1} step={0.01} onChange={(value) => updateSimulationSetting('hubLinkDamping', value)} />
           <PhysicsSlider id="setting-unrelated-base" label="Unrelated push" value={simulationSettings.unrelatedBaseStrength} min={0} max={500} step={5} onChange={(value) => updateSimulationSetting('unrelatedBaseStrength', value)} />
-          <PhysicsSlider id="setting-unrelated-hub" label="Unrelated hub push" value={simulationSettings.unrelatedHubStrength} min={0} max={1000} step={10} onChange={(value) => updateSimulationSetting('unrelatedHubStrength', value)} />
+          <PhysicsSlider id="setting-unrelated-hub" label="Unrelated hub push" value={simulationSettings.unrelatedHubStrength} min={0} max={2000} step={10} onChange={(value) => updateSimulationSetting('unrelatedHubStrength', value)} />
           <PhysicsSlider id="setting-unrelated-distance" label="Unrelated radius" value={simulationSettings.unrelatedDistance} min={100} max={1200} step={10} onChange={(value) => updateSimulationSetting('unrelatedDistance', value)} />
           <PhysicsSlider id="setting-unrelated-budget" label="Unrelated work budget" value={simulationSettings.unrelatedInteractionBudget} min={20000} max={500000} step={10000} onChange={(value) => updateSimulationSetting('unrelatedInteractionBudget', value)} format={(value) => value.toLocaleString()} />
           <div className="settings-group-title">HUB TERRITORIES</div>
-          <PhysicsSlider id="setting-hub-threshold" label="Hub degree threshold" value={simulationSettings.hubDegreeThreshold} min={0} max={50} step={1} onChange={(value) => updateSimulationSetting('hubDegreeThreshold', value)} />
           <PhysicsSlider id="setting-hub-reference" label="Hub score reference" value={simulationSettings.hubDegreeReference} min={10} max={500} step={5} onChange={(value) => updateSimulationSetting('hubDegreeReference', value)} />
-          <PhysicsSlider id="setting-territory-base" label="Territory base" value={simulationSettings.hubTerritoryBase} min={50} max={1000} step={10} onChange={(value) => updateSimulationSetting('hubTerritoryBase', value)} />
-          <PhysicsSlider id="setting-territory-scale" label="Territory degree scale" value={simulationSettings.hubTerritoryScale} min={0} max={1000} step={10} onChange={(value) => updateSimulationSetting('hubTerritoryScale', value)} />
-          <PhysicsSlider id="setting-hub-force-base" label="Hub force base" value={simulationSettings.hubForceBase} min={0} max={100} step={1} onChange={(value) => updateSimulationSetting('hubForceBase', value)} />
-          <PhysicsSlider id="setting-hub-force-scale" label="Hub force scale" value={simulationSettings.hubForceScale} min={0} max={1000} step={10} onChange={(value) => updateSimulationSetting('hubForceScale', value)} />
-          <PhysicsSlider id="setting-hub-force-max" label="Hub force maximum" value={simulationSettings.hubForceMax} min={1} max={200} step={1} onChange={(value) => updateSimulationSetting('hubForceMax', value)} />
-          <PhysicsSlider id="setting-hub-count" label="Hub interaction count" value={simulationSettings.hubMaxNodes} min={16} max={800} step={16} onChange={(value) => updateSimulationSetting('hubMaxNodes', value)} />
+          <PhysicsSlider id="setting-territory-base" label="Territory base" value={simulationSettings.hubTerritoryBase} min={50} max={1200} step={10} onChange={(value) => updateSimulationSetting('hubTerritoryBase', value)} />
+          <PhysicsSlider id="setting-territory-scale" label="Territory degree scale" value={simulationSettings.hubTerritoryScale} min={0} max={1500} step={10} onChange={(value) => updateSimulationSetting('hubTerritoryScale', value)} />
+          <PhysicsSlider id="setting-hub-force-base" label="Hub force base" value={simulationSettings.hubForceBase} min={0} max={200} step={1} onChange={(value) => updateSimulationSetting('hubForceBase', value)} />
+          <PhysicsSlider id="setting-hub-force-scale" label="Hub force scale" value={simulationSettings.hubForceScale} min={0} max={2000} step={10} onChange={(value) => updateSimulationSetting('hubForceScale', value)} />
+          <PhysicsSlider id="setting-hub-force-max" label="Hub force maximum" value={simulationSettings.hubForceMax} min={1} max={300} step={1} onChange={(value) => updateSimulationSetting('hubForceMax', value)} />
           <div className="settings-group-title">IMPORTANCE &amp; MOTION</div>
           <PhysicsSlider id="setting-size-weight" label="Article-size weight" value={simulationSettings.articleSizeWeight} min={0} max={1} step={0.05} onChange={(value) => updateSimulationSetting('articleSizeWeight', value)} />
           <PhysicsSlider id="setting-max-bytes" label="Article-size ceiling" value={simulationSettings.articleMaxBytes} min={100000} max={10000000} step={100000} onChange={(value) => updateSimulationSetting('articleMaxBytes', value)} format={(value) => `${(value / 1000000).toFixed(1)} MB`} />
