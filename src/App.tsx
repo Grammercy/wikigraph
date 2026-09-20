@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphData, type GraphSimulationSettings } from './components/GraphCanvas'
 import { fetchWikiGraphProgressive, usesLocalCorpus } from './data/wiki'
 import { selectHubIds } from './graph/hubs'
-import { decayedLinkDistanceScale, LINK_DISTANCE_SCALE_DECAY_MS, LINK_DISTANCE_SCALE_START } from './graph/linkDistanceDecay'
+import { decayedLinkDistanceScale, LINK_DISTANCE_SCALE_DECAY_MS, LINK_DISTANCE_SCALE_PHYSICS_STEP_MS, LINK_DISTANCE_SCALE_START } from './graph/linkDistanceDecay'
+import { selectVisibleArticleIds } from './graph/visibility'
 import type { WikiGraph } from './types'
 
 function formatArticleSize(bytes?: number) {
@@ -26,24 +27,34 @@ type PhysicsSliderProps = {
   step: number
   onChange: (value: number) => void
   format?: (value: number) => string
+  disabled?: boolean
 }
 
-function PhysicsSlider({ id, label, value, min, max, step, onChange, format }: PhysicsSliderProps) {
+function PhysicsSlider({ id, label, value, min, max, step, onChange, format, disabled = false }: PhysicsSliderProps) {
   const progress = `${Math.max(0, Math.min(100, ((value - min) / Math.max(1e-9, max - min)) * 100))}%`
   const display = format?.(value) ?? (step < 0.01 ? value.toFixed(4) : step < 1 ? value.toFixed(3) : Math.round(value).toLocaleString())
-  return <label className="simulation-control" htmlFor={id}>
+  return <label className={`simulation-control${disabled ? ' is-disabled' : ''}`} htmlFor={id}>
     <span className="simulation-control-label"><span>{label}</span><output>{display}</output></span>
-    <input id={id} className="range simulation-range" type="range" min={min} max={max} step={step} value={value} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${progress}, #d9dde5 ${progress})` }} onChange={(event) => onChange(Number(event.target.value))} />
+    <input id={id} className="range simulation-range" type="range" min={min} max={max} step={step} value={value} disabled={disabled} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${progress}, #d9dde5 ${progress})` }} onChange={(event) => onChange(Number(event.target.value))} />
   </label>
 }
 
-type LogSliderProps = PhysicsSliderProps & { center: number }
+type LogSliderProps = PhysicsSliderProps & {
+  center: number
+  ticks?: Array<{ value: number; label: string }>
+}
 
 function logSliderPosition(value: number, min: number, max: number, center: number) {
   const safeMin = Math.max(Number.MIN_VALUE, min)
   const safeMax = Math.max(safeMin, max)
   const safeCenter = Math.max(safeMin, Math.min(safeMax, center))
   if (safeMax === safeMin) return 0
+  if (safeCenter >= safeMax) {
+    return Math.max(0, Math.min(1, Math.log(Math.max(safeMin, value) / safeMin) / Math.max(Number.EPSILON, Math.log(safeMax / safeMin))))
+  }
+  if (safeCenter <= safeMin) {
+    return Math.max(0, Math.min(1, Math.log(Math.min(safeMax, value) / safeMin) / Math.max(Number.EPSILON, Math.log(safeMax / safeMin))))
+  }
   if (value <= safeCenter) {
     const lowerSpan = Math.max(Number.EPSILON, Math.log(safeCenter / safeMin))
     return Math.max(0, Math.min(0.5, 0.5 * Math.log(Math.max(safeMin, value) / safeMin) / lowerSpan))
@@ -57,20 +68,33 @@ function logSliderValue(position: number, min: number, max: number, center: numb
   const safeMax = Math.max(safeMin, max)
   const safeCenter = Math.max(safeMin, Math.min(safeMax, center))
   const boundedPosition = Math.max(0, Math.min(1, position))
-  const raw = boundedPosition <= 0.5
+  const raw = safeMax === safeMin
+    ? safeMin
+    : safeCenter >= safeMax || safeCenter <= safeMin
+      ? safeMin * Math.exp(boundedPosition * Math.log(Math.max(Number.EPSILON, safeMax / safeMin)))
+      : boundedPosition <= 0.5
     ? safeMin * Math.exp((boundedPosition / 0.5) * Math.log(Math.max(Number.EPSILON, safeCenter / safeMin)))
     : safeCenter * Math.exp(((boundedPosition - 0.5) / 0.5) * Math.log(Math.max(Number.EPSILON, safeMax / safeCenter)))
   const snapped = Math.round(raw / step) * step
   return Math.max(min, Math.min(max, snapped))
 }
 
-function LogSlider({ id, label, value, min, max, step, center, onChange, format }: LogSliderProps) {
+function LogSlider({ id, label, value, min, max, step, center, onChange, format, disabled = false, ticks = [] }: LogSliderProps) {
   const sliderPosition = logSliderPosition(value, min, max, center)
   const sliderUnits = Math.round(sliderPosition * 1_000)
   const display = format?.(value) ?? (step < 1 ? value.toFixed(3) : Math.round(value).toLocaleString())
-  const input = <input id={id} className={`range${label ? ' simulation-range' : ''}`} type="range" min="0" max="1000" step="1" value={sliderUnits} aria-valuetext={display} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${sliderUnits / 10}%, #d9dde5 ${sliderUnits / 10}%)` }} onChange={(event) => onChange(logSliderValue(Number(event.target.value) / 1_000, min, max, center, step))} />
+  const slider = <input id={id} className={`range${label ? ' simulation-range' : ''}`} type="range" min="0" max="1000" step="1" value={sliderUnits} disabled={disabled} aria-valuetext={display} style={{ background: `linear-gradient(90deg, #254fef 0%, #254fef ${sliderUnits / 10}%, #d9dde5 ${sliderUnits / 10}%)` }} onChange={(event) => onChange(logSliderValue(Number(event.target.value) / 1_000, min, max, center, step))} />
+  const input = ticks.length > 0 ? <div className="range-scale has-ticks">
+    {slider}
+    <div className="range-ticks" aria-hidden="true">
+      {ticks.map((tick) => <span key={tick.value} className="range-tick" style={{ left: `${logSliderPosition(tick.value, min, max, center) * 100}%` }} />)}
+    </div>
+    <div className="range-tick-labels">
+      {ticks.map((tick, index) => <span key={tick.value} className={`range-tick-label range-tick-label-${index === 0 ? 'start' : index === ticks.length - 1 ? 'end' : 'center'}`} style={{ left: `${logSliderPosition(tick.value, min, max, center) * 100}%` }}>{tick.label}</span>)}
+    </div>
+  </div> : slider
   if (!label) return input
-  return <label className="simulation-control" htmlFor={id}>
+  return <label className={`simulation-control${disabled ? ' is-disabled' : ''}`} htmlFor={id}>
     <span className="simulation-control-label"><span>{label}</span><output>{display}</output></span>
     {input}
   </label>
@@ -80,6 +104,7 @@ export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
   const MAX_LOCAL_ARTICLES = 100_000
   const [count, setCount] = useState(50)
+  const [displayCount, setDisplayCount] = useState(0)
   const [graph, setGraph] = useState<WikiGraph>({ nodes: [], links: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -96,17 +121,16 @@ export default function App() {
   const canvasRef = useRef<GraphCanvasHandle>(null)
   const linkDistanceDecayPendingRef = useRef(false)
   const linkDistanceDecayActiveRef = useRef(false)
-  const linkDistanceDecayTimerRef = useRef<number | null>(null)
+  const linkDistanceDecayElapsedRef = useRef(0)
   const renderedGraphRef = useRef<GraphData | null>(null)
+  // Keep the display slider proportional when a newly generated graph has a
+  // different number of loaded articles.
+  const displayRatioRef = useRef(1)
   const updateSimulationSetting = useCallback(<K extends keyof GraphSimulationSettings>(key: K, value: GraphSimulationSettings[K]) => {
     setSimulationSettings((previous) => ({ ...previous, [key]: value }))
   }, [])
   const stopLinkDistanceDecay = useCallback(() => {
     linkDistanceDecayActiveRef.current = false
-    if (linkDistanceDecayTimerRef.current != null) {
-      window.clearInterval(linkDistanceDecayTimerRef.current)
-      linkDistanceDecayTimerRef.current = null
-    }
   }, [])
   const updateLinkDistanceScale = useCallback((value: number) => {
     linkDistanceDecayPendingRef.current = false
@@ -117,17 +141,18 @@ export default function App() {
   const startLinkDistanceDecay = useCallback(() => {
     stopLinkDistanceDecay()
     linkDistanceDecayActiveRef.current = true
-    const startedAt = Date.now()
-    const update = () => {
-      if (!linkDistanceDecayActiveRef.current) return
-      const elapsed = Math.max(0, Date.now() - startedAt)
-      const nextScale = decayedLinkDistanceScale(elapsed)
-      setSimulationSettings((previous) => previous.linkDistanceScale === nextScale
-        ? previous
-        : { ...previous, linkDistanceScale: nextScale })
-      if (elapsed >= LINK_DISTANCE_SCALE_DECAY_MS) stopLinkDistanceDecay()
-    }
-    linkDistanceDecayTimerRef.current = window.setInterval(update, 100)
+    linkDistanceDecayElapsedRef.current = 0
+  }, [stopLinkDistanceDecay])
+
+  const advanceLinkDistanceDecay = useCallback(() => {
+    if (!linkDistanceDecayActiveRef.current) return
+    const elapsed = linkDistanceDecayElapsedRef.current + LINK_DISTANCE_SCALE_PHYSICS_STEP_MS
+    linkDistanceDecayElapsedRef.current = elapsed
+    const nextScale = decayedLinkDistanceScale(elapsed)
+    setSimulationSettings((previous) => previous.linkDistanceScale === nextScale
+      ? previous
+      : { ...previous, linkDistanceScale: nextScale })
+    if (elapsed >= LINK_DISTANCE_SCALE_DECAY_MS) stopLinkDistanceDecay()
   }, [stopLinkDistanceDecay])
 
   useEffect(() => () => stopLinkDistanceDecay(), [stopLinkDistanceDecay])
@@ -193,8 +218,21 @@ export default function App() {
     }
     return [...relatedIds].slice(0, 5).map((id) => nodeById.get(id)).filter((node): node is WikiGraph['nodes'][number] => Boolean(node))
   }, [graph.links, nodeById, selected])
+  const hubIds = useMemo(() => selectHubIds(graph.nodes, graph.links), [graph])
+  const displayMinimum = hubIds.size
+  const displayMaximum = graph.nodes.length
+  const effectiveDisplayCount = displayMaximum > 0
+    ? Math.max(displayMinimum, Math.min(displayMaximum, displayCount || displayMinimum))
+    : 0
+  const displaySliderCenter = displayMaximum > displayMinimum
+    ? displayMaximum > 1_000 ? 1_000 : Math.sqrt(Math.max(1, displayMinimum) * displayMaximum)
+    : displayMinimum
+  const visibleNodeIds = useMemo(
+    () => selectVisibleArticleIds(graph.nodes, graph.links, effectiveDisplayCount, selectedId),
+    [effectiveDisplayCount, graph, selectedId],
+  )
+  const visibleArticleCount = visibleNodeIds.size
   const graphForCanvas = useMemo(() => {
-    const hubIds = selectHubIds(graph.nodes, graph.links)
     return {
       nodes: graph.nodes.map((node) => {
         const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
@@ -205,7 +243,26 @@ export default function App() {
       }),
       links: graph.links,
     }
-  }, [graph])
+  }, [graph, hubIds])
+  useEffect(() => {
+    if (!displayMaximum) {
+      setDisplayCount(0)
+      return
+    }
+    const next = Math.max(displayMinimum, Math.min(displayMaximum, Math.round(displayMaximum * displayRatioRef.current)))
+    setDisplayCount((previous) => previous === next ? previous : next)
+  }, [displayMaximum, displayMinimum])
+  useEffect(() => {
+    if (hoveredId && !visibleNodeIds.has(hoveredId)) setHoveredId(null)
+  }, [hoveredId, visibleNodeIds])
+  const updateDisplayCount = useCallback((value: number) => {
+    const next = Math.max(displayMinimum, Math.min(displayMaximum, Math.round(value)))
+    setDisplayCount(next)
+    if (displayMaximum > 0) displayRatioRef.current = next / displayMaximum
+  }, [displayMaximum, displayMinimum])
+  const handleSelect = useCallback((node: GraphData['nodes'][number]) => {
+    setSelectedId((current) => current === node.id ? null : node.id)
+  }, [])
   const startPendingLinkDistanceDecay = useCallback(() => {
     if (!linkDistanceDecayPendingRef.current) return
     linkDistanceDecayPendingRef.current = false
@@ -242,8 +299,12 @@ export default function App() {
     <section className="workspace">
       <aside className="control-panel">
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
-        <LogSlider id="article-count" label="" value={count} min={10} max={MAX_LOCAL_ARTICLES} step={10} center={1_000} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} />
-        <div className="range-labels"><span>10</span><span>1,000</span><span>{MAX_LOCAL_ARTICLES.toLocaleString()}</span></div>
+        <LogSlider id="article-count" label="" value={count} min={10} max={MAX_LOCAL_ARTICLES} step={10} center={1_000} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} ticks={[{ value: 10, label: '10' }, { value: 1_000, label: '1,000' }, { value: MAX_LOCAL_ARTICLES, label: MAX_LOCAL_ARTICLES.toLocaleString() }]} />
+        {displayMaximum > 0 && <>
+          <label className="field-label displayed-articles-label" htmlFor="displayed-article-count">DISPLAYED ARTICLES <output>{effectiveDisplayCount.toLocaleString()}</output></label>
+          <LogSlider id="displayed-article-count" label="" value={effectiveDisplayCount} min={displayMinimum} max={displayMaximum} step={1} center={displaySliderCenter} onChange={updateDisplayCount} disabled={displayMinimum >= displayMaximum} format={(value) => Math.round(value).toLocaleString()} />
+          <div className="range-labels"><span>{displayMinimum.toLocaleString()}</span><span>{Math.round(displaySliderCenter).toLocaleString()}</span><span>{displayMaximum.toLocaleString()}</span></div>
+        </>}
         {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and processing time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
         <button className="primary-button" onClick={() => void load(count)} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
         <div className="rule" />
@@ -304,9 +365,9 @@ export default function App() {
         </details>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
+        <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === graph.nodes.length ? ' articles' : ` of ${graph.nodes.length.toLocaleString()} articles`} <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} mode={graphMode} showLabels={showLabels} onGraphRendered={handleGraphRendered} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
+        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} visibleNodeIds={visibleNodeIds} mode={graphMode} showLabels={showLabels} onGraphRendered={handleGraphRendered} onPhysicsTick={advanceLinkDistanceDecay} selectedId={selectedId} onSelect={handleSelect} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
       </section>

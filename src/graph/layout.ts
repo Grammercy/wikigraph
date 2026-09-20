@@ -257,6 +257,7 @@ export function unrelatedRepulsion(
   settings: GraphSimulationSettings,
   hubIds: ReadonlySet<string>,
   hubScore: (node: GraphNode) => number,
+  repulsionScale = 1,
 ) {
   const relatedLinkBudget = largeGraph ? 250_000 : Number.POSITIVE_INFINITY
   let orderedNodes = initialNodes
@@ -314,7 +315,7 @@ export function unrelatedRepulsion(
             if (distance > maxDistance) continue
             const falloff = 1 - distance / maxDistance
             const hubBoost = Math.max(hubScores.get(source) ?? 0, hubScores.get(target) ?? 0)
-            const magnitude = Math.min(14, ((settings.unrelatedBaseStrength + settings.unrelatedHubStrength * hubBoost) / Math.max(28, distance)) * falloff) * alpha
+            const magnitude = Math.min(14, ((settings.unrelatedBaseStrength * repulsionScale + settings.unrelatedHubStrength * hubBoost) / Math.max(28, distance)) * falloff) * alpha
             const vx = dx / distance * magnitude
             const vy = dy / distance * magnitude
             source.vx = (source.vx ?? 0) + vx

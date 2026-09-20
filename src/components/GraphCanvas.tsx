@@ -15,6 +15,9 @@ import {
 } from 'd3-force-3d'
 import { articleDegree, selectHubIds } from '../graph/hubs'
 import { boundaryForce, boundaryRadius } from '../graph/boundary'
+import { articleRepulsionScale } from '../graph/density'
+import { roundSimulationNodesF32 } from '../graph/f32'
+import { createGpuGraphSimulation, type PhysicsController } from '../graph/gpuSimulation'
 import { layoutSpacing, seedLayout, symmetricAttraction, unrelatedRepulsion, hubInteractions } from '../graph/layout'
 
 export type GraphNode = SimulationNodeDatum & {
@@ -50,8 +53,12 @@ export type GraphCanvasHandle = {
 
 export type GraphCanvasProps = {
   graph: GraphData
+  /** Node ids to paint; omitted means every node is visible. The simulation always uses the full graph. */
+  visibleNodeIds?: ReadonlySet<string>
   /** Called after the current graph has been painted to the canvas. */
   onGraphRendered?: (graph: GraphData) => void
+  /** Called once for every completed force-simulation tick. */
+  onPhysicsTick?: () => void
   selectedId?: string | null
   onSelect?: (node: GraphNode) => void
   onHover?: (node: GraphNode | null) => void
@@ -172,11 +179,23 @@ const hubRepulsionScore = (
   const degreeScore = Math.min(1, Math.log1p(degree) / Math.log1p(Math.max(1, settings.hubDegreeReference)))
   return HUB_SCORE_FLOOR + (1 - HUB_SCORE_FLOOR) * degreeScore
 }
-// More connected articles are visually larger, with a cap so hubs never swallow
-// nearby nodes. Keeping this in one helper also keeps hit testing/collision aligned.
+// More connected articles are physically larger, with a cap so hubs never
+// swallow nearby nodes. Rendering applies a separate scale so the dots can be
+// easier to read without changing the force-layout physics.
 const nodeRadius = (node: GraphNode, settings: GraphSimulationSettings = DEFAULT_SIMULATION_SETTINGS) => {
   return (node.id.length > 18 ? 5 : 6) + articleImportance(node, settings) * 6
 }
+const BASE_VISUAL_NODE_SCALE = 1.35
+const visualNodeScale = (visibleCount: number, totalCount: number) => {
+  if (totalCount <= 0 || visibleCount >= totalCount) return BASE_VISUAL_NODE_SCALE
+  const hiddenFraction = Math.max(0, Math.min(1, 1 - visibleCount / totalCount))
+  return BASE_VISUAL_NODE_SCALE + Math.sqrt(hiddenFraction) * 1.45
+}
+const visualNodeRadius = (
+  node: GraphNode,
+  settings: GraphSimulationSettings = DEFAULT_SIMULATION_SETTINGS,
+  scale = BASE_VISUAL_NODE_SCALE,
+) => nodeRadius(node, settings) * scale
 const LARGE_GRAPH_THRESHOLD = 2_000
 const HUB_OUTLINE_COLOR = '#2f9e44'
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
@@ -241,12 +260,12 @@ function boundedGraphBounds(nodes: GraphNode[], mode: GraphCanvasMode): Bounds {
  * fields as simulation state.
  */
 const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
-  { graph, mode = '2d', onGraphRendered, selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS, showLabels = true },
+  { graph, visibleNodeIds, mode = '2d', onGraphRendered, onPhysicsTick, selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS, showLabels = true },
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
-  const simulationRef = useRef<Simulation<GraphNode, undefined> | null>(null)
+  const simulationRef = useRef<PhysicsController | null>(null)
   const layoutCacheRef = useRef<LayoutCache>({ graph: null, twoD: null, threeD: null })
   const activeLayoutRef = useRef<LayoutGraph | null>(null)
   const activeGraphRef = useRef<GraphData | null>(null)
@@ -269,6 +288,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const simulationGuardRef = useRef(onSimulationGuard)
   const graphRenderedRef = useRef<GraphData | null>(null)
   const graphRenderedCallbackRef = useRef(onGraphRendered)
+  const physicsTickCallbackRef = useRef(onPhysicsTick)
+  const visibleNodeIdsRef = useRef<ReadonlySet<string> | null>(visibleNodeIds ?? null)
   const settingsRef = useRef(settings)
   const drawRef = useRef<() => void>(() => undefined)
   const nodeMapRef = useRef<{ graph: GraphData; map: Map<string, GraphNode> } | null>(null)
@@ -282,6 +303,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   colorResolverRef.current = getNodeColor
   simulationGuardRef.current = onSimulationGuard
   graphRenderedCallbackRef.current = onGraphRendered
+  physicsTickCallbackRef.current = onPhysicsTick
+  visibleNodeIdsRef.current = visibleNodeIds ?? null
   settingsRef.current = settings
   pausedRef.current = paused
   showLabelsRef.current = showLabels
@@ -342,6 +365,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const draw3D = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
     const radius = boundaryRadius(nodes.length, 3)
     const hubIds = getHubIds(nodes, links)
+    const isVisible = (node: GraphNode) => !visibleNodeIdsRef.current || visibleNodeIdsRef.current.has(node.id)
+    const visibleNodes = nodes.filter(isVisible)
+    const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
+    const showAllLabels = visibleNodes.length <= Math.max(80, hubIds.size)
     ctx.save()
     ctx.strokeStyle = 'rgba(115, 119, 127, 0.28)'
     ctx.lineWidth = 1
@@ -361,12 +388,15 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.restore()
     const projected = new Map<GraphNode, ReturnType<typeof project3D>>()
     for (const node of nodes) projected.set(node, project3D(node))
-    const linkStride = links.length > 100_000 ? Math.ceil(links.length / 100_000) : 1
-    const sortedLinks = links.filter((_, index) => index % linkStride === 0).map((edge) => {
+    const visibleLinks = links.map((edge) => {
       const source = linkNode(edge.source, nodeMap)
       const target = linkNode(edge.target, nodeMap)
-      return source && target ? { source, target, sourcePoint: projected.get(source), targetPoint: projected.get(target) } : null
+      return source && target && isVisible(source) && isVisible(target)
+        ? { source, target, sourcePoint: projected.get(source), targetPoint: projected.get(target) }
+        : null
     }).filter((edge): edge is { source: GraphNode; target: GraphNode; sourcePoint: ReturnType<typeof project3D>; targetPoint: ReturnType<typeof project3D> } => Boolean(edge?.sourcePoint && edge.targetPoint))
+    const linkStride = visibleLinks.length > 100_000 ? Math.ceil(visibleLinks.length / 100_000) : 1
+    const sortedLinks = visibleLinks.filter((edge, index) => index % linkStride === 0 || edge.source === selected || edge.target === selected)
       .sort((a, b) => ((b.sourcePoint.depth + b.targetPoint.depth) / 2) - ((a.sourcePoint.depth + a.targetPoint.depth) / 2))
     ctx.lineCap = 'round'
     for (const edge of sortedLinks) {
@@ -385,7 +415,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const distance = Math.hypot(dx, dy) || 1
       const ux = dx / distance
       const uy = dy / distance
-      const targetRadius = nodeRadius(edge.target, settingsRef.current) * edge.targetPoint.perspective * viewRef.current.scale
+      const targetRadius = visualNodeRadius(edge.target, settingsRef.current, dotScale) * edge.targetPoint.perspective * viewRef.current.scale
       const tipX = edge.targetPoint.x - ux * (targetRadius + 2)
       const tipY = edge.targetPoint.y - uy * (targetRadius + 2)
       const size = (isRelated ? 5 : 3.5) * viewRef.current.scale
@@ -397,13 +427,13 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.closePath()
       ctx.fill()
     }
-    const sortedNodes = nodes.map((node) => ({ node, point: projected.get(node) })).filter((item): item is { node: GraphNode; point: ReturnType<typeof project3D> } => Boolean(item.point))
+    const sortedNodes = nodes.filter(isVisible).map((node) => ({ node, point: projected.get(node) })).filter((item): item is { node: GraphNode; point: ReturnType<typeof project3D> } => Boolean(item.point))
     if (sortedNodes.length <= 10_000) sortedNodes.sort((a, b) => b.point.depth - a.point.depth)
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
     ctx.font = '500 11px Inter, ui-sans-serif, system-ui, sans-serif'
     for (const { node, point } of sortedNodes) {
-      const radius = nodeRadius(node, settingsRef.current) * point.perspective * viewRef.current.scale
+      const radius = visualNodeRadius(node, settingsRef.current, dotScale) * point.perspective * viewRef.current.scale
       const activeRing = 5 * viewRef.current.scale
       const active = node === selected || node === hovered
       const isHub = hubIds.has(node.id)
@@ -425,25 +455,24 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.stroke()
       if (!showLabelsRef.current) continue
       const text = node.label ?? node.title ?? node.id
-      if (active || point.perspective > 0.92) {
+      if (showAllLabels || active || point.perspective > 0.92) {
         ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
         ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, point.x, point.y + radius + 5)
       }
     }
   }
 
-  const drawLargeGraphLabels = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null) => {
+  const drawLargeGraphLabels = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], hubIds: ReadonlySet<string>, selected: GraphNode | undefined, hovered: GraphNode | null, dotScale: number) => {
     if (!showLabelsRef.current) return
-    // At low zoom, show a representative set of labels plus the hubs; zooming in
-    // progressively reveals more names without turning a dense map into ink.
+    // Keep dense maps legible, but let zooming out reveal a broader sample when
+    // fewer dots are being painted. Hubs remain labelled at every zoom level.
     const zoom = viewRef.current.scale
-    const labelBudget = nodes.length > 20_000 ? 300 : nodes.length > 8_000 ? 400 : nodes.length > 2_000 ? 520 : 950
-    const labelStride = zoom > 1.15 && nodes.length <= 8_000
-      ? 1
-      : Math.max(1, Math.ceil(nodes.length / labelBudget))
-    const minimumDegree = zoom > 1.15 ? 0 : zoom > 0.85 ? 8 : 12
+    const baseLabelBudget = nodes.length > 20_000 ? 300 : nodes.length > 8_000 ? 400 : nodes.length > 2_000 ? 520 : 950
+    const zoomBoost = zoom < 0.58 ? 2.4 : zoom < 0.85 ? 1.7 : zoom < 1.15 ? 1.25 : 1
+    const labelBudget = Math.min(nodes.length, Math.ceil(baseLabelBudget * zoomBoost))
+    const labelStride = Math.max(1, Math.ceil(nodes.length / Math.max(1, labelBudget)))
+    const minimumDegree = zoom < 0.85 ? 0 : zoom > 1.15 ? 0 : 8
     const degreeReference = Math.max(10, settingsRef.current.hubDegreeReference)
-    const hubIds = getHubIds(nodes, links)
     ctx.save()
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
@@ -453,15 +482,13 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const active = node === selected || node === hovered
       const degree = articleDegree(node)
       const isHub = hubIds.has(node.id)
-      const show = active || (zoom > 1.15
-        ? degree >= minimumDegree && index % labelStride === 0
-        : isHub)
+      const show = isHub || active || (degree >= minimumDegree && index % labelStride === 0)
       if (!show) continue
       const importance = Math.min(1, Math.log1p(degree) / Math.log1p(degreeReference))
       const fontSize = 9 + importance * 3 + (active ? 1 : 0)
       const text = node.label ?? node.title ?? node.id
       const label = text.length > 30 ? `${text.slice(0, 28)}…` : text
-      const y = node.y + nodeRadius(node, settingsRef.current) + 5
+      const y = node.y + visualNodeRadius(node, settingsRef.current, dotScale) + 5
       ctx.font = `${active || isHub ? 600 : 500} ${fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`
       ctx.globalAlpha = active ? 1 : 0.48 + importance * 0.42
       // A light halo keeps names readable over the dense link field.
@@ -494,7 +521,19 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.scale(view.scale, view.scale)
     const currentGraph = activeLayoutRef.current ?? graphRef.current
     const nodes = currentGraph.nodes
+    const visibleNodes = visibleNodeIdsRef.current
+      ? nodes.filter((node) => visibleNodeIdsRef.current?.has(node.id))
+      : nodes
     const largeGraph = nodes.length > LARGE_GRAPH_THRESHOLD
+    const renderLargeGraph = largeGraph && visibleNodes.length > LARGE_GRAPH_THRESHOLD
+    const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
+    const showAllVisibleLabels = visibleNodes.length <= Math.max(80, getHubIds(nodes, currentGraph.links).size)
+    const visibleLabelBudget = visibleNodes.length <= 120
+      ? visibleNodes.length
+      : visibleNodes.length <= 500
+        ? Math.ceil(visibleNodes.length * 0.8)
+        : Math.min(950, Math.ceil(visibleNodes.length * 0.55))
+    const visibleLabelStride = Math.max(1, Math.ceil(visibleNodes.length / Math.max(1, visibleLabelBudget)))
     const cachedNodeMap = nodeMapRef.current?.graph === currentGraph
       ? nodeMapRef.current.map
       : new Map(nodes.map((node) => [node.id, node]))
@@ -519,7 +558,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.arc(0, 0, boundaryRadius(nodes.length, 2), 0, Math.PI * 2)
     ctx.stroke()
     ctx.restore()
-    const linkStride = largeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
+    const linkStride = renderLargeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
     const hubIds = getHubIds(nodes, currentGraph.links)
 
     ctx.lineCap = 'round'
@@ -528,21 +567,22 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const source = linkNode(edge.source, nodeMap)
       const target = linkNode(edge.target, nodeMap)
       if (!source || !target || source.x == null || target.x == null || source.y == null || target.y == null) continue
+      if (visibleNodeIdsRef.current && (!visibleNodeIdsRef.current.has(source.id) || !visibleNodeIdsRef.current.has(target.id))) continue
       const isRelated = source === selected || target === selected
-      if (largeGraph && !isRelated && edgeIndex % linkStride !== 0) continue
-      ctx.strokeStyle = isRelated ? 'rgba(37, 79, 239, .72)' : largeGraph ? 'rgba(115, 119, 127, .16)' : 'rgba(115, 119, 127, .22)'
-      ctx.lineWidth = isRelated ? 1.7 : largeGraph ? 0.65 : 1
+      if (renderLargeGraph && !isRelated && edgeIndex % linkStride !== 0) continue
+      ctx.strokeStyle = isRelated ? 'rgba(37, 79, 239, .72)' : renderLargeGraph ? 'rgba(115, 119, 127, .16)' : 'rgba(115, 119, 127, .22)'
+      ctx.lineWidth = isRelated ? 1.7 : renderLargeGraph ? 0.65 : 1
       ctx.beginPath()
       ctx.moveTo(source.x, source.y)
       ctx.lineTo(target.x, target.y)
       ctx.stroke()
-      if (largeGraph && !isRelated) continue
+      if (renderLargeGraph && !isRelated) continue
       const dx = target.x - source.x
       const dy = target.y - source.y
       const distance = Math.hypot(dx, dy) || 1
       const ux = dx / distance
       const uy = dy / distance
-      const tip = { x: target.x - ux * (nodeRadius(target, settingsRef.current) + 2), y: target.y - uy * (nodeRadius(target, settingsRef.current) + 2) }
+      const tip = { x: target.x - ux * (visualNodeRadius(target, settingsRef.current, dotScale) + 2), y: target.y - uy * (visualNodeRadius(target, settingsRef.current, dotScale) + 2) }
       const size = isRelated ? 5 : 4
       ctx.fillStyle = ctx.strokeStyle
       ctx.beginPath()
@@ -555,9 +595,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
     ctx.font = '500 11px Inter, ui-sans-serif, system-ui, sans-serif'
-    for (const node of nodes) {
+    for (let visibleIndex = 0; visibleIndex < visibleNodes.length; visibleIndex += 1) {
+      const node = visibleNodes[visibleIndex]
       if (node.x == null || node.y == null) continue
-      const radius = nodeRadius(node, settingsRef.current)
+      const radius = visualNodeRadius(node, settingsRef.current, dotScale)
       const active = node === selected || node === hovered
       const isHub = hubIds.has(node.id)
       if (active) {
@@ -577,12 +618,13 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const text = node.label ?? node.title ?? node.id
       // Keep the regular canvas path lightweight; large-map labels are drawn
       // by the level-of-detail overlay below.
-      if (!largeGraph && view.scale > 0.58) {
+      const showLabel = showAllVisibleLabels || active || (view.scale <= 0.58 && visibleIndex % visibleLabelStride === 0) || view.scale > 0.58
+      if (!renderLargeGraph && showLabel) {
         ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
         ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, node.x, node.y + radius + 5)
       }
     }
-    if (largeGraph) drawLargeGraphLabels(ctx, nodes, currentGraph.links, selected, hovered)
+    if (renderLargeGraph) drawLargeGraphLabels(ctx, visibleNodes, hubIds, selected, hovered, dotScale)
     ctx.restore()
     if (nodes.length > 0 && activeGraphRef.current === graphRef.current && graphRenderedRef.current !== graphRef.current) {
       graphRenderedRef.current = graphRef.current
@@ -609,6 +651,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   useEffect(() => {
     const layoutGraph = getLayoutGraph(mode)
+    const dimensions = mode === '3d' ? 3 : 2
     activeGraphRef.current = graph
     activeLayoutRef.current = layoutGraph
     const hubIds = getHubIds(layoutGraph.nodes, layoutGraph.links)
@@ -616,63 +659,26 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     if (width > 1 && height > 1) viewRef.current = initialBoundaryView(width, height, graph.nodes.length, mode)
     const largeGraph = layoutGraph.nodes.length > LARGE_GRAPH_THRESHOLD
     const spacing = layoutSpacing(layoutGraph.nodes.length)
-    seedLayout(layoutGraph.nodes, mode === '3d' ? 3 : 2)
+    const repulsionScale = articleRepulsionScale(layoutGraph.nodes, layoutGraph.links)
+    seedLayout(layoutGraph.nodes, dimensions)
+    roundSimulationNodesF32(layoutGraph.nodes, dimensions)
     // Keep every edge available for rendering, but cap the per-tick attraction
     // work in large maps. The representative stride preserves the overall
     // topology while preventing a dense dump tier from freezing the tab.
     const attractionLinks = largeGraph && layoutGraph.links.length > 50_000
       ? layoutGraph.links.filter((_, index) => index % Math.ceil(layoutGraph.links.length / 50_000) === 0)
       : layoutGraph.links
-    const sim = (mode === '3d'
-      ? forceSimulation3D(layoutGraph.nodes, 3)
-      : forceSimulation(layoutGraph.nodes)) as unknown as Simulation<GraphNode, undefined>
-    if (mode === '3d') {
-      sim
-        .force('charge', forceManyBody3D()
-          .strength((node: GraphNode) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge)
-          .distanceMax(settings.chargeDistance * spacing))
-        .force('center', forceCenter3D(0, 0, 0).strength(settings.centerStrength))
-        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 3, hubIds, () => settingsRef.current))
-        .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 3, () => settingsRef.current))
-        .force('collision', forceCollide3D()
-          .radius((node: GraphNode) => nodeRadius(node, settings) + settings.collisionPadding)
-          .iterations(Math.max(1, Math.round(settings.collisionIterations))))
-    } else {
-      sim
-        // Generic charge handles ordinary spacing. The hub force separates
-        // territories without repelling a hub's own linked articles.
-        .force('charge', forceManyBody<GraphNode>()
-          .strength((node) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge)
-          .distanceMax(settings.chargeDistance * spacing))
-        // A direct link is allowed to pull its endpoints together, but a nearby
-        // pair with no loaded link in either direction receives an extra push.
-        // This makes disconnected topic islands separate instead of relying on
-        // the same generic charge for every relationship.
-        .force('unrelated-repulsion', unrelatedRepulsion(layoutGraph.links, layoutGraph.nodes, largeGraph, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings)))
-        .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
-        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 2, hubIds, () => settingsRef.current))
-        // Separate hubs, then resolve collisions using all proposed motion.
-        .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 2, () => settingsRef.current))
-        .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + settings.collisionPadding).iterations(Math.max(1, Math.round(settings.collisionIterations))))
-    }
-    sim
-      .force('boundary', boundaryForce(boundaryRadius(layoutGraph.nodes.length, mode === '3d' ? 3 : 2), mode === '3d' ? 3 : 2))
-      .velocityDecay(settings.velocityDecay)
-      .alphaDecay(settings.alphaDecay)
-      .alphaMin(settings.alphaMin)
-      .alphaTarget(settings.alphaTarget)
-    // Start at the configured temperature and cool toward the target.
-    const initialTemperature = Number.isFinite(settings.initialTemperature)
-      ? Math.max(settings.alphaMin, Math.min(1, settings.initialTemperature))
-      : 0.8
-    sim.alpha(initialTemperature)
-    simulationRef.current = sim
     let framePending = false
     let invalidState = false
     let simulationTicks = 0
+    let disposed = false
+    let cpuStarted = false
+    let activeSimulation: PhysicsController | null = null
     const protectNumerics = largeGraph || settings.linkDistanceScale < 10_000 || settings.linkDistanceExponent > 2
     const afterTick = () => {
+      roundSimulationNodesF32(layoutGraph.nodes, dimensions)
       simulationTicks += 1
+      physicsTickCallbackRef.current?.()
       if (!invalidState && protectNumerics && (simulationTicks <= 120 || simulationTicks % 32 === 0)) {
         const numericLimit = 1_000_000
         const invalid = layoutGraph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || (mode === '3d' && !Number.isFinite(node.z)) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy) || (mode === '3d' && !Number.isFinite(node.vz))
@@ -682,7 +688,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
           || (mode === '3d' && Math.abs(node.vz ?? 0) > numericLimit))
         if (invalid) {
           invalidState = true
-          sim.stop()
+          activeSimulation?.stop()
           invalid.x = Number.isFinite(invalid.x) && Math.abs(invalid.x as number) <= numericLimit ? invalid.x : 0
           invalid.y = Number.isFinite(invalid.y) && Math.abs(invalid.y as number) <= numericLimit ? invalid.y : 0
           invalid.z = mode === '3d' && Number.isFinite(invalid.z) && Math.abs(invalid.z as number) <= numericLimit ? invalid.z : mode === '3d' ? 0 : invalid.z
@@ -699,30 +705,120 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       framePending = true
       requestAnimationFrame(() => { framePending = false; drawRef.current() })
     }
-    sim.on('tick', afterTick)
-    if (largeGraph) {
-      // A d3 timer can monopolize the main thread when a dense tier needs a
-      // long force tick. Run one tick, yield to input/rendering, then continue
-      // at a bounded cadence so the page remains interruptible.
-      sim.stop()
-      const tickDelay = Math.min(250, Math.max(50, Math.round(layoutGraph.nodes.length / 500)))
-      const runLargeTick = () => {
-        largeTickTimerRef.current = null
-        if (pausedRef.current || invalidState) return
-        sim.tick()
-        // Manual D3 ticks do not dispatch tick events.
-        afterTick()
-        if (!pausedRef.current && !invalidState && sim.alpha() >= sim.alphaMin()) largeTickTimerRef.current = window.setTimeout(runLargeTick, tickDelay)
+
+    const startCpuSimulation = () => {
+      if (disposed || cpuStarted) return
+      cpuStarted = true
+      activeSimulation?.destroy?.()
+      invalidState = false
+      const sim = (mode === '3d'
+        ? forceSimulation3D(layoutGraph.nodes, 3)
+        : forceSimulation(layoutGraph.nodes)) as unknown as Simulation<GraphNode, undefined>
+      if (mode === '3d') {
+        sim
+          .force('charge', forceManyBody3D()
+            .strength((node: GraphNode) => -repulsionScale * (settings.baseCharge + articleImportance(node, settings) * settings.articleImportanceCharge))
+            .distanceMax(settings.chargeDistance * spacing))
+          .force('center', forceCenter3D(0, 0, 0).strength(settings.centerStrength))
+          .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 3, hubIds, () => settingsRef.current))
+          .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 3, () => settingsRef.current))
+          .force('collision', forceCollide3D()
+            .radius((node: GraphNode) => nodeRadius(node, settings) + settings.collisionPadding)
+            .iterations(Math.max(1, Math.round(settings.collisionIterations))))
+      } else {
+        sim
+          .force('charge', forceManyBody<GraphNode>()
+            .strength((node) => -repulsionScale * (settings.baseCharge + articleImportance(node, settings) * settings.articleImportanceCharge))
+            .distanceMax(settings.chargeDistance * spacing))
+          .force('unrelated-repulsion', unrelatedRepulsion(layoutGraph.links, layoutGraph.nodes, largeGraph, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), repulsionScale))
+          .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
+          .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 2, hubIds, () => settingsRef.current))
+          .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 2, () => settingsRef.current))
+          .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + settings.collisionPadding).iterations(Math.max(1, Math.round(settings.collisionIterations))))
       }
-      manualTickRef.current = runLargeTick
-      if (!pausedRef.current) largeTickTimerRef.current = window.setTimeout(runLargeTick, 0)
-    } else if (pausedRef.current) sim.stop()
+      sim
+        .force('boundary', boundaryForce(boundaryRadius(layoutGraph.nodes.length, dimensions), dimensions))
+        .velocityDecay(settings.velocityDecay)
+        .alphaDecay(settings.alphaDecay)
+        .alphaMin(settings.alphaMin)
+        .alphaTarget(settings.alphaTarget)
+      const initialTemperature = Number.isFinite(settings.initialTemperature)
+        ? Math.max(settings.alphaMin, Math.min(1, settings.initialTemperature))
+        : 0.8
+      sim.alpha(initialTemperature)
+      activeSimulation = sim as unknown as PhysicsController
+      simulationRef.current = activeSimulation
+      if (hostRef.current) hostRef.current.dataset.physicsBackend = 'cpu-f32'
+      sim.on('tick', afterTick)
+      if (largeGraph) {
+        sim.stop()
+        const tickDelay = Math.min(250, Math.max(50, Math.round(layoutGraph.nodes.length / 500)))
+        const runLargeTick = () => {
+          largeTickTimerRef.current = null
+          if (pausedRef.current || invalidState || disposed) return
+          sim.tick()
+          afterTick()
+          if (!pausedRef.current && !invalidState && sim.alpha() >= sim.alphaMin()) largeTickTimerRef.current = window.setTimeout(runLargeTick, tickDelay)
+        }
+        manualTickRef.current = runLargeTick
+        if (!pausedRef.current) largeTickTimerRef.current = window.setTimeout(runLargeTick, 0)
+      } else if (pausedRef.current) sim.stop()
+    }
+
+    if (hostRef.current) hostRef.current.dataset.physicsBackend = 'initializing'
+    drawRef.current()
+    const gpuNodeParameters = layoutGraph.nodes.map((node) => ({
+      charge: -repulsionScale * (settings.baseCharge + articleImportance(node, settings) * settings.articleImportanceCharge),
+      radius: nodeRadius(node, settings) + settings.collisionPadding,
+      hubScore: hubRepulsionScore(node, hubIds, settings),
+    }))
+    void createGpuGraphSimulation({
+      nodes: layoutGraph.nodes,
+      links: layoutGraph.links,
+      attractionLinks,
+      dimensions,
+      settings,
+      readSettings: () => settingsRef.current,
+      hubIds,
+      nodeParameters: gpuNodeParameters,
+      spacing,
+      repulsionScale,
+      boundaryRadius: boundaryRadius(layoutGraph.nodes.length, dimensions),
+      largeGraph,
+      onTick: afterTick,
+      onFailure: (error) => {
+        if (disposed) return
+        console.warn('WebGPU physics failed; continuing with the f32 CPU engine.', error)
+        roundSimulationNodesF32(layoutGraph.nodes, dimensions)
+        startCpuSimulation()
+      },
+    }).then((gpuSimulation) => {
+      if (disposed) {
+        gpuSimulation?.destroy?.()
+        return
+      }
+      if (!gpuSimulation) {
+        startCpuSimulation()
+        return
+      }
+      activeSimulation = gpuSimulation
+      simulationRef.current = gpuSimulation
+      if (hostRef.current) hostRef.current.dataset.physicsBackend = 'webgpu'
+      if (!pausedRef.current) gpuSimulation.restart()
+    }).catch((error) => {
+      if (disposed) return
+      console.warn('WebGPU physics is unavailable; using the f32 CPU engine.', error)
+      startCpuSimulation()
+    })
+
     return () => {
-      sim.stop()
+      disposed = true
+      activeSimulation?.stop()
+      activeSimulation?.destroy?.()
       if (largeTickTimerRef.current != null) window.clearTimeout(largeTickTimerRef.current)
       largeTickTimerRef.current = null
       manualTickRef.current = null
-      simulationRef.current = null
+      if (simulationRef.current === activeSimulation) simulationRef.current = null
     }
   }, [graph, layoutSettingsKey, mode])
 
@@ -739,7 +835,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     } else simulation.restart()
   }, [settings.linkDistanceScale])
 
-  useEffect(() => { drawRef.current() }, [selectedId, showLabels])
+  useEffect(() => { drawRef.current() }, [selectedId, showLabels, visibleNodeIds])
 
   useEffect(() => {
     orbitRef.current = { yaw: -0.45, pitch: 0.24 }
@@ -805,13 +901,17 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }
   const hit = (point: Point) => {
     const nodes = activeLayoutRef.current?.nodes ?? graph.nodes
+    const visibleNodes = visibleNodeIdsRef.current
+      ? nodes.filter((node) => visibleNodeIdsRef.current?.has(node.id))
+      : nodes
+    const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
     if (modeRef.current === '3d') {
-      return nodes.map((node) => ({ node, projected: project3D(node) }))
+      return visibleNodes.map((node) => ({ node, projected: project3D(node) }))
         .filter(({ projected }) => Number.isFinite(projected.x) && Number.isFinite(projected.y))
         .sort((first, second) => first.projected.depth - second.projected.depth)
-        .find(({ node, projected }) => Math.hypot(projected.x - point.x, projected.y - point.y) <= nodeRadius(node, settingsRef.current) * projected.perspective * viewRef.current.scale + Math.max(4, 8 * viewRef.current.scale))?.node
+        .find(({ node, projected }) => Math.hypot(projected.x - point.x, projected.y - point.y) <= visualNodeRadius(node, settingsRef.current, dotScale) * projected.perspective * viewRef.current.scale + Math.max(4, 8 * viewRef.current.scale))?.node
     }
-    return nodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (nodeRadius(node, settingsRef.current) + 7) / viewRef.current.scale)
+    return visibleNodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (visualNodeRadius(node, settingsRef.current, dotScale) + 7) / viewRef.current.scale)
   }
 
   return <div ref={hostRef} className={className} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>

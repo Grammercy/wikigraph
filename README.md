@@ -12,6 +12,7 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 ## Controls
 
 - **Articles** — choose 10–100,000 articles, then select **Generate new map**. Local dump tiers stream in cumulatively; a warning and acknowledgement appear above 1,000 nodes.
+- **Displayed articles** — limit what is painted to the hubs and the most-connected articles. The layout still simulates every loaded article; selecting an article reveals its full connected neighbourhood until it is deselected.
 - **Physics engine** — pause or resume the force simulation.
 - **Article names** — show or hide node names beside graph nodes.
 - **Select article** — open an inspector with an extract, connection counts, related articles, and a link to Wikipedia.

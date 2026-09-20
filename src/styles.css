@@ -50,10 +50,21 @@ button, select { -webkit-tap-highlight-color: transparent; }
 
 .field-label { display: flex; justify-content: space-between; margin-bottom: 14px; }
 .field-label output { font-size: 12px; color: #254fef; }
-.range { appearance: none; width: 100%; height: 3px; background: linear-gradient(90deg, #254fef 0%, #254fef 9%, #d9dde5 9%); outline: none; cursor: pointer; border-radius: 2px; }
+.displayed-articles-label { margin-top: 28px; }
+.range { appearance: none; display: block; width: 100%; height: 3px; background: linear-gradient(90deg, #254fef 0%, #254fef 9%, #d9dde5 9%); outline: none; cursor: pointer; border-radius: 2px; }
+.range:disabled { opacity: .55; cursor: not-allowed; }
 .range:focus-visible { outline: 2px solid #254fef; outline-offset: 6px; }
 .range::-webkit-slider-thumb { appearance: none; width: 15px; height: 15px; border-radius: 50%; border: 3px solid #254fef; background: #fff; box-shadow: 0 0 0 3px #dce3ff; }
 .range::-moz-range-thumb { width: 15px; height: 15px; border-radius: 50%; border: 3px solid #254fef; background: #fff; box-shadow: 0 0 0 3px #dce3ff; }
+.range-scale { position: relative; height: 31px; }
+.range-scale.has-ticks .range { position: relative; z-index: 3; margin: 0; }
+.range-ticks { position: absolute; z-index: 2; inset: -4px 0 auto; height: 11px; pointer-events: none; }
+.range-tick { position: absolute; top: 0; width: 1px; height: 11px; background: #c7cedb; transform: translateX(-50%); }
+.range-tick-labels { position: absolute; z-index: 2; inset: 12px 0 auto; height: 14px; color: #73777f; font: 10px 'DM Mono'; line-height: 1.2; pointer-events: none; }
+.range-tick-label { position: absolute; top: 0; white-space: nowrap; }
+.range-tick-label-start { transform: none; }
+.range-tick-label-center { transform: translateX(-50%); }
+.range-tick-label-end { transform: translateX(-100%); }
 .range-labels { display: flex; justify-content: space-between; margin-top: 9px; color: #73777f; font: 10px 'DM Mono'; }
 
 .primary-button { width: 100%; height: 43px; border: 0; border-radius: 4px; background: #254fef; color: #fff; font: 500 12px 'Space Grotesk'; margin-top: 27px; cursor: pointer; box-shadow: 0 5px 14px rgba(37, 79, 239, .16); }
