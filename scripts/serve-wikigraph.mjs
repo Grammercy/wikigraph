@@ -222,6 +222,10 @@ function readTier(count) {
   if (!manifest?.tiers?.length) return null
   const tier = manifest.tiers.find((candidate) => candidate.count >= count) || manifest.tiers.at(-1)
   const tierCapacity = Number(tier.nodes ?? tier.count)
+  // Do not parse a multi-million-node final snapshot just to answer an
+  // intermediate request. The JSONL path below can retain only the requested
+  // prefix, which keeps 200k/500k requests within a normal desktop heap.
+  if (count > 100_000 && tierCapacity > count && existsSync(jsonlFile)) return null
   // If an older tier manifest stops at 100k but the normalized JSONL contains
   // more records, let the streamable JSONL path satisfy a larger request
   // instead of silently returning the old largest tier.
@@ -264,8 +268,9 @@ function tierGraphCapacity() {
 }
 async function sampleJsonl(count) {
   if (!existsSync(jsonlFile)) return null
+  const target = Math.max(1, Math.min(CACHE_LIMIT, Math.floor(count) || 1))
   const stat = statSync(jsonlFile)
-  if (jsonlCache && jsonlCache.mtimeMs === stat.mtimeMs && jsonlCache.size === stat.size) return sample(jsonlCache.graph, count)
+  if (jsonlCache && jsonlCache.mtimeMs === stat.mtimeMs && jsonlCache.size === stat.size && jsonlCache.capacity >= target) return sample(jsonlCache.graph, target)
   const selected = []
   const input = createInterface({ input: createReadStream(jsonlFile), crlfDelay: Infinity })
   for await (const line of input) {
@@ -273,36 +278,34 @@ async function sampleJsonl(count) {
       const article = JSON.parse(line)
       if (typeof article.title !== 'string') continue
       const normalized = { ...article, id: article.id || article.title, url: article.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title).replaceAll('%20', '_')}` }
-      if (selected.length < CACHE_LIMIT) {
-        // With the default unlimited cache this stays an O(n) append while a
-        // full corpus is streamed from disk; sort once after the read.
-        selected.push(normalized)
-      } else {
-        // Keep a deterministic hash sample when an operator explicitly sets a
-        // lower memory ceiling for the JSONL fallback path.
-        let worstIndex = 0
-        for (let index = 1; index < selected.length; index += 1) {
-          if (hash(selected[index].id) > hash(selected[worstIndex].id)) worstIndex = index
-        }
-        if (hash(normalized.id) < hash(selected[worstIndex].id)) selected[worstIndex] = normalized
-      }
+      // Only retain enough records for this request. This is the important
+      // difference between a 200k request and accidentally loading the entire
+      // 7M-record corpus into the host process.
+      if (selected.length < target) selected.push(normalized)
+      if (selected.length >= target) break
     } catch { /* skip malformed rows */ }
   }
   selected.sort((a, b) => hash(a.id) - hash(b.id) || String(a.id).localeCompare(String(b.id)))
   const byRef = new Map(selected.flatMap((article) => [[key(article.id), String(article.id)], [key(article.title), String(article.id)]]))
   const edgeKeys = new Set()
-  const links = selected.flatMap((article) => (Array.isArray(article.links) ? article.links : []).flatMap((target) => {
+  const links = []
+  const linkLimit = Math.min(8_000_000, Math.max(100_000, target * 10))
+  outer:
+  for (const article of selected) {
     const source = byRef.get(key(article.id))
-    const targetId = byRef.get(key(refValue(target)))
-    if (!source || !targetId || source === targetId) return []
-    const edgeKey = `${source}\u0000${targetId}`
-    if (edgeKeys.has(edgeKey)) return []
-    edgeKeys.add(edgeKey)
-    return [{ source, target: targetId }]
-  }))
-  const graph = { nodes: selected.map(({ links: _links, ...article }) => article), links }
-  jsonlCache = { mtimeMs: stat.mtimeMs, size: stat.size, graph }
-  return sample(graph, count)
+    for (const targetRef of Array.isArray(article.links) ? article.links : []) {
+      const targetId = byRef.get(key(refValue(targetRef)))
+      if (!source || !targetId || source === targetId) continue
+      const edgeKey = `${source}\u0000${targetId}`
+      if (edgeKeys.has(edgeKey)) continue
+      edgeKeys.add(edgeKey)
+      links.push({ source, target: targetId })
+      if (links.length >= linkLimit) break outer
+    }
+  }
+  const graph = { order: 'connected', nodes: selected.map(({ links: _links, ...article }) => article), links }
+  jsonlCache = { mtimeMs: stat.mtimeMs, size: stat.size, capacity: selected.length, graph }
+  return sample(graph, target)
 }
 
 async function scanCorpus() {
