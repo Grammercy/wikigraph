@@ -49,6 +49,8 @@ export type GraphCanvasMode = '2d' | '3d'
 export type GraphCanvasHandle = {
   fit: () => void
   resetView: () => void
+  /** Center an article in the current viewport without changing its zoom. */
+  focusNode: (id: string) => void
 }
 
 export type GraphCanvasProps = {
@@ -187,11 +189,44 @@ const hubRepulsionScore = (
 const nodeRadius = (node: GraphNode, settings: GraphSimulationSettings = DEFAULT_SIMULATION_SETTINGS) => {
   return (node.id.length > 18 ? 5 : 6) + articleImportance(node, settings) * 6
 }
-const BASE_VISUAL_NODE_SCALE = 1.35
-const visualNodeScale = (visibleCount: number, totalCount: number) => {
-  if (totalCount <= 0 || visibleCount >= totalCount) return BASE_VISUAL_NODE_SCALE
+// Keep the all-articles endpoint at the original physics radius. Sparse views
+// add their own display-count boost below, so a complete graph never inherits
+// an enlargement merely because it was fit to the viewport.
+const BASE_VISUAL_NODE_SCALE = 1
+// On a large graph the hub-only position is an intentional overview mode,
+// not a request to magnify a tiny sample. Keep those hubs at the same normal
+// size used by a fully rendered graph, then let that normalization decay very
+// quickly as non-hubs enter the rendered set.
+const HUB_ONLY_NORMALIZATION_THRESHOLD = 1_000
+const visualNodeScale = (visibleCount: number, totalCount: number, zoomScale: number, hubCount = 0) => {
+  if (totalCount <= 0) return BASE_VISUAL_NODE_SCALE
   const hiddenFraction = Math.max(0, Math.min(1, 1 - visibleCount / totalCount))
-  return BASE_VISUAL_NODE_SCALE + Math.sqrt(hiddenFraction) * 1.45
+  // Use a logarithmic display-count curve so the first reductions are visible
+  // without letting the hub-only end dominate the map.
+  const logarithmicSparseBoost = Math.log1p(hiddenFraction * 9) / Math.log1p(9)
+  // Fade that boost quickly as the rendered set progresses from hubs to the
+  // complete graph. The normalization keeps both endpoints exact while the
+  // exponential falloff makes the first added articles shrink the dots fast.
+  const displayProgress = Math.max(0, Math.min(1, (visibleCount - hubCount) / Math.max(1, totalCount - hubCount)))
+  const fadeRate = 8
+  const exponentialSparseFade = (Math.exp(-fadeRate * displayProgress) - Math.exp(-fadeRate)) / (1 - Math.exp(-fadeRate))
+  const hubOnlyDistance = Math.max(0, visibleCount - hubCount)
+  const hubNormalizationDecay = Math.max(1, hubCount * 0.05)
+  const hubNormalization = totalCount > HUB_ONLY_NORMALIZATION_THRESHOLD && hubCount > 0
+    ? 1 - Math.exp(-hubOnlyDistance / hubNormalizationDecay)
+    : 1
+  const sparseVisualWeight = logarithmicSparseBoost * exponentialSparseFade * hubNormalization
+  const enlargedScale = BASE_VISUAL_NODE_SCALE + sparseVisualWeight * 1.45
+  // The sparse-map boost is for the overview. As the user zooms in, return
+  // every dot to the same baseline radius used by a fully displayed graph.
+  const zoomProgress = Math.max(0, Math.min(1, (zoomScale - 0.58) / (1.15 - 0.58)))
+  const displayScale = BASE_VISUAL_NODE_SCALE + (enlargedScale - BASE_VISUAL_NODE_SCALE) * (1 - zoomProgress)
+  // Fit views can make the world-space dots tiny. Add only a restrained paint
+  // boost so labels stay readable without turning a complete graph into a wall
+  // of oversized dots.
+  const zoomOutProgress = Math.max(0, Math.min(1, (0.85 - zoomScale) / 0.65))
+  const zoomOutCompensation = 1 + zoomOutProgress * 0.45 * sparseVisualWeight
+  return displayScale * zoomOutCompensation
 }
 const visualNodeRadius = (
   node: GraphNode,
@@ -393,7 +428,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const hubIds = getHubIds(nodes, links)
     const renderSubset = getRenderSubset(currentGraph)
     const visibleNodes = renderSubset.nodes
-    const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
+    const dotScale = visualNodeScale(visibleNodes.length, nodes.length, viewRef.current.scale, hubIds.size)
     const showAllLabels = visibleNodes.length <= Math.max(80, hubIds.size)
     ctx.save()
     ctx.strokeStyle = 'rgba(115, 119, 127, 0.28)'
@@ -457,7 +492,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     if (sortedNodes.length <= 10_000) sortedNodes.sort((a, b) => b.point.depth - a.point.depth)
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
-    ctx.font = '500 11px Inter, ui-sans-serif, system-ui, sans-serif'
+    ctx.font = `500 ${Math.max(9, Math.round(11 * dotScale))}px Inter, ui-sans-serif, system-ui, sans-serif`
     for (const { node, point } of sortedNodes) {
       const radius = visualNodeRadius(node, settingsRef.current, dotScale) * point.perspective * viewRef.current.scale
       const activeRing = 5 * viewRef.current.scale
@@ -511,7 +546,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const show = isHub || active || (degree >= minimumDegree && index % labelStride === 0)
       if (!show) continue
       const importance = Math.min(1, Math.log1p(degree) / Math.log1p(degreeReference))
-      const fontSize = 9 + importance * 3 + (active ? 1 : 0)
+      const fontSize = (9 + importance * 3 + (active ? 1 : 0)) * dotScale
       const text = node.label ?? node.title ?? node.id
       const label = text.length > 30 ? `${text.slice(0, 28)}…` : text
       const y = node.y + visualNodeRadius(node, settingsRef.current, dotScale) + 5
@@ -552,8 +587,9 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const visibleNodes = renderSubset.nodes
     const largeGraph = nodes.length > LARGE_GRAPH_THRESHOLD
     const renderLargeGraph = largeGraph && visibleNodes.length > LARGE_GRAPH_THRESHOLD
-    const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
-    const showAllVisibleLabels = visibleNodes.length <= Math.max(80, getHubIds(nodes, currentGraph.links).size)
+    const hubIds = getHubIds(nodes, currentGraph.links)
+    const dotScale = visualNodeScale(visibleNodes.length, nodes.length, view.scale, hubIds.size)
+    const showAllVisibleLabels = visibleNodes.length <= Math.max(80, hubIds.size)
     const visibleLabelBudget = visibleNodes.length <= 120
       ? visibleNodes.length
       : visibleNodes.length <= 500
@@ -585,8 +621,6 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.stroke()
     ctx.restore()
     const linkStride = renderLargeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
-    const hubIds = getHubIds(nodes, currentGraph.links)
-
     ctx.lineCap = 'round'
     for (const { edge, index: edgeIndex } of renderSubset.links) {
       const source = linkNode(edge.source, nodeMap)
@@ -618,7 +652,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     }
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
-    ctx.font = '500 11px Inter, ui-sans-serif, system-ui, sans-serif'
+    ctx.font = `500 ${Math.max(9, Math.round(11 * dotScale))}px Inter, ui-sans-serif, system-ui, sans-serif`
     for (let visibleIndex = 0; visibleIndex < visibleNodes.length; visibleIndex += 1) {
       const node = visibleNodes[visibleIndex]
       if (node.x == null || node.y == null) continue
@@ -670,6 +704,24 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       viewRef.current = initialBoundaryView(sizeRef.current.width, sizeRef.current.height, graphRef.current.nodes.length, modeRef.current)
       orbitRef.current = { yaw: -0.45, pitch: 0.24 }
       drawRef.current()
+    },
+    focusNode: (id: string) => {
+      const node = (activeLayoutRef.current?.nodes ?? graphRef.current.nodes).find((candidate) => candidate.id === id)
+      if (!node) return
+      const { width, height } = sizeRef.current
+      if (modeRef.current === '3d') {
+        const point = project3D(node)
+        if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return
+        viewRef.current.x += width / 2 - point.x
+        viewRef.current.y += height / 2 - point.y
+      } else if (Number.isFinite(node.x) && Number.isFinite(node.y)) {
+        viewRef.current.x = width / 2 - (node.x as number) * viewRef.current.scale
+        viewRef.current.y = height / 2 - (node.y as number) * viewRef.current.scale
+      } else {
+        return
+      }
+      drawRef.current()
+      canvasRef.current?.focus({ preventScroll: true })
     },
   }), [graph.nodes, mode])
 
@@ -934,7 +986,9 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const visibleNodes = visibleNodeIdsRef.current
       ? nodes.filter((node) => visibleNodeIdsRef.current?.has(node.id))
       : nodes
-    const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
+    const links = activeLayoutRef.current?.links ?? graph.links
+    const hubIds = getHubIds(nodes, links)
+    const dotScale = visualNodeScale(visibleNodes.length, nodes.length, viewRef.current.scale, hubIds.size)
     if (modeRef.current === '3d') {
       return visibleNodes.map((node) => ({ node, projected: project3D(node) }))
         .filter(({ projected }) => Number.isFinite(projected.x) && Number.isFinite(projected.y))

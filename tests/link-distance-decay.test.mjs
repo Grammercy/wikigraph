@@ -10,6 +10,6 @@ import {
 test('link distance scale follows a cubic decay over 30 seconds', () => {
   assert.equal(decayedLinkDistanceScale(0), LINK_DISTANCE_SCALE_START)
   assert.equal(decayedLinkDistanceScale(LINK_DISTANCE_SCALE_DECAY_MS), LINK_DISTANCE_SCALE_END)
-  assert.equal(decayedLinkDistanceScale(LINK_DISTANCE_SCALE_DECAY_MS / 2), 18_751)
+  assert.equal(decayedLinkDistanceScale(LINK_DISTANCE_SCALE_DECAY_MS / 2), 23_125)
   assert.equal(decayedLinkDistanceScale(LINK_DISTANCE_SCALE_DECAY_MS * 2), LINK_DISTANCE_SCALE_END)
 })

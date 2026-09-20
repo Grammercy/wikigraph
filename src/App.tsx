@@ -113,12 +113,16 @@ export default function App() {
   const [showLabels, setShowLabels] = useState(true)
   const [graphMode, setGraphMode] = useState<GraphCanvasMode>('2d')
   const [hoveredId, setHoveredId] = useState<string | null>(null)
+  const [finderOpen, setFinderOpen] = useState(false)
+  const [finderQuery, setFinderQuery] = useState('')
+  const [finderActiveIndex, setFinderActiveIndex] = useState(0)
   const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
   const [largeMapAcknowledged, setLargeMapAcknowledged] = useState(false)
   const [simulationSettings, setSimulationSettings] = useState<GraphSimulationSettings>(() => ({ ...DEFAULT_SIMULATION_SETTINGS }))
   const requestRef = useRef<AbortController | null>(null)
   const requestVersionRef = useRef(0)
   const canvasRef = useRef<GraphCanvasHandle>(null)
+  const finderInputRef = useRef<HTMLInputElement>(null)
   const linkDistanceDecayPendingRef = useRef(false)
   const linkDistanceDecayActiveRef = useRef(false)
   const linkDistanceDecayElapsedRef = useRef(0)
@@ -202,6 +206,23 @@ export default function App() {
 
   const nodeById = useMemo(() => new Map(graph.nodes.map((node) => [node.id, node])), [graph.nodes])
   const selected = selectedId ? nodeById.get(selectedId) : undefined
+  const finderResults = useMemo(() => {
+    const query = finderQuery.trim().toLocaleLowerCase()
+    if (!query) return []
+    return graph.nodes
+      .map((node) => {
+        const title = node.title.toLocaleLowerCase()
+        const id = node.id.toLocaleLowerCase()
+        const titleIndex = title.indexOf(query)
+        const idIndex = id.indexOf(query)
+        if (titleIndex < 0 && idIndex < 0) return null
+        const score = title === query ? 0 : title.startsWith(query) ? 1 : titleIndex >= 0 ? 2 : 3
+        return { node, score, matchIndex: titleIndex >= 0 ? titleIndex : idIndex }
+      })
+      .filter((result): result is { node: WikiGraph['nodes'][number]; score: number; matchIndex: number } => Boolean(result))
+      .sort((a, b) => a.score - b.score || a.matchIndex - b.matchIndex || a.node.title.localeCompare(b.node.title))
+      .slice(0, 18)
+  }, [finderQuery, graph.nodes])
   const selectedLinks = selected ? graph.links.filter((edge) => {
     const source = typeof edge.source === 'string' ? edge.source : edge.source.id
     const target = typeof edge.target === 'string' ? edge.target : edge.target.id
@@ -231,7 +252,7 @@ export default function App() {
     () => selectVisibleArticleIds(graph.nodes, graph.links, effectiveDisplayCount, selectedId),
     [effectiveDisplayCount, graph, selectedId],
   )
-  const visibleArticleCount = visibleNodeIds.size
+  const visibleArticleCount = graph.nodes.reduce((count, node) => count + (visibleNodeIds.has(node.id) ? 1 : 0), 0)
   const graphForCanvas = useMemo(() => {
     return {
       nodes: graph.nodes.map((node) => {
@@ -263,6 +284,45 @@ export default function App() {
   const handleSelect = useCallback((node: GraphData['nodes'][number]) => {
     setSelectedId((current) => current === node.id ? null : node.id)
   }, [])
+  const focusArticle = useCallback((node: WikiGraph['nodes'][number]) => {
+    setSelectedId(node.id)
+    setFinderOpen(false)
+    setFinderActiveIndex(0)
+    canvasRef.current?.focusNode(node.id)
+    // The selection makes hidden nodes renderable on the next React paint. A
+    // second pass keeps the article centered after that visibility update.
+    if (typeof window !== 'undefined') window.requestAnimationFrame(() => canvasRef.current?.focusNode(node.id))
+  }, [])
+  const openFinder = useCallback(() => {
+    setFinderOpen(true)
+    setFinderQuery('')
+    setFinderActiveIndex(0)
+  }, [])
+
+  useEffect(() => {
+    const handleFinderShortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
+        event.preventDefault()
+        openFinder()
+        return
+      }
+      if (finderOpen && event.key === 'Escape') {
+        event.preventDefault()
+        setFinderOpen(false)
+      }
+    }
+    window.addEventListener('keydown', handleFinderShortcut)
+    return () => window.removeEventListener('keydown', handleFinderShortcut)
+  }, [finderOpen, openFinder])
+
+  useEffect(() => {
+    if (!finderOpen) return
+    window.requestAnimationFrame(() => finderInputRef.current?.focus())
+  }, [finderOpen])
+
+  useEffect(() => {
+    setFinderActiveIndex((index) => Math.max(0, Math.min(index, Math.max(0, finderResults.length - 1))))
+  }, [finderResults.length])
   const startPendingLinkDistanceDecay = useCallback(() => {
     if (!linkDistanceDecayPendingRef.current) return
     linkDistanceDecayPendingRef.current = false
@@ -365,7 +425,58 @@ export default function App() {
         </details>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === graph.nodes.length ? ' articles' : ` of ${graph.nodes.length.toLocaleString()} articles`} <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
+        <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === graph.nodes.length ? ' articles' : ` of ${graph.nodes.length.toLocaleString()} articles`} <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={openFinder} disabled={!graph.nodes.length}>Find</button><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
+        {finderOpen && <div className="finder-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setFinderOpen(false) }}>
+          <section className="article-finder" role="dialog" aria-modal="true" aria-labelledby="article-finder-title">
+            <header className="article-finder-header">
+              <div><div className="eyebrow">ARTICLE FINDER</div><h2 id="article-finder-title">Jump to an article</h2></div>
+              <button type="button" className="finder-close" onClick={() => setFinderOpen(false)} aria-label="Close article finder">ESC</button>
+            </header>
+            <div className="finder-input-wrap">
+              <span className="finder-search-icon" aria-hidden="true">⌕</span>
+              <input
+                ref={finderInputRef}
+                className="finder-input"
+                value={finderQuery}
+                onChange={(event) => { setFinderQuery(event.target.value); setFinderActiveIndex(0) }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') { event.preventDefault(); setFinderOpen(false) }
+                  else if (event.key === 'ArrowDown' && finderResults.length > 0) { event.preventDefault(); setFinderActiveIndex((index) => (index + 1) % finderResults.length) }
+                  else if (event.key === 'ArrowUp' && finderResults.length > 0) { event.preventDefault(); setFinderActiveIndex((index) => (index - 1 + finderResults.length) % finderResults.length) }
+                  else if (event.key === 'Enter' && finderResults[finderActiveIndex]) { event.preventDefault(); focusArticle(finderResults[finderActiveIndex].node) }
+                }}
+                placeholder="Search article titles…"
+                aria-label="Search article titles"
+                aria-controls="article-finder-results"
+                aria-activedescendant={finderResults[finderActiveIndex] ? `finder-result-${finderActiveIndex}` : undefined}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <kbd>CTRL F</kbd>
+            </div>
+            <div className="finder-meta" aria-live="polite">
+              {finderQuery.trim() ? `${finderResults.length} match${finderResults.length === 1 ? '' : 'es'}` : `${graph.nodes.length.toLocaleString()} articles loaded`}
+              <span>↑↓ navigate <i /> ↵ open</span>
+            </div>
+            <div id="article-finder-results" className="finder-results" role="listbox" aria-label="Matching articles">
+              {!finderQuery.trim() && <div className="finder-empty"><span className="finder-empty-mark">↗</span><strong>Type to search the graph</strong><span>Choose an article to center it in your current view.</span></div>}
+              {finderQuery.trim() && finderResults.length === 0 && <div className="finder-empty"><span className="finder-empty-mark">∅</span><strong>No matching articles</strong><span>Try a broader title or another keyword.</span></div>}
+              {finderResults.map(({ node }, index) => <button
+                key={node.id}
+                id={`finder-result-${index}`}
+                type="button"
+                role="option"
+                aria-selected={index === finderActiveIndex}
+                className={`finder-result${index === finderActiveIndex ? ' active' : ''}`}
+                onMouseEnter={() => setFinderActiveIndex(index)}
+                onClick={() => focusArticle(node)}
+              >
+                <span className="finder-result-copy"><strong>{node.title}</strong><span>{node.extract ? node.extract.slice(0, 86) : 'Wikipedia article'}</span></span>
+                <span className="finder-result-degree">{((node.inDegree ?? 0) + (node.outDegree ?? 0)).toLocaleString()} links</span>
+              </button>)}
+            </div>
+          </section>
+        </div>}
         {error && <div className="notice" role="status">{error}</div>}
         <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} visibleNodeIds={visibleNodeIds} mode={graphMode} showLabels={showLabels} onGraphRendered={handleGraphRendered} onPhysicsTick={advanceLinkDistanceDecay} selectedId={selectedId} onSelect={handleSelect} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}

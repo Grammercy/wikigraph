@@ -14,6 +14,7 @@ export function selectVisibleArticleIds(
   selectedId?: string | null,
 ): Set<string> {
   const hubIds = selectHubIds(nodes, links)
+  const nodeIds = new Set(nodes.map((node) => node.id))
   const visible = new Set<string>(hubIds)
   const limit = Math.max(hubIds.size, Math.min(nodes.length, Math.floor(displayCount) || hubIds.size))
 
@@ -31,8 +32,8 @@ export function selectVisibleArticleIds(
     for (const link of links) {
       const source = endpointId(link.source)
       const target = endpointId(link.target)
-      if (source === selectedId) visible.add(target)
-      if (target === selectedId) visible.add(source)
+      if (source === selectedId && nodeIds.has(target)) visible.add(target)
+      if (target === selectedId && nodeIds.has(source)) visible.add(source)
     }
   }
 

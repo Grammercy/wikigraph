@@ -16,6 +16,7 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 - **Physics engine** — pause or resume the force simulation.
 - **Article names** — show or hide node names beside graph nodes.
 - **Select article** — open an inspector with an extract, connection counts, related articles, and a link to Wikipedia.
+- **Article finder**. Press **Ctrl+F** (or select **Find**) to search loaded article titles, then jump to a result without changing the current zoom.
 - **Fit / Reset** — fit the current graph to the canvas or restore the default view. Drag nodes to explore and scroll to zoom.
 
 ## Data and fallback behavior
