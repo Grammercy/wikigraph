@@ -7,6 +7,8 @@ export interface WikiNode extends SimulationNodeDatum {
   title: string
   url: string
   extract?: string
+  /** True for a page classified as a Wikipedia disambiguation page. */
+  isDisambiguation?: boolean
   /** Optional source metadata from a dump/index (usually article byte length). */
   articleSize?: number
   byteLength?: number

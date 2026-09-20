@@ -1,5 +1,14 @@
 import { articleDegree, selectHubIds, type HubCandidate, type HubLink } from './hubs'
 
+export function rankVisibleArticleNodes(
+  nodes: readonly HubCandidate[],
+  hubIds: ReadonlySet<string>,
+): HubCandidate[] {
+  return [...nodes]
+    .filter((node) => !hubIds.has(node.id))
+    .sort((a, b) => articleDegree(b) - articleDegree(a) || a.id.localeCompare(b.id))
+}
+
 /**
  * Pick the nodes that should be painted without changing the force-layout
  * graph. Hubs are always retained, then the remaining slots go to the most
@@ -12,21 +21,21 @@ export function selectVisibleArticleIds(
   links: readonly HubLink[],
   displayCount: number,
   selectedId?: string | null,
+  selectedHubIds?: ReadonlySet<string>,
+  rankedNodes?: readonly HubCandidate[],
 ): Set<string> {
-  const hubIds = selectHubIds(nodes, links)
-  const nodeIds = new Set(nodes.map((node) => node.id))
+  const hubIds = selectedHubIds ?? selectHubIds(nodes, links)
   const visible = new Set<string>(hubIds)
   const limit = Math.max(hubIds.size, Math.min(nodes.length, Math.floor(displayCount) || hubIds.size))
 
-  const ranked = [...nodes]
-    .filter((node) => !hubIds.has(node.id))
-    .sort((a, b) => articleDegree(b) - articleDegree(a) || a.id.localeCompare(b.id))
+  const ranked = rankedNodes ?? rankVisibleArticleNodes(nodes, hubIds)
   for (const node of ranked) {
     if (visible.size >= limit) break
     visible.add(node.id)
   }
 
   if (selectedId) {
+    const nodeIds = new Set(nodes.map((node) => node.id))
     if (nodes.some((node) => node.id === selectedId)) visible.add(selectedId)
     const endpointId = (endpoint: string | HubCandidate) => typeof endpoint === 'string' ? endpoint : endpoint.id
     for (const link of links) {

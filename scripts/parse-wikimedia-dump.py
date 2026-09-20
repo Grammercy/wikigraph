@@ -2,8 +2,9 @@
 """Stream a Wikimedia pages-articles dump into WikiGraph JSONL.
 
 This uses only Python's standard library.  It never loads the dump or the
-article corpus into memory: each main-namespace page is emitted as one JSONL
-record containing its id, title, byte length, and conservative internal links.
+article corpus into memory: each main-namespace, non-redirect,
+non-disambiguation page is emitted as one JSONL record containing its id, title,
+byte length, and conservative internal links.
 Keep both input and output on the external data drive (D: by default).
 """
 
@@ -38,11 +39,37 @@ except ImportError:
 DUMP_NAME = "enwiki-latest-pages-articles-multistream.xml.bz2"
 DEFAULT_ROOT = Path("D:/WikiGraphData") if os.name == "nt" else Path("/mnt/d/WikiGraphData")
 LINK_RE = re.compile(r"\[\[\s*:?[\t ]*([^\]|#<>]+?)(?:#[^\]|<>]*)?(?:\|[^\]]*)?\]\]")
+# Wikimedia uses a family of page-level templates to mark disambiguation
+# pages. The category check catches pages that use a specialized template
+# without the generic marker.
+DISAMBIGUATION_TEMPLATE_RE = re.compile(
+    r"{{\s*(?:disambiguation|disambig|disamb|hndis|geodis|mathdab|"
+    r"number\s+disambiguation|letter\s+disambiguation)\s*(?:\||}})",
+    re.IGNORECASE,
+)
+DISAMBIGUATION_CATEGORY_RE = re.compile(
+    r"\[\[\s*category\s*:\s*(?:all\s+)?disambiguation\s+pages\b",
+    re.IGNORECASE,
+)
+DISAMBIGUATION_TITLE_RE = re.compile(r"\s+\(disambiguation\)$", re.IGNORECASE)
 IGNORED_PREFIXES = {
     "category", "file", "image", "media", "mediawiki", "module", "portal",
     "special", "template", "talk", "user", "wikipedia", "help", "draft",
     "book", "timedtext", "topic", "gadget", "gadget definition",
 }
+
+
+def is_disambiguation_page(wikitext: str) -> bool:
+    """Return whether page markup identifies the page as disambiguation."""
+    return bool(
+        DISAMBIGUATION_TEMPLATE_RE.search(wikitext)
+        or DISAMBIGUATION_CATEGORY_RE.search(wikitext)
+    )
+
+
+def is_disambiguation_title(title: str) -> bool:
+    """Return whether the title uses Wikipedia's explicit disambiguation form."""
+    return bool(DISAMBIGUATION_TITLE_RE.search(title.strip()))
 
 
 def local_name(tag: str) -> str:
@@ -183,7 +210,7 @@ def process_stream_data(index: int, data: bytes) -> list[bytes | None]:
         redirect = any(local_name(child.tag) == "redirect" for child in page)
         revision = next((child for child in page if local_name(child.tag) == "revision"), None)
         text = child_text(revision, "text") if revision is not None else ""
-        if namespace != "0" or not title or redirect:
+        if namespace != "0" or not title or redirect or is_disambiguation_title(title) or is_disambiguation_page(text):
             page_records.append(None)
         else:
             page_id = child_text(page, "id").strip()
@@ -340,7 +367,7 @@ def parse_dump(source: Path, output: Path, limit: int | None, progress_every: in
                 redirect = any(local_name(child.tag) == "redirect" for child in page)
                 revision = next((child for child in page if local_name(child.tag) == "revision"), None)
                 text = child_text(revision, "text") if revision is not None else ""
-                if namespace != "0" or not title or redirect:
+                if namespace != "0" or not title or redirect or is_disambiguation_title(title) or is_disambiguation_page(text):
                     skipped += 1
                 else:
                     page_id = child_text(page, "id").strip()

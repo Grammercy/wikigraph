@@ -43,6 +43,9 @@ const CACHE_LIMIT = Number.isFinite(configuredCacheLimit) && configuredCacheLimi
   : Number.MAX_SAFE_INTEGER
 const key = (value) => String(value).trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US')
 const refValue = (value) => value && typeof value === 'object' ? value.id ?? value.title ?? '' : value
+const isDisambiguation = (value) => value?.isDisambiguation === true
+  || value?.disambiguation === true
+  || /\s+\(disambiguation\)$/i.test(String(value?.title ?? '').trim())
 const hash = (value) => { let h = 2166136261; for (const c of String(value)) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0 }
 const send = (res, code, body) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(body)) }
 const contentTypes = { '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2' }
@@ -65,7 +68,7 @@ function serveWeb(res, pathname) {
 }
 function normalizedNodes(value) {
   return value.nodes
-    .filter((node) => node && typeof node.title === 'string')
+    .filter((node) => node && typeof node.title === 'string' && !isDisambiguation(node))
     .map((node) => ({ ...node, id: String(node.id || node.title), url: node.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(node.title).replaceAll('%20', '_')}` }))
 }
 
@@ -276,7 +279,7 @@ async function sampleJsonl(count) {
   for await (const line of input) {
     try {
       const article = JSON.parse(line)
-      if (typeof article.title !== 'string') continue
+      if (typeof article.title !== 'string' || isDisambiguation(article)) continue
       const normalized = { ...article, id: article.id || article.title, url: article.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title).replaceAll('%20', '_')}` }
       // Only retain enough records for this request. This is the important
       // difference between a 200k request and accidentally loading the entire
@@ -352,7 +355,7 @@ async function scanCorpus() {
     if (!line.trim()) continue
     try {
       const article = JSON.parse(line)
-      if (typeof article.title !== 'string') continue
+      if (typeof article.title !== 'string' || isDisambiguation(article)) continue
       articles += 1
       totalArticleBytes += Number.isFinite(article.byteLength) ? article.byteLength : 0
       links += Array.isArray(article.links) ? article.links.length : 0
@@ -372,7 +375,7 @@ async function searchCorpus(query, limit) {
   for await (const line of input) {
     try {
       const article = JSON.parse(line)
-      if (typeof article.title !== 'string' || !key(article.title).includes(needle)) continue
+      if (typeof article.title !== 'string' || isDisambiguation(article) || !key(article.title).includes(needle)) continue
       matches.push({ id: String(article.id || article.title), title: article.title, url: article.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title).replaceAll('%20', '_')}`, articleSize: article.byteLength ?? null })
       matches.sort((a, b) => (a.title.length - b.title.length) || a.title.localeCompare(b.title))
       if (matches.length > limit) matches.pop()
@@ -388,6 +391,7 @@ async function findArticle(value) {
   for await (const line of input) {
     try {
       const article = JSON.parse(line)
+      if (isDisambiguation(article)) continue
       if (key(article.id) !== needle && key(article.title) !== needle) continue
       const { links, ...node } = article
       return { ...node, id: String(node.id || node.title), url: node.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(node.title).replaceAll('%20', '_')}`, links: Array.isArray(links) ? links : [] }

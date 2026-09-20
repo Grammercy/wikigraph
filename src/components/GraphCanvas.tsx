@@ -19,6 +19,8 @@ import { articleRepulsionScale } from '../graph/density'
 import { roundSimulationNodesF32 } from '../graph/f32'
 import { createGpuGraphSimulation, nextPhysicsTickDelay, PHYSICS_TICKS_PER_SECOND, type PhysicsController } from '../graph/gpuSimulation'
 import { layoutSpacing, seedLayout, symmetricAttraction, unrelatedRepulsion, hubInteractions } from '../graph/layout'
+import { velocityLimitForce } from '../graph/velocity'
+import { kineticEnergy } from '../graph/energy'
 
 export type GraphNode = SimulationNodeDatum & {
   id: string
@@ -49,6 +51,8 @@ export type GraphCanvasMode = '2d' | '3d'
 export type GraphCanvasHandle = {
   fit: () => void
   resetView: () => void
+  /** Download the complete graph layout as a scalable SVG with every label. */
+  exportSvg: () => void
   /** Center an article in the current viewport without changing its zoom. */
   focusNode: (id: string) => void
 }
@@ -59,8 +63,8 @@ export type GraphCanvasProps = {
   visibleNodeIds?: ReadonlySet<string>
   /** Called after the current graph has been painted to the canvas. */
   onGraphRendered?: (graph: GraphData) => void
-  /** Called once for every completed force-simulation tick. */
-  onPhysicsTick?: () => void
+  /** Called once for every completed force-simulation tick with current kinetic energy. */
+  onPhysicsTick?: (energy: number) => void
   selectedId?: string | null
   onSelect?: (node: GraphNode) => void
   onHover?: (node: GraphNode | null) => void
@@ -272,6 +276,15 @@ const labelText = (node: GraphNode) => {
   const text = node.label ?? node.title ?? node.id
   return text.length > LABEL_MAX_LENGTH ? `${text.slice(0, LABEL_MAX_LENGTH - 1)}…` : text
 }
+const exportLabelText = (node: GraphNode) => (node.label ?? node.title ?? node.id).replace(/[\r\n]+/g, ' ')
+const escapeSvgText = (value: string) => value.replace(/[&<>"']/g, (character) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&apos;',
+}[character] ?? character))
+const svgNumber = (value: number) => Number.isFinite(value) ? Number(value.toFixed(3)).toString() : '0'
 const labelBudget = (count: number, zoom: number, hubCount: number, showAll: boolean) => {
   if (showAll || count <= 12) return count
   const base = count <= 40 ? 8 : count <= 100 ? 12 : count <= 250 ? 18 : count <= 800 ? 28 : 420
@@ -609,14 +622,20 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
         { x: candidate.x - candidate.radius - gap - width / 2, y: candidate.y + candidate.radius + gap },
       ]
       let placement: { x: number; y: number; rect: LabelRect } | null = null
+      let fallbackPlacement: { x: number; y: number; rect: LabelRect } | null = null
       for (const position of positions) {
         const rect = { left: position.x - width / 2, top: position.y, right: position.x + width / 2, bottom: position.y + height }
         if (rect.right < bounds.minX || rect.left > bounds.maxX || rect.bottom < bounds.minY || rect.top > bounds.maxY) continue
+        // Keep a usable position for the explicit "show all" mode. Dense
+        // layouts can leave no collision-free slot, but that must not hide a
+        // requested label.
+        fallbackPlacement ??= { x: position.x, y: position.y, rect }
         if (occupied.some((other) => overlaps(rect, other, padding))) continue
         if (nodeObstacles.some((node) => node.x !== candidate.x && circleTouchesRect(node, rect, padding))) continue
         placement = { x: position.x, y: position.y, rect }
         break
       }
+      if (!placement && showAll) placement = fallbackPlacement
       if (!placement) continue
       occupied.push(placement.rect)
       const nodeEdgeX = candidate.x
@@ -671,13 +690,15 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.restore()
     const projected = new Map<GraphNode, ReturnType<typeof project3D>>()
     for (const node of visibleNodes) projected.set(node, project3D(node))
-    const visibleLinks = renderSubset.links.map(({ edge }) => {
+    const visibleLinks: Array<{ source: GraphNode; target: GraphNode; sourcePoint: ReturnType<typeof project3D>; targetPoint: ReturnType<typeof project3D> }> = []
+    for (const { edge } of renderSubset.links) {
       const source = linkNode(edge.source, nodeMap)
       const target = linkNode(edge.target, nodeMap)
-      return source && target
-        ? { source, target, sourcePoint: projected.get(source), targetPoint: projected.get(target) }
-        : null
-    }).filter((edge): edge is { source: GraphNode; target: GraphNode; sourcePoint: ReturnType<typeof project3D>; targetPoint: ReturnType<typeof project3D> } => Boolean(edge?.sourcePoint && edge.targetPoint))
+      if (!source || !target) continue
+      const sourcePoint = projected.get(source)
+      const targetPoint = projected.get(target)
+      if (sourcePoint && targetPoint) visibleLinks.push({ source, target, sourcePoint, targetPoint })
+    }
     const linkStride = visibleLinks.length > 100_000 ? Math.ceil(visibleLinks.length / 100_000) : 1
     const sortedLinks = visibleLinks.filter((edge, index) => index % linkStride === 0 || edge.source === selected || edge.target === selected)
       .sort((a, b) => ((b.sourcePoint.depth + b.targetPoint.depth) / 2) - ((a.sourcePoint.depth + a.targetPoint.depth) / 2))
@@ -890,6 +911,126 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }
   drawRef.current = draw
 
+  const exportSvg = () => {
+    if (typeof document === 'undefined' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return
+    const currentGraph = activeLayoutRef.current ?? graphRef.current
+    if (!currentGraph.nodes.length) return
+
+    // The viewport intentionally renders only a ranked subset for large maps.
+    // Export from the active layout instead so the downloaded artwork always
+    // contains every loaded node, connection, and article name.
+    const nodes = currentGraph.nodes
+    const links = currentGraph.links
+    const nodeMap = new Map(nodes.map((node) => [node.id, node]))
+    const hubIds = getHubIds(nodes, links)
+    const dimension = modeRef.current === '3d' ? 3 : 2
+    const fallbackRadius = Math.max(80, boundaryRadius(nodes.length, dimension))
+    const currentView = viewRef.current
+    const currentScale = Math.max(0.0001, currentView.scale)
+    const points = new Map<string, { x: number; y: number; radius: number }>()
+
+    nodes.forEach((node, index) => {
+      let x = Number.isFinite(node.x) ? node.x as number : 0
+      let y = Number.isFinite(node.y) ? node.y as number : 0
+      if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) {
+        const angle = index * 2.399963229728653
+        const distance = fallbackRadius * (0.35 + (index % 17) / 17 * 0.55)
+        x = Math.cos(angle) * distance
+        y = Math.sin(angle) * distance
+      }
+      if (modeRef.current === '3d') {
+        const projected = project3D({ ...node, x, y, z: Number.isFinite(node.z) ? node.z : 0 })
+        points.set(node.id, {
+          x: (projected.x - currentView.x) / currentScale,
+          y: (projected.y - currentView.y) / currentScale,
+          radius: visualNodeRadius(node, settingsRef.current) * projected.perspective,
+        })
+      } else {
+        points.set(node.id, { x, y, radius: visualNodeRadius(node, settingsRef.current) })
+      }
+    })
+
+    const labelFontSize = 12
+    const labelGap = 10
+    const labels = nodes.map((node) => {
+      const point = points.get(node.id) as { x: number; y: number; radius: number }
+      const text = exportLabelText(node)
+      // This estimate only expands the viewBox; SVG still lays out the text
+      // using the actual font, so unusually wide glyphs remain unclipped.
+      const estimatedWidth = Math.max(labelFontSize, text.length * 7.2)
+      const x = point.x + point.radius + labelGap + estimatedWidth / 2
+      const y = point.y
+      return { node, point, text, estimatedWidth, x, y }
+    })
+
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
+    const includeBounds = (x: number, y: number) => {
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x)
+      minY = Math.min(minY, y); maxY = Math.max(maxY, y)
+    }
+    for (const point of points.values()) {
+      includeBounds(point.x - point.radius, point.y - point.radius)
+      includeBounds(point.x + point.radius, point.y + point.radius)
+    }
+    for (const label of labels) {
+      includeBounds(label.x - label.estimatedWidth / 2, label.y - labelFontSize * 0.7)
+      includeBounds(label.x + label.estimatedWidth / 2, label.y + labelFontSize * 0.7)
+    }
+    if (!Number.isFinite(minX)) return
+    const margin = 42
+    minX -= margin; maxX += margin; minY -= margin; maxY += margin
+    const width = Math.max(1, maxX - minX)
+    const height = Math.max(1, maxY - minY)
+    const getNode = (endpoint: string | GraphNode) => typeof endpoint === 'string' ? nodeMap.get(endpoint) : nodeMap.get(endpoint.id)
+    const lines: string[] = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      `<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="${svgNumber(width)}" height="${svgNumber(height)}" viewBox="${svgNumber(minX)} ${svgNumber(minY)} ${svgNumber(width)} ${svgNumber(height)}" role="img" aria-labelledby="wikigraph-title wikigraph-description">`,
+      `<title id="wikigraph-title">WikiGraph — ${nodes.length.toLocaleString()} articles</title>`,
+      `<desc id="wikigraph-description">Full-resolution Wikipedia article graph with ${links.length.toLocaleString()} connections and labels for every article.</desc>`,
+      '<defs><marker id="wikigraph-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 8 4 L 0 8 z" fill="#73777f" fill-opacity=".34" /></marker></defs>',
+      `<rect x="${svgNumber(minX)}" y="${svgNumber(minY)}" width="${svgNumber(width)}" height="${svgNumber(height)}" fill="#fbfcfe" />`,
+      '<g class="wikigraph-links" fill="none" stroke="#73777f" stroke-opacity=".28" stroke-width="1" stroke-linecap="round" marker-end="url(#wikigraph-arrow)">',
+    ]
+    for (const edge of links) {
+      const source = getNode(edge.source)
+      const target = getNode(edge.target)
+      const sourcePoint = source ? points.get(source.id) : undefined
+      const targetPoint = target ? points.get(target.id) : undefined
+      if (!sourcePoint || !targetPoint) continue
+      lines.push(`<line x1="${svgNumber(sourcePoint.x)}" y1="${svgNumber(sourcePoint.y)}" x2="${svgNumber(targetPoint.x)}" y2="${svgNumber(targetPoint.y)}" />`)
+    }
+    lines.push('</g>', '<g class="wikigraph-nodes">')
+    for (const [nodeId, point] of points.entries()) {
+      const graphNode = nodeMap.get(nodeId)
+      if (!graphNode) continue
+      const isHub = hubIds.has(graphNode.id)
+      const color = colorResolverRef.current?.(graphNode) ?? graphNode.color ?? '#9aabf8'
+      lines.push(`<circle data-node-id="${escapeSvgText(graphNode.id)}" cx="${svgNumber(point.x)}" cy="${svgNumber(point.y)}" r="${svgNumber(point.radius)}" fill="${escapeSvgText(color)}" stroke="${isHub ? HUB_OUTLINE_COLOR : 'rgba(28, 32, 39, .28)'}" stroke-width="${isHub ? '1.6' : '1'}" />`)
+    }
+    lines.push('</g>', `<g class="wikigraph-labels" font-family="Space Grotesk, sans-serif" font-size="${labelFontSize}" text-anchor="middle" dominant-baseline="central">`)
+    for (const label of labels) {
+      const isHub = hubIds.has(label.node.id)
+      const labelX = label.x
+      const labelStart = label.point.x + label.point.radius + 3
+      lines.push(`<line x1="${svgNumber(label.point.x + label.point.radius)}" y1="${svgNumber(label.point.y)}" x2="${svgNumber(labelStart)}" y2="${svgNumber(label.y)}" stroke="${isHub ? HUB_OUTLINE_COLOR : '#9aa4b8'}" stroke-opacity=".34" stroke-width=".7" />`)
+      lines.push(`<text data-node-label="${escapeSvgText(label.node.id)}" x="${svgNumber(labelX)}" y="${svgNumber(label.y)}" fill="#555c68" font-weight="${isHub ? '600' : '500'}" stroke="#fbfcfe" stroke-width="3" paint-order="stroke">${escapeSvgText(label.text)}</text>`)
+    }
+    lines.push('</g>', '</svg>')
+    const blob = new Blob([lines.join('\n')], { type: 'image/svg+xml;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `wikigraph-${new Date().toISOString().slice(0, 10)}.svg`
+    anchor.style.display = 'none'
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  }
+
   useImperativeHandle(ref, () => ({
     fit: () => {
       const bounds = boundedGraphBounds(activeLayoutRef.current?.nodes ?? graph.nodes, modeRef.current)
@@ -904,6 +1045,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       orbitRef.current = { yaw: -0.45, pitch: 0.24 }
       drawRef.current()
     },
+    exportSvg,
     focusNode: (id: string) => {
       const node = (activeLayoutRef.current?.nodes ?? graphRef.current.nodes).find((candidate) => candidate.id === id)
       if (!node) return
@@ -960,7 +1102,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       if ((import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV && hostRef.current) {
         hostRef.current.dataset.physicsTicks = String(simulationTicks)
       }
-      physicsTickCallbackRef.current?.()
+      physicsTickCallbackRef.current?.(kineticEnergy(layoutGraph.nodes, dimensions))
       if (!invalidState && protectNumerics && (simulationTicks <= 120 || simulationTicks % 32 === 0)) {
         const numericLimit = 1_000_000
         const invalid = layoutGraph.nodes.find((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || (mode === '3d' && !Number.isFinite(node.z)) || !Number.isFinite(node.vx) || !Number.isFinite(node.vy) || (mode === '3d' && !Number.isFinite(node.vz))
@@ -1024,6 +1166,13 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       }
       sim
         .force('boundary', boundaryForce(boundaryRadius(layoutGraph.nodes.length, dimensions), dimensions))
+        // A collision pass samples positions once per tick. Keep a node from
+        // travelling farther than its reserved collision radius so a strong
+        // impulse cannot tunnel through a neighbour between samples.
+        .force('velocity-limit', velocityLimitForce(
+          dimensions,
+          (node) => Math.max(1, nodeRadius(node as GraphNode, settings) + Math.max(0, settings.collisionPadding)),
+        ))
         .velocityDecay(settings.velocityDecay)
         .alphaDecay(settings.alphaDecay)
         .alphaMin(settings.alphaMin)
@@ -1190,17 +1339,29 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }
   const hit = (point: Point) => {
     const nodes = activeLayoutRef.current?.nodes ?? graph.nodes
-    const visibleNodes = visibleNodeIdsRef.current
-      ? nodes.filter((node) => visibleNodeIdsRef.current?.has(node.id))
-      : nodes
     const links = activeLayoutRef.current?.links ?? graph.links
+    // Rendering already resolves the visible subset and caches it by graph and
+    // visibility-set identity. Reuse that list for pointer hit testing instead
+    // of allocating a filtered array for every pointer-move event.
+    const visibleNodes = getRenderSubset(activeLayoutRef.current ?? graph).nodes
     const hubIds = getHubIds(nodes, links)
     const dotScale = visualNodeScale(visibleNodes.length, nodes.length, viewRef.current.scale, hubIds.size)
     if (modeRef.current === '3d') {
-      return visibleNodes.map((node) => ({ node, projected: project3D(node) }))
-        .filter(({ projected }) => Number.isFinite(projected.x) && Number.isFinite(projected.y))
-        .sort((first, second) => first.projected.depth - second.projected.depth)
-        .find(({ node, projected }) => Math.hypot(projected.x - point.x, projected.y - point.y) <= visualNodeRadius(node, settingsRef.current, dotScale) * projected.perspective * viewRef.current.scale + Math.max(4, 8 * viewRef.current.scale))?.node
+      // The old implementation sorted every projected node to find the first
+      // depth hit. A linear pass that keeps the shallowest matching node has
+      // the same result, without allocating or sorting on every mouse move.
+      let hitNode: GraphNode | undefined
+      let nearestDepth = Infinity
+      for (const node of visibleNodes) {
+        const projected = project3D(node)
+        if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y)) continue
+        if (Math.hypot(projected.x - point.x, projected.y - point.y) > visualNodeRadius(node, settingsRef.current, dotScale) * projected.perspective * viewRef.current.scale + Math.max(4, 8 * viewRef.current.scale)) continue
+        if (!hitNode || projected.depth < nearestDepth) {
+          hitNode = node
+          nearestDepth = projected.depth
+        }
+      }
+      return hitNode
     }
     return visibleNodes.find((node) => node.x != null && node.y != null && Math.hypot((node.x as number) - point.x, (node.y as number) - point.y) <= (visualNodeRadius(node, settingsRef.current, dotScale) + 7) / viewRef.current.scale)
   }

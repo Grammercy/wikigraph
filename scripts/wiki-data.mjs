@@ -164,6 +164,8 @@ async function buildIndex({ input, limit = Infinity, dryRun = false } = {}) {
       if (records >= limit) break;
       let article;
       try { article = JSON.parse(line); } catch { malformed += 1; continue; }
+      if (article?.isDisambiguation === true || article?.disambiguation === true
+        || /\s+\(disambiguation\)$/i.test(String(article?.title ?? '').trim())) continue;
       const id = typeof article.id === "string" ? article.id.trim() : "";
       const title = typeof article.title === "string" ? article.title.trim() : id;
       if (!id || !title) { malformed += 1; continue; }

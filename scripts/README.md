@@ -51,9 +51,10 @@ by the dependency-free parser below.
 ### Convert the dump to JSONL
 
 `parse-wikimedia-dump.py` is a dependency-free streaming converter for the
-compressed XML dump. It keeps only main-namespace, non-redirect pages and
-extracts conservative `[[article]]` links. The parser reads one page at a time,
-so it does not require enough RAM for all of Wikipedia:
+compressed XML dump. It keeps only main-namespace, non-redirect, and
+non-disambiguation pages. It extracts conservative `[[article]]` links. The
+parser reads one page at a time, so it does not require enough RAM for all of
+Wikipedia:
 
 ```powershell
 node .\scripts\wiki-data.mjs download

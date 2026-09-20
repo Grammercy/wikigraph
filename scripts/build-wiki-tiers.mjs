@@ -49,6 +49,8 @@ function parseTiers(value) {
 }
 
 function normalizeArticle(article) {
+  if (article?.isDisambiguation === true || article?.disambiguation === true
+    || /\s+\(disambiguation\)$/i.test(String(article?.title ?? '').trim())) return null;
   const id = typeof article.id === "string" ? article.id.trim() : "";
   const title = typeof article.title === "string" ? article.title.trim() : id;
   if (!id || !title) return null;

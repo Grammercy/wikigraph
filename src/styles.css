@@ -3,20 +3,21 @@
 :root {
   font-family: 'Space Grotesk', sans-serif;
   color: #1c2027;
-  background: #fff;
+  --surface-background: #fbfcfe;
+  background: var(--surface-background);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; background: #fff; }
+body { margin: 0; min-width: 320px; background: var(--surface-background); }
 button, input, select { font: inherit; }
 button, select { -webkit-tap-highlight-color: transparent; }
 
 .app-shell {
   min-height: 100vh;
   color: #1c2027;
-  background: #fff;
+  background: var(--surface-background);
 }
 
 .topbar {
@@ -26,7 +27,7 @@ button, select { -webkit-tap-highlight-color: transparent; }
   align-items: center;
   padding: 0 34px;
   gap: 14px;
-  background: #fff;
+  background: var(--surface-background);
 }
 
 .brand-mark { width: 27px; height: 27px; display: block; flex: 0 0 27px; overflow: visible; }
@@ -45,7 +46,7 @@ button, select { -webkit-tap-highlight-color: transparent; }
 .muted { color: #73777f; }
 
 .workspace { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 82px); min-height: 560px; }
-.control-panel { padding: 35px 25px 20px; border-right: 1px solid #e7e9ed; background: #fbfcfe; display: flex; flex-direction: column; overflow-y: auto; }
+.control-panel { padding: 35px 25px 20px; border-right: 1px solid #e7e9ed; background: var(--surface-background); display: flex; flex-direction: column; overflow-y: auto; }
 .control-panel > * { flex-shrink: 0; }
 
 .field-label { display: flex; justify-content: space-between; margin-bottom: 14px; }
@@ -103,17 +104,19 @@ button, select { -webkit-tap-highlight-color: transparent; }
 .simulation-range { margin-top: 10px; }
 .settings-reset { width: 100%; border: 1px solid #d8dce4; border-radius: 4px; color: #555c68; background: #fff; padding: 8px 10px; font: 10px 'DM Mono'; cursor: pointer; margin-top: 12px; }
 .settings-reset:hover { border-color: #254fef; color: #254fef; background: #f5f7ff; }
-.canvas-panel { position: relative; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; background: #fff; background-image: linear-gradient(rgba(231, 233, 237, .52) 1px, transparent 1px), linear-gradient(90deg, rgba(231, 233, 237, .52) 1px, transparent 1px); background-size: 48px 48px; }
+.canvas-panel { position: relative; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; background: var(--surface-background); }
 .canvas-toolbar { flex: 0 0 54px; height: 54px; padding: 18px 25px; color: #73777f; font: 10px 'DM Mono'; letter-spacing: .04em; display: flex; justify-content: space-between; gap: 16px; }
+.canvas-toolbar > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .canvas-toolbar b { color: #1c2027; font-weight: 500; }
 .canvas-toolbar i { display: inline-block; width: 3px; height: 3px; border-radius: 50%; background: #9a9ea6; margin: 0 10px 2px; }
-.toolbar-actions { display: flex; align-items: center; gap: 8px; }
+.toolbar-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .toolbar-actions button { border: 1px solid #d8dce4; border-radius: 4px; background: #fff; color: #555c68; padding: 4px 8px; font: 10px 'DM Mono'; cursor: pointer; }
 .toolbar-actions button:hover:not(:disabled) { border-color: #254fef; color: #254fef; background: #f5f7ff; }
 .toolbar-actions button:disabled { opacity: .45; cursor: not-allowed; }
 .view-badge { color: #254fef; font: 500 9px 'DM Mono'; letter-spacing: .08em; }
 .zoom-hint { color: #9a9ea6; }
 .hover-readout { color: #254fef; max-width: 200px; display: inline-block; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.energy-readout { white-space: nowrap; }
 .graph-canvas-host { flex: 1 1 auto; min-height: 0; }
 .canvas-panel canvas, .canvas-panel > svg { display: block; width: 100%; height: 100%; }
 .finder-backdrop { position: absolute; z-index: 12; inset: 0; display: flex; align-items: flex-start; justify-content: center; padding: 72px 24px 24px; overflow: auto; background: rgba(28, 32, 39, .17); backdrop-filter: blur(2px); }

@@ -19,3 +19,8 @@ export function isDayArticle(title: string): boolean {
 export function isYearOrDayArticle(title: string): boolean {
   return isYearArticle(title) || isDayArticle(title)
 }
+
+/** A common explicit title form for Wikipedia disambiguation pages. */
+export function isDisambiguationTitle(title: string): boolean {
+  return /\s+\(disambiguation\)$/i.test(title.trim())
+}

@@ -3,8 +3,9 @@ import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type 
 import { fetchWikiGraphProgressive, fetchWikiStats, usesLocalCorpus } from './data/wiki'
 import { selectHubIds } from './graph/hubs'
 import { decayedLinkDistanceScale, LINK_DISTANCE_SCALE_DECAY_MS, LINK_DISTANCE_SCALE_PHYSICS_STEP_MS, LINK_DISTANCE_SCALE_START } from './graph/linkDistanceDecay'
-import { isYearOrDayArticle } from './graph/articleFilters'
-import { selectVisibleArticleIds } from './graph/visibility'
+import { isDisambiguationTitle, isYearOrDayArticle } from './graph/articleFilters'
+import { formatKineticEnergy } from './graph/energy'
+import { rankVisibleArticleNodes, selectVisibleArticleIds } from './graph/visibility'
 import type { WikiGraph, WikiStats } from './types'
 
 function formatArticleSize(bytes?: number) {
@@ -117,7 +118,7 @@ export default function App() {
   const [paused, setPaused] = useState(false)
   const [showLabels, setShowLabels] = useState(true)
   const [showAllLabels, setShowAllLabels] = useState(false)
-  const [removeYearAndDayArticles, setRemoveYearAndDayArticles] = useState(false)
+  const [removeYearAndDayArticles, setRemoveYearAndDayArticles] = useState(true)
   const [graphMode, setGraphMode] = useState<GraphCanvasMode>('2d')
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const [finderOpen, setFinderOpen] = useState(false)
@@ -126,6 +127,7 @@ export default function App() {
   const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
   const [largeMapAcknowledged, setLargeMapAcknowledged] = useState(false)
   const [corpusStats, setCorpusStats] = useState<WikiStats | null>(null)
+  const [simulationEnergy, setSimulationEnergy] = useState(0)
   const [simulationSettings, setSimulationSettings] = useState<GraphSimulationSettings>(() => ({ ...DEFAULT_SIMULATION_SETTINGS }))
   const requestRef = useRef<AbortController | null>(null)
   const requestVersionRef = useRef(0)
@@ -134,6 +136,7 @@ export default function App() {
   const linkDistanceDecayPendingRef = useRef(false)
   const linkDistanceDecayActiveRef = useRef(false)
   const linkDistanceDecayElapsedRef = useRef(0)
+  const energyUpdatedAtRef = useRef(0)
   const renderedGraphRef = useRef<GraphData | null>(null)
   // Keep the display slider proportional when a newly generated graph has a
   // different number of loaded articles.
@@ -180,6 +183,14 @@ export default function App() {
     if (elapsed >= LINK_DISTANCE_SCALE_DECAY_MS) stopLinkDistanceDecay()
   }, [stopLinkDistanceDecay])
 
+  const handlePhysicsTick = useCallback((energy: number) => {
+    advanceLinkDistanceDecay()
+    const now = typeof performance === 'undefined' ? Date.now() : performance.now()
+    if (now - energyUpdatedAtRef.current < 100 && energy > 0) return
+    energyUpdatedAtRef.current = now
+    setSimulationEnergy(energy)
+  }, [advanceLinkDistanceDecay])
+
   useEffect(() => () => stopLinkDistanceDecay(), [stopLinkDistanceDecay])
 
   useEffect(() => {
@@ -224,8 +235,9 @@ export default function App() {
           setLoadProgress({ loaded, requested })
           setGraph(partial)
         })
-        if (!replaceCalendarArticles) break
-        const eligibleCount = next.nodes.reduce((total, node) => total + (isYearOrDayArticle(node.title) ? 0 : 1), 0)
+        const hasDisambiguation = next.nodes.some((node) => node.isDisambiguation || isDisambiguationTitle(node.title))
+        if (!replaceCalendarArticles && !hasDisambiguation) break
+        const eligibleCount = next.nodes.reduce((total, node) => total + ((hasDisambiguation && (node.isDisambiguation || isDisambiguationTitle(node.title))) || (replaceCalendarArticles && isYearOrDayArticle(node.title)) ? 0 : 1), 0)
         if (eligibleCount >= targetAmount || requestAmount >= maximum) break
         // Stop when a local tier, a public preview, or the finite fallback
         // cannot provide any more records. Hosted public-API batches can still
@@ -255,7 +267,7 @@ export default function App() {
   }, [stopLinkDistanceDecay])
 
   useEffect(() => {
-    void load(count)
+    void load(count, { replaceCalendarArticles: true })
     return () => {
       requestVersionRef.current += 1
       requestRef.current?.abort()
@@ -263,8 +275,9 @@ export default function App() {
   }, [load])
 
   const filteredGraph = useMemo(() => {
-    if (!removeYearAndDayArticles) return graph
-    const removedIds = new Set(graph.nodes.filter((node) => isYearOrDayArticle(node.title)).map((node) => node.id))
+    const removedIds = new Set(graph.nodes
+      .filter((node) => node.isDisambiguation || isDisambiguationTitle(node.title) || (removeYearAndDayArticles && isYearOrDayArticle(node.title)))
+      .map((node) => node.id))
     if (!removedIds.size) return graph
     const endpointId = (endpoint: string | WikiGraph['nodes'][number]) => typeof endpoint === 'string' ? endpoint : endpoint.id
     const nodes = graph.nodes.filter((node) => !removedIds.has(node.id))
@@ -301,11 +314,16 @@ export default function App() {
       .sort((a, b) => a.score - b.score || a.matchIndex - b.matchIndex || a.node.title.localeCompare(b.node.title))
       .slice(0, 18)
   }, [finderQuery, filteredGraph.nodes])
-  const selectedLinks = selected ? filteredGraph.links.filter((edge) => {
-    const source = typeof edge.source === 'string' ? edge.source : edge.source.id
-    const target = typeof edge.target === 'string' ? edge.target : edge.target.id
-    return source === selected.id || target === selected.id
-  }).length : 0
+  const selectedLinks = useMemo(() => {
+    if (!selected) return 0
+    let count = 0
+    for (const edge of filteredGraph.links) {
+      const source = typeof edge.source === 'string' ? edge.source : edge.source.id
+      const target = typeof edge.target === 'string' ? edge.target : edge.target.id
+      if (source === selected.id || target === selected.id) count += 1
+    }
+    return count
+  }, [filteredGraph.links, selected])
   const relatedArticles = useMemo(() => {
     if (!selected) return []
     const relatedIds = new Set<string>()
@@ -326,11 +344,15 @@ export default function App() {
   const displaySliderCenter = displayMaximum > displayMinimum
     ? displayMaximum > 1_000 ? 1_000 : Math.sqrt(Math.max(1, displayMinimum) * displayMaximum)
     : displayMinimum
-  const visibleNodeIds = useMemo(
-    () => selectVisibleArticleIds(filteredGraph.nodes, filteredGraph.links, effectiveDisplayCount, selectedId),
-    [effectiveDisplayCount, filteredGraph, selectedId],
+  const rankedVisibleArticles = useMemo(
+    () => rankVisibleArticleNodes(filteredGraph.nodes, hubIds),
+    [filteredGraph.nodes, hubIds],
   )
-  const visibleArticleCount = filteredGraph.nodes.reduce((count, node) => count + (visibleNodeIds.has(node.id) ? 1 : 0), 0)
+  const visibleNodeIds = useMemo(
+    () => selectVisibleArticleIds(filteredGraph.nodes, filteredGraph.links, effectiveDisplayCount, selectedId, hubIds, rankedVisibleArticles),
+    [effectiveDisplayCount, filteredGraph, hubIds, rankedVisibleArticles, selectedId],
+  )
+  const visibleArticleCount = visibleNodeIds.size
   const graphForCanvas = useMemo(() => {
     return {
       nodes: filteredGraph.nodes.map((node) => {
@@ -351,6 +373,10 @@ export default function App() {
     const next = Math.max(displayMinimum, Math.min(displayMaximum, Math.round(displayMaximum * displayRatioRef.current)))
     setDisplayCount((previous) => previous === next ? previous : next)
   }, [displayMaximum, displayMinimum])
+  useEffect(() => {
+    energyUpdatedAtRef.current = 0
+    setSimulationEnergy(0)
+  }, [graphForCanvas])
   useEffect(() => {
     if (hoveredId && !visibleNodeIds.has(hoveredId)) setHoveredId(null)
   }, [hoveredId, visibleNodeIds])
@@ -515,7 +541,7 @@ export default function App() {
         </details>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === filteredGraph.nodes.length ? ' articles' : ` of ${filteredGraph.nodes.length.toLocaleString()} articles`} <i /> <b>{filteredGraph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={openFinder} disabled={!filteredGraph.nodes.length}>Find</button><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!filteredGraph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!filteredGraph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
+        <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === filteredGraph.nodes.length ? ' articles' : ` of ${filteredGraph.nodes.length.toLocaleString()} articles`} <i /> <b>{filteredGraph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span> <i /> <span className="muted energy-readout" title="Kinetic energy in layout units per simulation tick">energy {formatKineticEnergy(simulationEnergy)}</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={openFinder} disabled={!filteredGraph.nodes.length}>Find</button><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!filteredGraph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!filteredGraph.nodes.length}>Reset</button><button type="button" className="export-button" onClick={() => canvasRef.current?.exportSvg()} disabled={loading || !filteredGraph.nodes.length} title="Download the full-resolution graph with every article name" aria-label="Export full-resolution graph as SVG">Export SVG</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {finderOpen && <div className="finder-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setFinderOpen(false) }}>
           <section className="article-finder" role="dialog" aria-modal="true" aria-label="Article finder">
             <header className="article-finder-header">
@@ -568,7 +594,7 @@ export default function App() {
           </section>
         </div>}
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} visibleNodeIds={visibleNodeIds} mode={graphMode} showLabels={showLabels} showAllLabels={showAllLabels} onGraphRendered={handleGraphRendered} onPhysicsTick={advanceLinkDistanceDecay} selectedId={selectedId} onSelect={handleSelect} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
+        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} visibleNodeIds={visibleNodeIds} mode={graphMode} showLabels={showLabels} showAllLabels={showAllLabels} onGraphRendered={handleGraphRendered} onPhysicsTick={handlePhysicsTick} selectedId={selectedId} onSelect={handleSelect} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
       </section>

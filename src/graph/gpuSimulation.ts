@@ -523,6 +523,15 @@ fn safe_direction(delta_input: vec3<f32>, first: u32, second: u32, dimensions: u
   return vec4<f32>(delta / distance, distance);
 }
 
+// Keep one integration step within the node's collision radius. Without this
+// guard a strong force can move a node completely past a neighbour before the
+// next collision sample, producing visible tunnelling.
+fn limited_velocity(value: vec3<f32>, max_step: f32) -> vec3<f32> {
+  let speed = length(value);
+  if (speed > max_step && speed > 0.0) { return value * (max_step / speed); }
+  return value;
+}
+
 @compute @workgroup_size(128)
 fn force_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   let index = invocation.x;
@@ -692,6 +701,8 @@ fn force_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     velocity -= position / boundary_distance * magnitude;
   }
 
+  velocity = limited_velocity(velocity, max(1.0, node_meta[index].y));
+
   state.position = vec4<f32>(position, 0.0);
   state.velocity = vec4<f32>(velocity, 0.0);
   force_out[index] = state;
@@ -769,7 +780,7 @@ fn collision_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
       }
     }
   }
-  state.velocity = vec4<f32>(state.velocity.xyz + impulse, 0.0);
+  state.velocity = vec4<f32>(limited_velocity(state.velocity.xyz + impulse, max(1.0, own_radius)), 0.0);
   collision_out[index] = state;
 }
 

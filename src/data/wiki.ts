@@ -32,6 +32,11 @@ interface ApiPage {
   extract?: string
   length?: number
   links?: Array<{ ns?: number; title?: string }>
+  pageprops?: { disambiguation?: string }
+}
+
+function isDisambiguationPage(page: ApiPage): boolean {
+  return Boolean(page.pageprops && Object.prototype.hasOwnProperty.call(page.pageprops, 'disambiguation'))
 }
 
 interface ApiResponse {
@@ -280,14 +285,17 @@ async function pageBatch(titles: string[], signal?: AbortSignal): Promise<PageBa
   let continuation: { plcontinue?: string; continue?: string } | undefined
   for (let attempt = 0; attempt <= MAX_LINK_CONTINUATIONS; attempt += 1) {
     const data = await request({
-      action: 'query', titles: titles.join('|'), prop: 'extracts|links|info', inprop: 'url', exintro: '1', explaintext: '1', exchars: '280',
+      action: 'query', titles: titles.join('|'), prop: 'extracts|links|info|pageprops', inprop: 'url', exintro: '1', explaintext: '1', exchars: '280',
       plnamespace: '0', pllimit: String(MAX_LINKS_PER_PAGE), redirects: '1', ...(continuation ?? {}),
     }, signal)
     for (const mapping of [...(data.query?.normalized ?? []), ...(data.query?.redirects ?? [])]) {
       if (mapping.from && mapping.to) aliases.set(titleId(mapping.from), titleKey(mapping.to))
     }
     const batch = Array.isArray(data.query?.pages) ? data.query.pages : Object.values(data.query?.pages ?? {})
-    pages.push(...batch.filter((page) => page.title && (page.ns == null || page.ns === 0)))
+    pages.push(...batch.filter((page) => page.title
+      && (page.ns == null || page.ns === 0)
+      && !/\s+\(disambiguation\)$/i.test(page.title)
+      && !isDisambiguationPage(page)))
     continuation = data.continue?.plcontinue ? data.continue : undefined
     if (!continuation) break
   }
