@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphSimulationSettings } from './components/GraphCanvas'
+import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphData, type GraphSimulationSettings } from './components/GraphCanvas'
 import { fetchWikiGraphProgressive, usesLocalCorpus } from './data/wiki'
 import { selectHubIds } from './graph/hubs'
 import { decayedLinkDistanceScale, LINK_DISTANCE_SCALE_DECAY_MS, LINK_DISTANCE_SCALE_START } from './graph/linkDistanceDecay'
@@ -94,8 +94,10 @@ export default function App() {
   const requestRef = useRef<AbortController | null>(null)
   const requestVersionRef = useRef(0)
   const canvasRef = useRef<GraphCanvasHandle>(null)
-  const linkDistanceDecayActiveRef = useRef(true)
+  const linkDistanceDecayPendingRef = useRef(false)
+  const linkDistanceDecayActiveRef = useRef(false)
   const linkDistanceDecayTimerRef = useRef<number | null>(null)
+  const renderedGraphRef = useRef<GraphData | null>(null)
   const updateSimulationSetting = useCallback(<K extends keyof GraphSimulationSettings>(key: K, value: GraphSimulationSettings[K]) => {
     setSimulationSettings((previous) => ({ ...previous, [key]: value }))
   }, [])
@@ -107,6 +109,7 @@ export default function App() {
     }
   }, [])
   const updateLinkDistanceScale = useCallback((value: number) => {
+    linkDistanceDecayPendingRef.current = false
     stopLinkDistanceDecay()
     updateSimulationSetting('linkDistanceScale', value)
   }, [stopLinkDistanceDecay, updateSimulationSetting])
@@ -127,13 +130,12 @@ export default function App() {
     linkDistanceDecayTimerRef.current = window.setInterval(update, 100)
   }, [stopLinkDistanceDecay])
 
-  useEffect(() => {
-    startLinkDistanceDecay()
-    return stopLinkDistanceDecay
-  }, [startLinkDistanceDecay, stopLinkDistanceDecay])
+  useEffect(() => () => stopLinkDistanceDecay(), [stopLinkDistanceDecay])
 
   const load = useCallback(async (amount: number) => {
-    startLinkDistanceDecay()
+    linkDistanceDecayPendingRef.current = true
+    renderedGraphRef.current = null
+    stopLinkDistanceDecay()
     setSimulationSettings((previous) => previous.linkDistanceScale === LINK_DISTANCE_SCALE_START
       ? previous
       : { ...previous, linkDistanceScale: LINK_DISTANCE_SCALE_START })
@@ -163,7 +165,7 @@ export default function App() {
     } finally {
       if (version === requestVersionRef.current) setLoading(false)
     }
-  }, [startLinkDistanceDecay])
+  }, [stopLinkDistanceDecay])
 
   useEffect(() => {
     void load(count)
@@ -204,6 +206,23 @@ export default function App() {
       links: graph.links,
     }
   }, [graph])
+  const startPendingLinkDistanceDecay = useCallback(() => {
+    if (!linkDistanceDecayPendingRef.current) return
+    linkDistanceDecayPendingRef.current = false
+    startLinkDistanceDecay()
+  }, [startLinkDistanceDecay])
+  const handleGraphRendered = useCallback((renderedGraph: GraphData) => {
+    renderedGraphRef.current = renderedGraph
+    if (!loading && renderedGraph === graphForCanvas) startPendingLinkDistanceDecay()
+  }, [graphForCanvas, loading, startPendingLinkDistanceDecay])
+  // A small local graph can be emitted as progress and then returned as the
+  // final result by the loader without changing its object identity. In that
+  // case the canvas already painted it while loading, so acknowledge the
+  // render when loading completes as well.
+  useEffect(() => {
+    if (loading || !graph.nodes.length || renderedGraphRef.current !== graphForCanvas) return
+    startPendingLinkDistanceDecay()
+  }, [graph.nodes.length, graphForCanvas, loading, startPendingLinkDistanceDecay])
   const averageLinks = graph.nodes.length ? graph.links.length / graph.nodes.length : 0
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
@@ -281,13 +300,13 @@ export default function App() {
           <PhysicsSlider id="setting-alpha-decay" label="Alpha decay" value={simulationSettings.alphaDecay} min={0.001} max={0.1} step={0.001} onChange={(value) => updateSimulationSetting('alphaDecay', value)} />
           <PhysicsSlider id="setting-alpha-min" label="Alpha minimum" value={simulationSettings.alphaMin} min={0.0001} max={0.02} step={0.0001} onChange={(value) => updateSimulationSetting('alphaMin', value)} />
           <PhysicsSlider id="setting-alpha-target" label="Running alpha target" value={simulationSettings.alphaTarget} min={0} max={0.2} step={0.005} onChange={(value) => updateSimulationSetting('alphaTarget', value)} />
-          <button type="button" className="settings-reset" onClick={() => { stopLinkDistanceDecay(); setSimulationSettings({ ...DEFAULT_SIMULATION_SETTINGS }) }}>Reset physics values</button>
+          <button type="button" className="settings-reset" onClick={() => { linkDistanceDecayPendingRef.current = false; stopLinkDistanceDecay(); setSimulationSettings({ ...DEFAULT_SIMULATION_SETTINGS }) }}>Reset physics values</button>
         </details>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
         <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} mode={graphMode} showLabels={showLabels} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
+        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} mode={graphMode} showLabels={showLabels} onGraphRendered={handleGraphRendered} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
       </section>

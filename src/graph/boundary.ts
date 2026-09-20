@@ -11,7 +11,7 @@ export function boundaryRadius(count: number, dimensions: 2 | 3): number {
 /** An inward force that begins at the boundary and increases beyond it. */
 export function boundaryForce(radius: number, dimensions: 2 | 3) {
   let nodes: GraphNode[] = []
-  const force = (alpha: number) => {
+  const force = (_alpha: number) => {
     for (const node of nodes) {
       const x = node.x ?? 0
       const y = node.y ?? 0
@@ -19,11 +19,15 @@ export function boundaryForce(radius: number, dimensions: 2 | 3) {
       const distance = Math.hypot(x, y, z)
       if (!Number.isFinite(distance) || distance <= radius || distance === 0) continue
       const excess = distance - radius
-      const relative = excess / Math.max(1, radius)
-      // Continuous at the boundary, progressively stiffer outside it. The
-      // stiffness approaches 0.4 so distant nodes return without an explosive
-      // polynomial impulse. Position is never clamped.
-      const magnitude = excess * (0.04 + 0.36 * relative / (1 + relative)) * Math.max(0, alpha)
+      // Ramp up across a narrow band, rather than an entire graph radius.
+      // Bound the band width so large graphs do not acquire a very soft wall.
+      const band = Math.max(1, Math.min(120, radius * 0.08))
+      const exponential = band * 0.12 * Math.expm1(Math.min(50, excess / band))
+      // Limit extreme per-tick kicks to avoid shooting through the graph.
+      // This caps acceleration, never the node's position.
+      // Boundary confinement, like collision handling, must not fade as the
+      // topology forces cool. Otherwise outlying clusters freeze outside it.
+      const magnitude = Math.min(exponential, 0.6 * excess)
       node.vx = (node.vx ?? 0) - x / distance * magnitude
       node.vy = (node.vy ?? 0) - y / distance * magnitude
       if (dimensions === 3) node.vz = (node.vz ?? 0) - z / distance * magnitude

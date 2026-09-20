@@ -50,6 +50,8 @@ export type GraphCanvasHandle = {
 
 export type GraphCanvasProps = {
   graph: GraphData
+  /** Called after the current graph has been painted to the canvas. */
+  onGraphRendered?: (graph: GraphData) => void
   selectedId?: string | null
   onSelect?: (node: GraphNode) => void
   onHover?: (node: GraphNode | null) => void
@@ -176,6 +178,7 @@ const nodeRadius = (node: GraphNode, settings: GraphSimulationSettings = DEFAULT
   return (node.id.length > 18 ? 5 : 6) + articleImportance(node, settings) * 6
 }
 const LARGE_GRAPH_THRESHOLD = 2_000
+const HUB_OUTLINE_COLOR = '#2f9e44'
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
 
@@ -238,7 +241,7 @@ function boundedGraphBounds(nodes: GraphNode[], mode: GraphCanvasMode): Bounds {
  * fields as simulation state.
  */
 const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
-  { graph, mode = '2d', selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS, showLabels = true },
+  { graph, mode = '2d', onGraphRendered, selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS, showLabels = true },
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -246,6 +249,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const simulationRef = useRef<Simulation<GraphNode, undefined> | null>(null)
   const layoutCacheRef = useRef<LayoutCache>({ graph: null, twoD: null, threeD: null })
   const activeLayoutRef = useRef<LayoutGraph | null>(null)
+  const activeGraphRef = useRef<GraphData | null>(null)
   const viewRef = useRef<View>({ x: 0, y: 0, scale: 1 })
   const orbitRef = useRef<Orbit>({ yaw: -0.45, pitch: 0.24 })
   const sizeRef = useRef({ width: 1, height: 1, dpr: 1 })
@@ -263,6 +267,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const modeRef = useRef<GraphCanvasMode>(mode)
   const colorResolverRef = useRef(getNodeColor)
   const simulationGuardRef = useRef(onSimulationGuard)
+  const graphRenderedRef = useRef<GraphData | null>(null)
+  const graphRenderedCallbackRef = useRef(onGraphRendered)
   const settingsRef = useRef(settings)
   const drawRef = useRef<() => void>(() => undefined)
   const nodeMapRef = useRef<{ graph: GraphData; map: Map<string, GraphNode> } | null>(null)
@@ -275,10 +281,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   modeRef.current = mode
   colorResolverRef.current = getNodeColor
   simulationGuardRef.current = onSimulationGuard
+  graphRenderedCallbackRef.current = onGraphRendered
   settingsRef.current = settings
   pausedRef.current = paused
   showLabelsRef.current = showLabels
-  // Link distance scale changes during the startup and graph-load decay. Keep that one
+  // Link distance scale changes during the graph-rendered decay. Keep that one
   // setting out of the layout rebuild key so the existing force can update it
   // in place while other physics changes still rebuild the simulation.
   const layoutSettingsKey = Object.entries(settings)
@@ -334,6 +341,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   const draw3D = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
     const radius = boundaryRadius(nodes.length, 3)
+    const hubIds = getHubIds(nodes, links)
     ctx.save()
     ctx.strokeStyle = 'rgba(115, 119, 127, 0.28)'
     ctx.lineWidth = 1
@@ -398,6 +406,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const radius = nodeRadius(node, settingsRef.current) * point.perspective * viewRef.current.scale
       const activeRing = 5 * viewRef.current.scale
       const active = node === selected || node === hovered
+      const isHub = hubIds.has(node.id)
       if (active) {
         ctx.beginPath()
         ctx.arc(point.x, point.y, radius + activeRing, 0, Math.PI * 2)
@@ -411,8 +420,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.globalAlpha = Math.max(0.46, Math.min(1, 0.58 + point.perspective * 0.42))
       ctx.fill()
       ctx.globalAlpha = 1
-      ctx.strokeStyle = node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
-      ctx.lineWidth = node === selected ? 2 : 1
+      ctx.strokeStyle = isHub ? HUB_OUTLINE_COLOR : node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
+      ctx.lineWidth = node === selected ? 2 : isHub ? 1.6 : 1
       ctx.stroke()
       if (!showLabelsRef.current) continue
       const text = node.label ?? node.title ?? node.id
@@ -496,6 +505,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     if (modeRef.current === '3d') {
       ctx.restore()
       draw3D(ctx, nodes, currentGraph.links, selected, hovered, nodeMap)
+      if (nodes.length > 0 && activeGraphRef.current === graphRef.current && graphRenderedRef.current !== graphRef.current) {
+        graphRenderedRef.current = graphRef.current
+        graphRenderedCallbackRef.current?.(graphRef.current)
+      }
       return
     }
     ctx.save()
@@ -507,6 +520,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.stroke()
     ctx.restore()
     const linkStride = largeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
+    const hubIds = getHubIds(nodes, currentGraph.links)
 
     ctx.lineCap = 'round'
     for (let edgeIndex = 0; edgeIndex < currentGraph.links.length; edgeIndex += 1) {
@@ -545,6 +559,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       if (node.x == null || node.y == null) continue
       const radius = nodeRadius(node, settingsRef.current)
       const active = node === selected || node === hovered
+      const isHub = hubIds.has(node.id)
       if (active) {
         ctx.beginPath()
         ctx.arc(node.x, node.y, radius + 5, 0, Math.PI * 2)
@@ -555,8 +570,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.arc(node.x, node.y, radius, 0, Math.PI * 2)
       ctx.fillStyle = colorResolverRef.current?.(node) ?? node.color ?? (node === selected ? '#254fef' : '#9aabf8')
       ctx.fill()
-      ctx.strokeStyle = node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
-      ctx.lineWidth = node === selected ? 2 : 1
+      ctx.strokeStyle = isHub ? HUB_OUTLINE_COLOR : node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
+      ctx.lineWidth = node === selected ? 2 : isHub ? 1.6 : 1
       ctx.stroke()
       if (!showLabelsRef.current) continue
       const text = node.label ?? node.title ?? node.id
@@ -569,6 +584,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     }
     if (largeGraph) drawLargeGraphLabels(ctx, nodes, currentGraph.links, selected, hovered)
     ctx.restore()
+    if (nodes.length > 0 && activeGraphRef.current === graphRef.current && graphRenderedRef.current !== graphRef.current) {
+      graphRenderedRef.current = graphRef.current
+      graphRenderedCallbackRef.current?.(graphRef.current)
+    }
   }
   drawRef.current = draw
 
@@ -590,6 +609,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   useEffect(() => {
     const layoutGraph = getLayoutGraph(mode)
+    activeGraphRef.current = graph
     activeLayoutRef.current = layoutGraph
     const hubIds = getHubIds(layoutGraph.nodes, layoutGraph.links)
     const { width, height } = sizeRef.current

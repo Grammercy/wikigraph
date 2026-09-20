@@ -42,4 +42,47 @@ for (const dimensions of [2, 3]) {
     sim.tick(200)
     assert.ok(distance() < 101)
   })
+  test(`${dimensions}D boundary force grows exponentially with excess distance`, () => {
+    const nodes = [102, 104, 106].map((distance, i) => ({ id: `${i}`, ...position(distance) }))
+    const force = boundaryForce(100, dimensions)
+    force.initialize(nodes); force(1)
+    const pulls = nodes.map(node => -velocity(node))
+    assert.ok(Math.abs((pulls[2] - pulls[1]) / (pulls[1] - pulls[0]) - Math.exp(0.25)) < 1e-12)
+  })
+  test(`${dimensions}D boundary retains its strength after cooling`, () => {
+    const node = { id: 'outside', ...position(130) }
+    const force = boundaryForce(100, dimensions)
+    force.initialize([node]); force(1)
+    const warm = velocity(node)
+    node.vx = 0; node.vy = 0; node.vz = 0
+    force(0.001)
+    assert.equal(velocity(node), warm)
+  })
+  test(`${dimensions}D cooling brings repelled outliers back close to the boundary`, () => {
+    for (const count of [1000, 3000]) {
+      const radius = boundaryRadius(count, dimensions)
+      const node = { id: 'outlier', ...position(radius * 2.5) }
+      const sim = (dimensions === 2 ? forceSimulation([node]) : forceSimulation3D([node], 3)).stop()
+        .force('outward', alpha => {
+          if (dimensions === 2) node.vx += 140 * alpha
+          else node.vz += 140 * alpha
+        })
+        .force('boundary', boundaryForce(radius, dimensions))
+        .alpha(0.8).alphaDecay(0.01).velocityDecay(0.4)
+      sim.tick(670)
+      const distance = Math.hypot(node.x, node.y, dimensions === 3 ? node.z : 0)
+      assert.ok(distance < radius * 1.01, `${count} articles: outlier at ${distance / radius} radii`)
+    }
+  })
+  test(`${dimensions}D exponential boundary remains stable for distant nodes`, () => {
+    const node = { id: 'distant', ...position(1_000_000) }
+    const sim = (dimensions === 2 ? forceSimulation([node]) : forceSimulation3D([node], 3)).stop()
+      .force('boundary', boundaryForce(100, dimensions)).alphaDecay(0).velocityDecay(0.4)
+    for (let tick = 0; tick < 300; tick++) {
+      sim.tick()
+      const distance = Math.hypot(node.x, node.y, dimensions === 3 ? node.z : 0)
+      assert.ok(Number.isFinite(distance) && distance < 1_000_000)
+    }
+    assert.ok(Math.hypot(node.x, node.y, dimensions === 3 ? node.z : 0) < 101)
+  })
 }
