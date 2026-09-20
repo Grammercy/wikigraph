@@ -111,6 +111,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [paused, setPaused] = useState(false)
   const [showLabels, setShowLabels] = useState(true)
+  const [showAllLabels, setShowAllLabels] = useState(false)
   const [graphMode, setGraphMode] = useState<GraphCanvasMode>('2d')
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const [finderOpen, setFinderOpen] = useState(false)
@@ -371,6 +372,7 @@ export default function App() {
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
         <button type="button" className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-label={`${showLabels ? 'Hide' : 'Show'} article names`} aria-pressed={showLabels}><span>Article names</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
+        <button type="button" className="toggle-row" onClick={() => setShowAllLabels(!showAllLabels)} aria-label={`${showAllLabels ? 'Stop showing' : 'Always show'} all article names for visible articles`} aria-pressed={showAllLabels} disabled={!showLabels}><span>Always show all names</span><span className={`toggle ${showAllLabels ? 'on' : ''}`}><i /></span></button>
         <div className="view-mode-control" role="group" aria-label="Graph view">
           <span className="view-mode-label">Graph view</span>
           <div className="view-mode-options">
@@ -427,9 +429,9 @@ export default function App() {
       <section className="canvas-panel" aria-label="Wikipedia article graph">
         <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === graph.nodes.length ? ' articles' : ` of ${graph.nodes.length.toLocaleString()} articles`} <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={openFinder} disabled={!graph.nodes.length}>Find</button><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {finderOpen && <div className="finder-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setFinderOpen(false) }}>
-          <section className="article-finder" role="dialog" aria-modal="true" aria-labelledby="article-finder-title">
+          <section className="article-finder" role="dialog" aria-modal="true" aria-label="Article finder">
             <header className="article-finder-header">
-              <div><div className="eyebrow">ARTICLE FINDER</div><h2 id="article-finder-title">Jump to an article</h2></div>
+              <div className="eyebrow">ARTICLE FINDER</div>
               <button type="button" className="finder-close" onClick={() => setFinderOpen(false)} aria-label="Close article finder">ESC</button>
             </header>
             <div className="finder-input-wrap">
@@ -454,10 +456,10 @@ export default function App() {
               />
               <kbd>CTRL F</kbd>
             </div>
-            <div className="finder-meta" aria-live="polite">
-              {finderQuery.trim() ? `${finderResults.length} match${finderResults.length === 1 ? '' : 'es'}` : `${graph.nodes.length.toLocaleString()} articles loaded`}
+            {finderQuery.trim() && <div className="finder-meta" aria-live="polite">
+              {`${finderResults.length} match${finderResults.length === 1 ? '' : 'es'}`}
               <span>↑↓ navigate <i /> ↵ open</span>
-            </div>
+            </div>}
             <div id="article-finder-results" className="finder-results" role="listbox" aria-label="Matching articles">
               {!finderQuery.trim() && <div className="finder-empty"><span className="finder-empty-mark">↗</span><strong>Type to search the graph</strong><span>Choose an article to center it in your current view.</span></div>}
               {finderQuery.trim() && finderResults.length === 0 && <div className="finder-empty"><span className="finder-empty-mark">∅</span><strong>No matching articles</strong><span>Try a broader title or another keyword.</span></div>}
@@ -478,7 +480,7 @@ export default function App() {
           </section>
         </div>}
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} visibleNodeIds={visibleNodeIds} mode={graphMode} showLabels={showLabels} onGraphRendered={handleGraphRendered} onPhysicsTick={advanceLinkDistanceDecay} selectedId={selectedId} onSelect={handleSelect} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
+        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} visibleNodeIds={visibleNodeIds} mode={graphMode} showLabels={showLabels} showAllLabels={showAllLabels} onGraphRendered={handleGraphRendered} onPhysicsTick={advanceLinkDistanceDecay} selectedId={selectedId} onSelect={handleSelect} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
       </section>

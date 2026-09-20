@@ -75,6 +75,8 @@ export type GraphCanvasProps = {
   mode?: GraphCanvasMode
   /** Whether article names should be painted next to graph nodes. */
   showLabels?: boolean
+  /** Whether every currently visible article should receive a name label. */
+  showAllLabels?: boolean
 }
 
 export type GraphSimulationSettings = {
@@ -297,7 +299,7 @@ function boundedGraphBounds(nodes: GraphNode[], mode: GraphCanvasMode): Bounds {
  * fields as simulation state.
  */
 const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
-  { graph, visibleNodeIds, mode = '2d', onGraphRendered, onPhysicsTick, selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS, showLabels = true },
+  { graph, visibleNodeIds, mode = '2d', onGraphRendered, onPhysicsTick, selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS, showLabels = true, showAllLabels = false },
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -316,6 +318,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const pressedNodeRef = useRef<GraphNode | null>(null)
   const pausedRef = useRef(paused)
   const showLabelsRef = useRef(showLabels)
+  const showAllLabelsRef = useRef(showAllLabels)
   const viewInitializedRef = useRef(false)
   // Keep the simulation and resize observer independent from React render identity.
   const graphRef = useRef(graph)
@@ -346,6 +349,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   settingsRef.current = settings
   pausedRef.current = paused
   showLabelsRef.current = showLabels
+  showAllLabelsRef.current = showAllLabels
   // Link distance scale changes during the graph-rendered decay. Keep that one
   // setting out of the layout rebuild key so the existing force can update it
   // in place while other physics changes still rebuild the simulation.
@@ -429,7 +433,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const renderSubset = getRenderSubset(currentGraph)
     const visibleNodes = renderSubset.nodes
     const dotScale = visualNodeScale(visibleNodes.length, nodes.length, viewRef.current.scale, hubIds.size)
-    const showAllLabels = visibleNodes.length <= Math.max(80, hubIds.size)
+    const showAllVisibleLabels = showAllLabelsRef.current || visibleNodes.length <= Math.max(80, hubIds.size)
     ctx.save()
     ctx.strokeStyle = 'rgba(115, 119, 127, 0.28)'
     ctx.lineWidth = 1
@@ -516,14 +520,14 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.stroke()
       if (!showLabelsRef.current) continue
       const text = node.label ?? node.title ?? node.id
-      if (showAllLabels || active || point.perspective > 0.92) {
+      if (showAllVisibleLabels || active || point.perspective > 0.92) {
         ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
         ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, point.x, point.y + radius + 5)
       }
     }
   }
 
-  const drawLargeGraphLabels = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], hubIds: ReadonlySet<string>, selected: GraphNode | undefined, hovered: GraphNode | null, dotScale: number) => {
+  const drawLargeGraphLabels = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], hubIds: ReadonlySet<string>, selected: GraphNode | undefined, hovered: GraphNode | null, dotScale: number, showAllVisibleLabels: boolean) => {
     if (!showLabelsRef.current) return
     // Keep dense maps legible, but let zooming out reveal a broader sample when
     // fewer dots are being painted. Hubs remain labelled at every zoom level.
@@ -531,8 +535,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const baseLabelBudget = nodes.length > 20_000 ? 300 : nodes.length > 8_000 ? 400 : nodes.length > 2_000 ? 520 : 950
     const zoomBoost = zoom < 0.58 ? 2.4 : zoom < 0.85 ? 1.7 : zoom < 1.15 ? 1.25 : 1
     const labelBudget = Math.min(nodes.length, Math.ceil(baseLabelBudget * zoomBoost))
-    const labelStride = Math.max(1, Math.ceil(nodes.length / Math.max(1, labelBudget)))
-    const minimumDegree = zoom < 0.85 ? 0 : zoom > 1.15 ? 0 : 8
+    const labelStride = showAllVisibleLabels ? 1 : Math.max(1, Math.ceil(nodes.length / Math.max(1, labelBudget)))
+    const minimumDegree = showAllVisibleLabels ? 0 : zoom < 0.85 ? 0 : zoom > 1.15 ? 0 : 8
     const degreeReference = Math.max(10, settingsRef.current.hubDegreeReference)
     ctx.save()
     ctx.textAlign = 'center'
@@ -543,7 +547,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const active = node === selected || node === hovered
       const degree = articleDegree(node)
       const isHub = hubIds.has(node.id)
-      const show = isHub || active || (degree >= minimumDegree && index % labelStride === 0)
+      const show = showAllVisibleLabels || isHub || active || (degree >= minimumDegree && index % labelStride === 0)
       if (!show) continue
       const importance = Math.min(1, Math.log1p(degree) / Math.log1p(degreeReference))
       const fontSize = (9 + importance * 3 + (active ? 1 : 0)) * dotScale
@@ -589,7 +593,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const renderLargeGraph = largeGraph && visibleNodes.length > LARGE_GRAPH_THRESHOLD
     const hubIds = getHubIds(nodes, currentGraph.links)
     const dotScale = visualNodeScale(visibleNodes.length, nodes.length, view.scale, hubIds.size)
-    const showAllVisibleLabels = visibleNodes.length <= Math.max(80, hubIds.size)
+    const showAllVisibleLabels = showAllLabelsRef.current || visibleNodes.length <= Math.max(80, hubIds.size)
     const visibleLabelBudget = visibleNodes.length <= 120
       ? visibleNodes.length
       : visibleNodes.length <= 500
@@ -682,7 +686,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
         ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, node.x, node.y + radius + 5)
       }
     }
-    if (renderLargeGraph) drawLargeGraphLabels(ctx, visibleNodes, hubIds, selected, hovered, dotScale)
+    if (renderLargeGraph) drawLargeGraphLabels(ctx, visibleNodes, hubIds, selected, hovered, dotScale, showAllLabelsRef.current)
     ctx.restore()
     if (nodes.length > 0 && activeGraphRef.current === graphRef.current && graphRenderedRef.current !== graphRef.current) {
       graphRenderedRef.current = graphRef.current
@@ -917,7 +921,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     } else simulation.restart()
   }, [settings.linkDistanceScale])
 
-  useEffect(() => { drawRef.current() }, [selectedId, showLabels, visibleNodeIds])
+  useEffect(() => { drawRef.current() }, [selectedId, showLabels, showAllLabels, visibleNodeIds])
 
   useEffect(() => {
     orbitRef.current = { yaw: -0.45, pitch: 0.24 }
