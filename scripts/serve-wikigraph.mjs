@@ -34,7 +34,7 @@ let corpusStatsCache = null
 let tierManifestCache = null
 const tierGraphCache = new Map()
 // Keep the existing 500-node default, while allowing the complete 100k
-// progressive tier for GPU-backed clients without attempting a full-corpus
+// progressive tier for browser clients without attempting a full-corpus
 // response in one browser tab. Set WIKIGRAPH_MAX_GRAPH_NODES lower when a
 // machine needs a smaller working set.
 const CACHE_LIMIT = Math.max(500, Math.min(100_000, Number(process.env.WIKIGRAPH_MAX_GRAPH_NODES || 100_000) || 100_000))

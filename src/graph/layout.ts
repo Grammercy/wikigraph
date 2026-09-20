@@ -35,6 +35,7 @@ export function symmetricAttraction(
   settings: GraphSimulationSettings,
   dimensions: 2 | 3 = 2,
   hubIds: ReadonlySet<string>,
+  readSettings: () => GraphSimulationSettings = () => settings,
 ) {
   // Cap the polynomial spring and each node's total impulse to keep extreme
   // slider settings finite.
@@ -46,6 +47,7 @@ export function symmetricAttraction(
   const force = (alpha: number) => {
     impulses.clear()
     const maxImpulse = maxNodeImpulse * Math.max(0, alpha)
+    const currentSettings = readSettings()
     for (const [source, target, weight] of resolved) {
       if (source.x == null || target.x == null || source.y == null || target.y == null || (dimensions === 3 && (source.z == null || target.z == null))) continue
       const dx = target.x - source.x
@@ -61,9 +63,9 @@ export function symmetricAttraction(
       // articles should stay compact even when the map contains thousands.
       const restDistance = 48
       const safeDistance = Math.min(Math.max(0, distance - restDistance), forceDistanceLimit)
-      const exponent = settings.linkDistanceExponent === 3 ? 3 : 2
-      const distanceScale = Number.isFinite(settings.linkDistanceScale)
-        ? Math.max(1, settings.linkDistanceScale)
+      const exponent = currentSettings.linkDistanceExponent === 3 ? 3 : 2
+      const distanceScale = Number.isFinite(currentSettings.linkDistanceScale)
+        ? Math.max(1, currentSettings.linkDistanceScale)
         : 150_000
       // The linear spring gathers related articles from distant seeds. The
       // polynomial adds tension on long links; both cool and share a bounded
@@ -104,6 +106,7 @@ export function symmetricAttraction(
     }
   }
   force.initialize = (simulationNodes: GraphNode[]) => {
+    const currentSettings = readSettings()
     const map = new Map(nodes.map((node) => [node.id, node]))
     const candidates = links.flatMap((link) => {
       const source = linkNode(link.source, map)
@@ -122,7 +125,7 @@ export function symmetricAttraction(
       .map(([source, target]) => {
         const sourceDegree = Math.max(1, degrees.get(source) ?? 0)
         const targetDegree = Math.max(1, degrees.get(target) ?? 0)
-        const weight = Math.max(settings.linkWeightFloor, 1 / Math.sqrt(sourceDegree * targetDegree))
+        const weight = Math.max(currentSettings.linkWeightFloor, 1 / Math.sqrt(sourceDegree * targetDegree))
         return [source, target, Math.max(0, weight)] as const
       })
     const totals = new Map<GraphNode, number>()
@@ -245,4 +248,3 @@ export function unrelatedRepulsion(
   }
   return force
 }
-

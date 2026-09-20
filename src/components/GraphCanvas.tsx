@@ -61,6 +61,8 @@ export type GraphCanvasProps = {
   settings?: GraphSimulationSettings
   /** Switch between the standard top-down map and the orbiting depth view. */
   mode?: GraphCanvasMode
+  /** Whether article names should be painted next to graph nodes. */
+  showLabels?: boolean
 }
 
 export type GraphSimulationSettings = {
@@ -222,14 +224,10 @@ function graphBounds(nodes: GraphNode[]): Bounds | null {
  * fields as simulation state.
  */
 const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function GraphCanvas(
-  { graph, mode = '2d', selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS },
+  { graph, mode = '2d', selectedId, onSelect, onHover, onSimulationGuard, paused = false, className, getNodeColor, settings = DEFAULT_SIMULATION_SETTINGS, showLabels = true },
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const webglCanvasRef = useRef<HTMLCanvasElement>(null)
-  const webglRef = useRef<WebGL2RenderingContext | null>(null)
-  const webglProgramRef = useRef<WebGLProgram | null>(null)
-  const webglBuffersRef = useRef<{ positions: WebGLBuffer; colors: WebGLBuffer; sizes: WebGLBuffer; shapes: WebGLBuffer } | null>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   const simulationRef = useRef<Simulation<GraphNode, undefined> | null>(null)
   const layoutCacheRef = useRef<LayoutCache>({ graph: null, twoD: null, threeD: null })
@@ -243,6 +241,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const rotateRef = useRef<{ start: Point; orbit: Orbit } | null>(null)
   const pressedNodeRef = useRef<GraphNode | null>(null)
   const pausedRef = useRef(paused)
+  const showLabelsRef = useRef(showLabels)
   const viewInitializedRef = useRef(false)
   // Keep the simulation and resize observer independent from React render identity.
   const graphRef = useRef(graph)
@@ -253,9 +252,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const settingsRef = useRef(settings)
   const drawRef = useRef<() => void>(() => undefined)
   const nodeMapRef = useRef<{ graph: GraphData; map: Map<string, GraphNode> } | null>(null)
-  const lastWebglDrawRef = useRef(0)
   const last3DDrawRef = useRef(0)
-  const webglGeometryRef = useRef({ positions: new Float32Array(0), colors: new Float32Array(0), sizes: new Float32Array(0), shapes: new Float32Array(0) })
   const largeTickTimerRef = useRef<number | null>(null)
   const manualTickRef = useRef<(() => void) | null>(null)
   const hubSelectionRef = useRef<{ nodes: GraphNode[] | null; links: GraphLink[] | null; ids: Set<string> }>({ nodes: null, links: null, ids: new Set() })
@@ -266,6 +263,14 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   simulationGuardRef.current = onSimulationGuard
   settingsRef.current = settings
   pausedRef.current = paused
+  showLabelsRef.current = showLabels
+  // Link distance scale changes during the startup and graph-load decay. Keep that one
+  // setting out of the layout rebuild key so the existing force can update it
+  // in place while other physics changes still rebuild the simulation.
+  const layoutSettingsKey = Object.entries(settings)
+    .filter(([key]) => key !== 'linkDistanceScale')
+    .map(([key, value]) => `${key}:${value}`)
+    .join('|')
 
   const getLayoutGraph = (requestedMode: GraphCanvasMode) => {
     const cache = layoutCacheRef.current
@@ -287,124 +292,6 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       hubSelectionRef.current = { nodes, links, ids: selectHubIds(nodes, links) }
     }
     return hubSelectionRef.current.ids
-  }
-
-  const renderWebGL = (gl: WebGL2RenderingContext, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
-    const program = webglProgramRef.current
-    const buffers = webglBuffersRef.current
-    if (!program || !buffers) return
-    const { width, height, dpr } = sizeRef.current
-    const view = viewRef.current
-    const clipX = (x: number) => ((x * view.scale + view.x) / width) * 2 - 1
-    const clipY = (y: number) => 1 - ((y * view.scale + view.y) / height) * 2
-    const stride = links.length > 250_000 ? Math.ceil(links.length / 250_000) : 1
-    const sampledLinkCount = Math.ceil(links.length / stride)
-    // Each sampled link contributes two line vertices and one arrowhead
-    // triangle. Nodes are drawn afterward as point sprites.
-    const maxVertices = sampledLinkCount * 5 + nodes.length
-    const geometry = webglGeometryRef.current
-    if (geometry.positions.length < maxVertices * 2) geometry.positions = new Float32Array(maxVertices * 2)
-    if (geometry.colors.length < maxVertices * 4) geometry.colors = new Float32Array(maxVertices * 4)
-    if (geometry.sizes.length < maxVertices) geometry.sizes = new Float32Array(maxVertices)
-    if (geometry.shapes.length < maxVertices) geometry.shapes = new Float32Array(maxVertices)
-    const positions = geometry.positions
-    const colors = geometry.colors
-    const sizes = geometry.sizes
-    const shapes = geometry.shapes
-    let positionCursor = 0
-    let colorCursor = 0
-    let sizeCursor = 0
-    let shapeCursor = 0
-    let lineVertexCount = 0
-    const pushVertex = (x: number, y: number, pointSize = 0, shape = 0) => {
-      positions[positionCursor++] = clipX(x)
-      positions[positionCursor++] = clipY(y)
-      sizes[sizeCursor++] = pointSize
-      shapes[shapeCursor++] = shape
-    }
-    const pushColor = (color: string, alpha: number) => {
-      const hex = color.startsWith('#') ? color.slice(1) : ''
-      const value = hex.length === 6 ? Number.parseInt(hex, 16) : 0x73777f
-      colors[colorCursor++] = ((value >> 16) & 255) / 255
-      colors[colorCursor++] = ((value >> 8) & 255) / 255
-      colors[colorCursor++] = (value & 255) / 255
-      colors[colorCursor++] = alpha
-    }
-    for (let index = 0; index < links.length; index += stride) {
-      const edge = links[index]
-      const source = linkNode(edge.source, nodeMap)
-      const target = linkNode(edge.target, nodeMap)
-      if (!source || !target || source.x == null || source.y == null || target.x == null || target.y == null) continue
-      const related = source === selected || target === selected
-      pushVertex(source.x, source.y); pushVertex(target.x, target.y)
-      lineVertexCount += 2
-      pushColor('#254fef', related ? 0.72 : 0.16); pushColor('#254fef', related ? 0.72 : 0.16)
-    }
-
-    // WebGL lines do not have a native arrowhead primitive. Add a small
-    // triangle at the target end, stopping short of the circular node. Keep
-    // these vertices in a contiguous range after all line vertices so the
-    // primitive-specific draw calls cannot consume one another's geometry.
-    for (let index = 0; index < links.length; index += stride) {
-      const edge = links[index]
-      const source = linkNode(edge.source, nodeMap)
-      const target = linkNode(edge.target, nodeMap)
-      if (!source || !target || source.x == null || source.y == null || target.x == null || target.y == null) continue
-      const related = source === selected || target === selected
-      const dx = target.x - source.x
-      const dy = target.y - source.y
-      const distance = Math.hypot(dx, dy) || 1
-      const ux = dx / distance
-      const uy = dy / distance
-      const targetRadius = nodeRadius(target, settingsRef.current)
-      const tipX = target.x - ux * (targetRadius + 2)
-      const tipY = target.y - uy * (targetRadius + 2)
-      const size = related ? 6 : 5
-      const arrowAlpha = related ? 0.78 : 0.3
-      const leftX = tipX - ux * size - uy * size * 0.55
-      const leftY = tipY - uy * size + ux * size * 0.55
-      const rightX = tipX - ux * size + uy * size * 0.55
-      const rightY = tipY - uy * size - ux * size * 0.55
-      pushVertex(tipX, tipY); pushVertex(leftX, leftY); pushVertex(rightX, rightY)
-      pushColor('#254fef', arrowAlpha)
-      pushColor('#254fef', arrowAlpha)
-      pushColor('#254fef', arrowAlpha)
-    }
-    const arrowVertexCount = positionCursor / 2 - lineVertexCount
-    for (const node of nodes) {
-      if (node.x == null || node.y == null) continue
-      const pointSize = Math.max(3, Math.min(32, 2 * nodeRadius(node, settingsRef.current) * view.scale * dpr))
-      pushVertex(node.x, node.y, pointSize, 1)
-      const active = node === selected || node === hovered
-      const color = active || node === selected ? '#254fef' : (colorResolverRef.current?.(node) ?? node.color ?? '#9aabf8')
-      pushColor(color, 1)
-    }
-    gl.viewport(0, 0, Math.round(width * dpr), Math.round(height * dpr))
-    gl.clearColor(1, 1, 1, 0)
-    gl.clear(gl.COLOR_BUFFER_BIT)
-    gl.useProgram(program)
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.positions)
-    gl.bufferData(gl.ARRAY_BUFFER, positions.subarray(0, positionCursor), gl.DYNAMIC_DRAW)
-    const positionLocation = gl.getAttribLocation(program, 'a_position')
-    gl.enableVertexAttribArray(positionLocation); gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0)
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.colors)
-    gl.bufferData(gl.ARRAY_BUFFER, colors.subarray(0, colorCursor), gl.DYNAMIC_DRAW)
-    const colorLocation = gl.getAttribLocation(program, 'a_color')
-    gl.enableVertexAttribArray(colorLocation); gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, 0, 0)
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.sizes)
-    gl.bufferData(gl.ARRAY_BUFFER, sizes.subarray(0, sizeCursor), gl.DYNAMIC_DRAW)
-    const sizeLocation = gl.getAttribLocation(program, 'a_point_size')
-    gl.enableVertexAttribArray(sizeLocation); gl.vertexAttribPointer(sizeLocation, 1, gl.FLOAT, false, 0, 0)
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffers.shapes)
-    gl.bufferData(gl.ARRAY_BUFFER, shapes.subarray(0, shapeCursor), gl.DYNAMIC_DRAW)
-    const shapeLocation = gl.getAttribLocation(program, 'a_shape')
-    gl.enableVertexAttribArray(shapeLocation); gl.vertexAttribPointer(shapeLocation, 1, gl.FLOAT, false, 0, 0)
-    gl.lineWidth(1)
-    gl.drawArrays(gl.LINES, 0, lineVertexCount)
-    gl.drawArrays(gl.TRIANGLES, lineVertexCount, arrowVertexCount)
-    const nodeStart = lineVertexCount + arrowVertexCount
-    const nodeVertexCount = positionCursor / 2 - nodeStart
-    gl.drawArrays(gl.POINTS, nodeStart, nodeVertexCount)
   }
 
   const project3D = (node: GraphNode) => {
@@ -494,6 +381,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.strokeStyle = node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
       ctx.lineWidth = node === selected ? 2 : 1
       ctx.stroke()
+      if (!showLabelsRef.current) continue
       const text = node.label ?? node.title ?? node.id
       if (active || point.perspective > 0.92) {
         ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
@@ -503,7 +391,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }
 
   const drawLargeGraphLabels = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null) => {
-    // Text is kept on the 2D overlay so WebGL can stay focused on geometry.
+    if (!showLabelsRef.current) return
     // At low zoom, show a representative set of labels plus the hubs; zooming in
     // progressively reveals more names without turning a dense map into ink.
     const zoom = viewRef.current.scale
@@ -577,21 +465,6 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       draw3D(ctx, nodes, currentGraph.links, selected, hovered, nodeMap)
       return
     }
-    if (largeGraph && webglRef.current && webglProgramRef.current) {
-      const now = typeof performance === 'undefined' ? Date.now() : performance.now()
-      if (now - lastWebglDrawRef.current < 32) {
-        ctx.restore()
-        return
-      }
-      lastWebglDrawRef.current = now
-      renderWebGL(webglRef.current, nodes, currentGraph.links, selected, hovered, nodeMap)
-      drawLargeGraphLabels(ctx, nodes, currentGraph.links, selected, hovered)
-      // The overlay was saved/transformed above. Restore it before returning so
-      // repeated WebGL frames do not accumulate canvas state or leave stale
-      // interaction pixels behind.
-      ctx.restore()
-      return
-    }
     const linkStride = largeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
 
     ctx.lineCap = 'round'
@@ -644,6 +517,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.strokeStyle = node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
       ctx.lineWidth = node === selected ? 2 : 1
       ctx.stroke()
+      if (!showLabelsRef.current) continue
       const text = node.label ?? node.title ?? node.id
       // Keep the regular canvas path lightweight; large-map labels are drawn
       // by the level-of-detail overlay below.
@@ -674,29 +548,6 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }), [graph.nodes, mode])
 
   useEffect(() => {
-    const canvas = webglCanvasRef.current
-    if (!canvas) return
-    const gl = canvas.getContext('webgl2', { antialias: false, alpha: true })
-    if (!gl) return
-    const vertex = gl.createShader(gl.VERTEX_SHADER)
-    const fragment = gl.createShader(gl.FRAGMENT_SHADER)
-    if (!vertex || !fragment) return
-    gl.shaderSource(vertex, '#version 300 es\nin vec2 a_position; in vec4 a_color; in float a_point_size; in float a_shape; out vec4 v_color; flat out int v_shape; void main(){gl_Position=vec4(a_position,0.0,1.0); gl_PointSize=a_point_size; v_color=a_color; v_shape=int(a_shape+0.5);}')
-    gl.shaderSource(fragment, '#version 300 es\nprecision mediump float; in vec4 v_color; flat in int v_shape; out vec4 outColor; void main(){if(v_shape==1){if(distance(gl_PointCoord,vec2(0.5))>0.5) discard;} outColor=v_color;}')
-    gl.compileShader(vertex); gl.compileShader(fragment)
-    if (!gl.getShaderParameter(vertex, gl.COMPILE_STATUS) || !gl.getShaderParameter(fragment, gl.COMPILE_STATUS)) return
-    const program = gl.createProgram()
-    if (!program) return
-    gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program)
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return
-    const positions = gl.createBuffer(); const colors = gl.createBuffer(); const sizes = gl.createBuffer(); const shapes = gl.createBuffer()
-    if (!positions || !colors || !sizes || !shapes) return
-    webglRef.current = gl; webglProgramRef.current = program; webglBuffersRef.current = { positions, colors, sizes, shapes }
-    drawRef.current()
-    return () => { webglRef.current = null; webglProgramRef.current = null; webglBuffersRef.current = null }
-  }, [])
-
-  useEffect(() => {
     const layoutGraph = getLayoutGraph(mode)
     activeLayoutRef.current = layoutGraph
     const hubIds = getHubIds(layoutGraph.nodes, layoutGraph.links)
@@ -720,7 +571,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
           .strength((node: GraphNode) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge - hubRepulsionScore(node, hubIds, settings) ** 3 * settings.hubCharge)
           .distanceMax(settings.chargeDistance * spacing))
         .force('center', forceCenter3D(0, 0, 0).strength(settings.centerStrength))
-        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 3, hubIds))
+        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 3, hubIds, () => settingsRef.current))
         .force('collision', forceCollide3D()
           .radius((node: GraphNode) => nodeRadius(node, settings) + settings.collisionPadding)
           .iterations(Math.max(1, Math.round(settings.collisionIterations))))
@@ -740,7 +591,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
         // the same generic charge for every relationship.
         .force('unrelated-repulsion', unrelatedRepulsion(layoutGraph.links, layoutGraph.nodes, largeGraph, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings)))
         .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
-        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 2, hubIds))
+        .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 2, hubIds, () => settingsRef.current))
         // Separate hubs, then resolve collisions using all proposed motion.
         .force('hub-repulsion', hubRepulsion(settings, hubIds))
         .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + settings.collisionPadding).iterations(Math.max(1, Math.round(settings.collisionIterations))))
@@ -813,9 +664,22 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       manualTickRef.current = null
       simulationRef.current = null
     }
-  }, [graph, settings, mode])
+  }, [graph, layoutSettingsKey, mode])
 
-  useEffect(() => { drawRef.current() }, [selectedId])
+  useEffect(() => {
+    const simulation = simulationRef.current
+    if (!simulation || pausedRef.current) return
+    const reheatTemperature = Number.isFinite(settings.initialTemperature)
+      ? Math.max(settings.alphaMin, Math.min(0.12, settings.initialTemperature))
+      : 0.12
+    if (simulation.alpha() < reheatTemperature) simulation.alpha(reheatTemperature)
+    if (manualTickRef.current) {
+      simulation.stop()
+      if (largeTickTimerRef.current == null) manualTickRef.current()
+    } else simulation.restart()
+  }, [settings.linkDistanceScale])
+
+  useEffect(() => { drawRef.current() }, [selectedId, showLabels])
 
   useEffect(() => {
     orbitRef.current = { yaw: -0.45, pitch: 0.24 }
@@ -860,8 +724,6 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       const dpr = Math.min(window.devicePixelRatio || 1, 2)
       sizeRef.current = { width: Math.max(1, rect.width), height: Math.max(1, rect.height), dpr }
       canvas.width = Math.round(rect.width * dpr); canvas.height = Math.round(rect.height * dpr)
-      const webglCanvas = webglCanvasRef.current
-      if (webglCanvas) { webglCanvas.width = Math.round(rect.width * dpr); webglCanvas.height = Math.round(rect.height * dpr); webglCanvas.style.width = `${rect.width}px`; webglCanvas.style.height = `${rect.height}px` }
       if (!viewInitializedRef.current) {
         viewRef.current = { x: rect.width / 2, y: rect.height / 2, scale: 1 }
         viewInitializedRef.current = true
@@ -893,7 +755,6 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }
 
   return <div ref={hostRef} className={className} style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
-    <canvas ref={webglCanvasRef} aria-hidden="true" style={{ position: 'absolute', inset: 0, display: graph.nodes.length > LARGE_GRAPH_THRESHOLD && mode === '2d' ? 'block' : 'none', width: '100%', height: '100%', pointerEvents: 'none' }} />
     <canvas ref={canvasRef} aria-label={mode === '3d' ? 'Wikipedia article graph in 3D. Drag to orbit and scroll to zoom.' : 'Wikipedia article graph'} style={{ position: 'relative', display: 'block', width: '100%', height: '100%', cursor: dragRef.current ? 'grabbing' : 'grab', touchAction: 'none', background: 'transparent' }}
       onPointerDown={(event) => { const point = localPoint(event); const screen = screenPoint(event); const node = hit(modeRef.current === '3d' ? screen : point); event.currentTarget.setPointerCapture(event.pointerId); pressedNodeRef.current = node ?? null; if (modeRef.current === '3d') { if (node) return; if (event.shiftKey) panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } }; else rotateRef.current = { start: { x: event.clientX, y: event.clientY }, orbit: { ...orbitRef.current } }; return } if (node) { dragRef.current = { node, offset: { x: (node.x as number) - point.x, y: (node.y as number) - point.y } }; node.fx = node.x; node.fy = node.y } else panRef.current = { x: viewRef.current.x, y: viewRef.current.y, start: { x: event.clientX, y: event.clientY } } }}
       onPointerMove={(event) => { const point = localPoint(event); const screen = screenPoint(event); if (modeRef.current === '3d') { const rotate = rotateRef.current; if (rotate) { orbitRef.current.yaw = rotate.orbit.yaw + (event.clientX - rotate.start.x) * 0.008; orbitRef.current.pitch = Math.max(-1.2, Math.min(1.2, rotate.orbit.pitch + (event.clientY - rotate.start.y) * 0.006)); draw(); return } const pan = panRef.current; if (pan) { viewRef.current.x = pan.x + event.clientX - pan.start.x; viewRef.current.y = pan.y + event.clientY - pan.start.y; draw(); return } } const drag = dragRef.current; const node = drag?.node; if (node && drag) { node.fx = point.x + drag.offset.x; node.fy = point.y + drag.offset.y; if (!pausedRef.current) { simulationRef.current?.alpha(0.12); if (manualTickRef.current) { if (largeTickTimerRef.current == null) manualTickRef.current() } else simulationRef.current?.restart() }; draw(); return } const pan = panRef.current; if (pan) { viewRef.current.x = pan.x + event.clientX - pan.start.x; viewRef.current.y = pan.y + event.clientY - pan.start.y; draw(); return } const next = hit(modeRef.current === '3d' ? screen : point) ?? null; if (next !== hoverRef.current) { hoverRef.current = next; onHover?.(next); draw() } }}

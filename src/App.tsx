@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphSimulationSettings } from './components/GraphCanvas'
 import { fetchWikiGraphProgressive, usesLocalCorpus } from './data/wiki'
 import { selectHubIds } from './graph/hubs'
+import { decayedLinkDistanceScale, LINK_DISTANCE_SCALE_DECAY_MS, LINK_DISTANCE_SCALE_START } from './graph/linkDistanceDecay'
 import type { WikiGraph } from './types'
 
 function formatArticleSize(bytes?: number) {
@@ -93,11 +94,49 @@ export default function App() {
   const requestRef = useRef<AbortController | null>(null)
   const requestVersionRef = useRef(0)
   const canvasRef = useRef<GraphCanvasHandle>(null)
+  const linkDistanceDecayActiveRef = useRef(true)
+  const linkDistanceDecayTimerRef = useRef<number | null>(null)
   const updateSimulationSetting = useCallback(<K extends keyof GraphSimulationSettings>(key: K, value: GraphSimulationSettings[K]) => {
     setSimulationSettings((previous) => ({ ...previous, [key]: value }))
   }, [])
+  const stopLinkDistanceDecay = useCallback(() => {
+    linkDistanceDecayActiveRef.current = false
+    if (linkDistanceDecayTimerRef.current != null) {
+      window.clearInterval(linkDistanceDecayTimerRef.current)
+      linkDistanceDecayTimerRef.current = null
+    }
+  }, [])
+  const updateLinkDistanceScale = useCallback((value: number) => {
+    stopLinkDistanceDecay()
+    updateSimulationSetting('linkDistanceScale', value)
+  }, [stopLinkDistanceDecay, updateSimulationSetting])
+
+  const startLinkDistanceDecay = useCallback(() => {
+    stopLinkDistanceDecay()
+    linkDistanceDecayActiveRef.current = true
+    const startedAt = Date.now()
+    const update = () => {
+      if (!linkDistanceDecayActiveRef.current) return
+      const elapsed = Math.max(0, Date.now() - startedAt)
+      const nextScale = decayedLinkDistanceScale(elapsed)
+      setSimulationSettings((previous) => previous.linkDistanceScale === nextScale
+        ? previous
+        : { ...previous, linkDistanceScale: nextScale })
+      if (elapsed >= LINK_DISTANCE_SCALE_DECAY_MS) stopLinkDistanceDecay()
+    }
+    linkDistanceDecayTimerRef.current = window.setInterval(update, 100)
+  }, [stopLinkDistanceDecay])
+
+  useEffect(() => {
+    startLinkDistanceDecay()
+    return stopLinkDistanceDecay
+  }, [startLinkDistanceDecay, stopLinkDistanceDecay])
 
   const load = useCallback(async (amount: number) => {
+    startLinkDistanceDecay()
+    setSimulationSettings((previous) => previous.linkDistanceScale === LINK_DISTANCE_SCALE_START
+      ? previous
+      : { ...previous, linkDistanceScale: LINK_DISTANCE_SCALE_START })
     const version = ++requestVersionRef.current
     requestRef.current?.abort()
     const controller = new AbortController()
@@ -124,7 +163,7 @@ export default function App() {
     } finally {
       if (version === requestVersionRef.current) setLoading(false)
     }
-  }, [])
+  }, [startLinkDistanceDecay])
 
   useEffect(() => {
     void load(count)
@@ -159,13 +198,12 @@ export default function App() {
         const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
         return {
           ...node,
-          label: showLabels ? node.title : '',
           color: hubIds.has(node.id) ? '#254fef' : degree >= 4 ? '#6e86f2' : '#b6c4ff',
         }
       }),
       links: graph.links,
     }
-  }, [graph, showLabels])
+  }, [graph])
   const averageLinks = graph.nodes.length ? graph.links.length / graph.nodes.length : 0
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
@@ -187,12 +225,12 @@ export default function App() {
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
         <LogSlider id="article-count" label="" value={count} min={10} max={MAX_LOCAL_ARTICLES} step={10} center={1_000} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} />
         <div className="range-labels"><span>10</span><span>1,000</span><span>{MAX_LOCAL_ARTICLES.toLocaleString()}</span></div>
-        {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and GPU time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
+        {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and processing time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
         <button className="primary-button" onClick={() => void load(count)} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
         <div className="rule" />
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
-        <button className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-pressed={showLabels}><span>Article labels</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
+        <button type="button" className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-label={`${showLabels ? 'Hide' : 'Show'} article names`} aria-pressed={showLabels}><span>Article names</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
         <div className="view-mode-control" role="group" aria-label="Graph view">
           <span className="view-mode-label">Graph view</span>
           <div className="view-mode-options">
@@ -208,7 +246,7 @@ export default function App() {
           <PhysicsSlider id="setting-importance-charge" label="Article importance" value={simulationSettings.articleImportanceCharge} min={0} max={500} step={5} onChange={(value) => updateSimulationSetting('articleImportanceCharge', value)} />
           <PhysicsSlider id="setting-hub-charge" label="Hub repulsion" value={simulationSettings.hubCharge} min={0} max={3000} step={10} onChange={(value) => updateSimulationSetting('hubCharge', value)} />
           <PhysicsSlider id="setting-charge-distance" label="Charge radius" value={simulationSettings.chargeDistance} min={100} max={2000} step={10} onChange={(value) => updateSimulationSetting('chargeDistance', value)} />
-          <LogSlider id="setting-link-scale" label={`Link distance${simulationSettings.linkDistanceExponent === 3 ? '³' : '²'} scale`} value={simulationSettings.linkDistanceScale} min={1} max={300000} step={1} center={1_000} onChange={(value) => updateSimulationSetting('linkDistanceScale', value)} format={(value) => value.toLocaleString()} />
+          <LogSlider id="setting-link-scale" label={`Link distance${simulationSettings.linkDistanceExponent === 3 ? '³' : '²'} scale`} value={simulationSettings.linkDistanceScale} min={1} max={300000} step={1} center={1_000} onChange={updateLinkDistanceScale} format={(value) => value.toLocaleString()} />
           <button
             type="button"
             className="toggle-row distance-mode-toggle"
@@ -243,13 +281,13 @@ export default function App() {
           <PhysicsSlider id="setting-alpha-decay" label="Alpha decay" value={simulationSettings.alphaDecay} min={0.001} max={0.1} step={0.001} onChange={(value) => updateSimulationSetting('alphaDecay', value)} />
           <PhysicsSlider id="setting-alpha-min" label="Alpha minimum" value={simulationSettings.alphaMin} min={0.0001} max={0.02} step={0.0001} onChange={(value) => updateSimulationSetting('alphaMin', value)} />
           <PhysicsSlider id="setting-alpha-target" label="Running alpha target" value={simulationSettings.alphaTarget} min={0} max={0.2} step={0.005} onChange={(value) => updateSimulationSetting('alphaTarget', value)} />
-          <button type="button" className="settings-reset" onClick={() => setSimulationSettings({ ...DEFAULT_SIMULATION_SETTINGS })}>Reset physics values</button>
+          <button type="button" className="settings-reset" onClick={() => { stopLinkDistanceDecay(); setSimulationSettings({ ...DEFAULT_SIMULATION_SETTINGS }) }}>Reset physics values</button>
         </details>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
         <div className="canvas-toolbar"><span><b>{graph.nodes.length}</b> articles <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {error && <div className="notice" role="status">{error}</div>}
-        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} mode={graphMode} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
+        <GraphCanvas className="graph-canvas-host" ref={canvasRef} graph={graphForCanvas} mode={graphMode} showLabels={showLabels} selectedId={selectedId} onSelect={(node) => setSelectedId(node.id)} onHover={(node) => setHoveredId(node?.id ?? null)} onSimulationGuard={() => setError('Layout paused after a runaway link impulse. Reduce the link distance scale or generate a fresh map.')} paused={paused} settings={simulationSettings} />
         {loading && <div className="loading-overlay"><span className="spinner" />{progressLabel}</div>}
         {selected && <article className="inspector"><button className="close-button" onClick={() => setSelectedId(null)} aria-label="Close inspector">×</button><div className="eyebrow">ARTICLE INSPECTOR</div><h3>{selected.title}</h3><span className="category">WIKIPEDIA ARTICLE</span><p>{selected.extract ?? 'Explore this article and its connections in the knowledge graph.'}</p><div className="inspector-stat"><span>CONNECTIONS</span><b>{selectedLinks}</b></div><div className="inspector-degree"><span><b>{selected.outDegree ?? 0}</b> outbound</span><span><b>{selected.inDegree ?? 0}</b> inbound</span></div><div className="inspector-size"><span>ARTICLE SIZE</span><b>{formatArticleSize(selected.byteLength ?? selected.articleSize)}</b></div>{relatedArticles.length > 0 && <div className="related"><div className="field-label">CONNECTED ARTICLES</div><ul>{relatedArticles.map((node) => <li key={node.id}>{node.title}</li>)}</ul></div>}<a className="text-button" href={selected.url} target="_blank" rel="noreferrer">Open on Wikipedia ↗</a></article>}
       </section>
