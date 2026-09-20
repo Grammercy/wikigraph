@@ -31,6 +31,8 @@ export interface WikiGraph {
 /** Corpus-level metadata returned by the local dump-backed API. */
 export interface WikiStats {
   articles: number
+  /** Number of articles currently available from the graph endpoint. */
+  graphArticles?: number
   links?: number | null
   totalArticleBytes?: number | null
   pagesRead?: number

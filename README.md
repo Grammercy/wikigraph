@@ -11,7 +11,7 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 
 ## Controls
 
-- **Articles** — choose 10–100,000 articles, then select **Generate new map**. Local dump tiers stream in cumulatively; a warning and acknowledgement appear above 1,000 nodes.
+- **Articles** — choose a graph size from 10 through the full graph-ready local corpus, then select **Generate new map**. A warning and acknowledgement appear above 1,000 nodes.
 - **Displayed articles** — limit what is painted to the hubs and the most-connected articles. The layout still simulates every loaded article; selecting an article reveals its full connected neighbourhood until it is deselected.
 - **Physics engine** — pause or resume the force simulation.
 - **Article names** — show or hide node names beside graph nodes.
@@ -21,7 +21,7 @@ WikiGraph is an interactive 2D map of Wikipedia articles. Articles repel one ano
 
 ## Data and fallback behavior
 
-The hosted Pages build requests main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). The local build automatically uses the D:-drive API when it is available, progressively loading deterministic, link-connected 1k/5k/25k/100k tiers while the page remains open. Slider values between tiers are connected prefixes, so the local map does not pad a request with unrelated isolated pages. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
+The hosted Pages build requests main-namespace articles and their extracts/links from the public English Wikipedia API (`en.wikipedia.org/w/api.php`). The local build automatically uses the D:-drive API when it is available, progressively loading deterministic, link-connected 1k/5k/25k/100k tiers and a final tier containing the full indexed corpus while the page remains open. Slider values prefer connected prefixes; the final tier appends any disconnected or isolated downloaded records so the full-corpus option does not silently omit articles. If Wikipedia cannot be reached, WikiGraph displays a small local demo graph and marks the status as **DEMO DATA**. No Wikipedia dump or other large dataset is stored in this repository.
 
 ## Optional full-dump storage
 
@@ -50,7 +50,8 @@ npm run wiki:serve
 The local Vite server proxies `/api` to port 8787, and the production host
 serves the same API and UI from one origin. The complete English corpus remains
 on D: and is queryable through `/api/stats`, `/api/search`, and `/api/article`;
-the browser renders bounded progressive tiers so the tab stays responsive.
+the browser can request the final full-corpus tier explicitly, while the
+smaller progressive tiers keep normal exploration responsive.
 
 To serve the production website and local API from one origin, run
 `npm run wiki:host` and open `http://127.0.0.1:8787/`; it serves `dist/` with

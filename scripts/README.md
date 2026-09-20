@@ -75,8 +75,9 @@ scanned sequentially.
 
 After the normalized JSONL exists, build deterministic snapshots for
 progressive loading. The default tiers are 1,000, 5,000, 25,000, and 100,000
-articles; only the largest tier is retained in memory during the scan, and
-each output is committed with an atomic rename:
+articles plus a final tier sized to the complete indexed corpus; only the
+largest tier is retained in memory during the scan, and each output is
+committed with an atomic rename:
 
 ```powershell
 npm run wiki:tiers
@@ -86,9 +87,10 @@ node .\scripts\build-wiki-tiers.mjs --tiers 100,500,1000
 
 Outputs are written to `D:\WikiGraphData\index\tiers\<count>.json` with a
 `manifest.json`. Selection starts from a deterministic article and expands
-over real Wikipedia links, so every tier prefix is connected and every page
-has at least one neighbour (except the unavoidable one-page request). The
-same source produces nested, repeatable tiers instead of a request-order
+over real Wikipedia links, so smaller requests prefer a connected prefix. The
+final corpus tier appends any disconnected or isolated records after that
+prefix, ensuring the full-corpus control includes every downloaded article.
+The same source produces nested, repeatable tiers instead of a request-order
 dependent random sample. These files are external data and must not be
 committed to Git; the browser/API can load them incrementally and warn before
 selecting a large tier.
@@ -108,5 +110,7 @@ The service reads either `D:\WikiGraphData\index.json`, the JSONL index at
 prefixes for every slider count, including values between tier boundaries.
 It exposes `/health`, and serves the built frontend when run through
 `npm run wiki:host`. Without an index it serves a tiny deterministic graph for
-endpoint testing; it never downloads, parses raw XML, or loads the full
-corpus into the browser.
+endpoint testing; it never downloads or parses raw XML. A full-corpus graph
+request is explicit and can be large, so use the 1k/5k/25k/100k prefixes for
+interactive exploration when the complete index would exceed the browser's
+working memory.

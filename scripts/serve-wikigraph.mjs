@@ -33,11 +33,14 @@ let jsonlCache = null
 let corpusStatsCache = null
 let tierManifestCache = null
 const tierGraphCache = new Map()
-// Keep the existing 500-node default, while allowing the complete 100k
-// progressive tier for browser clients without attempting a full-corpus
-// response in one browser tab. Set WIKIGRAPH_MAX_GRAPH_NODES lower when a
-// machine needs a smaller working set.
-const CACHE_LIMIT = Math.max(500, Math.min(100_000, Number(process.env.WIKIGRAPH_MAX_GRAPH_NODES || 100_000) || 100_000))
+// Keep the existing 500-node default for requests that omit `count`, while
+// allowing a complete downloaded index when the client explicitly requests
+// it. Set WIKIGRAPH_MAX_GRAPH_NODES lower when a machine needs a smaller
+// working set; an unset value intentionally means "the whole local index".
+const configuredCacheLimit = Number(process.env.WIKIGRAPH_MAX_GRAPH_NODES)
+const CACHE_LIMIT = Number.isFinite(configuredCacheLimit) && configuredCacheLimit > 0
+  ? Math.max(500, Math.floor(configuredCacheLimit))
+  : Number.MAX_SAFE_INTEGER
 const key = (value) => String(value).trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US')
 const refValue = (value) => value && typeof value === 'object' ? value.id ?? value.title ?? '' : value
 const hash = (value) => { let h = 2166136261; for (const c of String(value)) h = Math.imul(h ^ c.codePointAt(0), 16777619); return h >>> 0 }
@@ -218,6 +221,11 @@ function readTier(count) {
   const manifest = readTierManifest()
   if (!manifest?.tiers?.length) return null
   const tier = manifest.tiers.find((candidate) => candidate.count >= count) || manifest.tiers.at(-1)
+  const tierCapacity = Number(tier.nodes ?? tier.count)
+  // If an older tier manifest stops at 100k but the normalized JSONL contains
+  // more records, let the streamable JSONL path satisfy a larger request
+  // instead of silently returning the old largest tier.
+  if (count > tierCapacity && existsSync(jsonlFile)) return null
   const fileName = typeof tier.file === 'string' ? tier.file : `${tier.count}.json`
   const file = resolve(tiersDir, fileName)
   const prefix = tiersDir.endsWith(sep) ? tiersDir : `${tiersDir}${sep}`
@@ -232,6 +240,22 @@ function readTier(count) {
     return { graph, count: tier.count }
   } catch { return null }
 }
+
+function tierGraphCapacity() {
+  const manifest = readTierManifest()
+  const largest = manifest?.tiers?.at(-1)
+  const tierValue = largest ? Number(largest.nodes ?? largest.count) : 0
+  let indexedValue = 0
+  if (existsSync(indexManifestFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(indexManifestFile, 'utf8'))
+      indexedValue = Number(parsed.records)
+    } catch { /* use the tier count when the manifest is unreadable */ }
+  }
+  const value = Math.max(tierValue, Number.isFinite(indexedValue) ? indexedValue : 0)
+  if (!value) return null
+  return Math.floor(Math.min(value, CACHE_LIMIT))
+}
 async function sampleJsonl(count) {
   if (!existsSync(jsonlFile)) return null
   const stat = statSync(jsonlFile)
@@ -242,13 +266,23 @@ async function sampleJsonl(count) {
     try {
       const article = JSON.parse(line)
       if (typeof article.title !== 'string') continue
-      selected.push({ ...article, id: article.id || article.title, url: article.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title).replaceAll('%20', '_')}` })
-      selected.sort((a, b) => hash(a.id) - hash(b.id))
-      // Keep a stable cache large enough for every slider value. The previous
-      // request must not determine how many articles are available later.
-      if (selected.length > CACHE_LIMIT) selected.pop()
+      const normalized = { ...article, id: article.id || article.title, url: article.url || `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title).replaceAll('%20', '_')}` }
+      if (selected.length < CACHE_LIMIT) {
+        // With the default unlimited cache this stays an O(n) append while a
+        // full corpus is streamed from disk; sort once after the read.
+        selected.push(normalized)
+      } else {
+        // Keep a deterministic hash sample when an operator explicitly sets a
+        // lower memory ceiling for the JSONL fallback path.
+        let worstIndex = 0
+        for (let index = 1; index < selected.length; index += 1) {
+          if (hash(selected[index].id) > hash(selected[worstIndex].id)) worstIndex = index
+        }
+        if (hash(normalized.id) < hash(selected[worstIndex].id)) selected[worstIndex] = normalized
+      }
     } catch { /* skip malformed rows */ }
   }
+  selected.sort((a, b) => hash(a.id) - hash(b.id) || String(a.id).localeCompare(String(b.id)))
   const byRef = new Map(selected.flatMap((article) => [[key(article.id), String(article.id)], [key(article.title), String(article.id)]]))
   const edgeKeys = new Set()
   const links = selected.flatMap((article) => (Array.isArray(article.links) ? article.links : []).flatMap((target) => {
@@ -268,12 +302,12 @@ async function sampleJsonl(count) {
 async function scanCorpus() {
   const tierManifest = readTierManifest()
   if (tierManifest?.scanned) {
-    return { articles: tierManifest.scanned, links: null, totalArticleBytes: null, indexed: true, source: 'tiers', tiers: tierManifest.tiers, updatedAt: tierManifest.completedAt ?? null }
+    return { articles: tierManifest.scanned, graphArticles: tierGraphCapacity() ?? tierManifest.selected ?? tierManifest.scanned, links: null, totalArticleBytes: null, indexed: true, source: 'tiers', tiers: tierManifest.tiers, updatedAt: tierManifest.completedAt ?? null }
   }
   if (!existsSync(jsonlFile) && existsSync(parserCheckpoint)) {
     try {
       const progress = JSON.parse(readFileSync(parserCheckpoint, 'utf8'))
-      return { articles: progress.recordsWritten ?? 0, pagesRead: progress.pagesRead ?? 0, indexed: false, building: true, source: 'parser', updatedAt: progress.updatedAt ?? null }
+      return { articles: progress.recordsWritten ?? 0, graphArticles: 0, pagesRead: progress.pagesRead ?? 0, indexed: false, building: true, source: 'parser', updatedAt: progress.updatedAt ?? null }
     } catch { /* continue to the fallback response */ }
   }
   if (!existsSync(jsonlFile)) {
@@ -290,6 +324,7 @@ async function scanCorpus() {
         const stat = statSync(indexManifestFile)
         return {
           articles: manifest.records,
+          graphArticles: tierGraphCapacity() ?? Math.min(manifest.records, CACHE_LIMIT),
           links: null,
           totalArticleBytes: null,
           indexed: true,
@@ -314,7 +349,7 @@ async function scanCorpus() {
       links += Array.isArray(article.links) ? article.links.length : 0
     } catch { /* skip malformed rows */ }
   }
-  const value = { articles, links, totalArticleBytes, indexed: true, source: 'jsonl', tiers: readTierManifest()?.tiers ?? [], updatedAt: new Date(stat.mtimeMs).toISOString() }
+  const value = { articles, graphArticles: tierGraphCapacity() ?? Math.min(articles, CACHE_LIMIT), links, totalArticleBytes, indexed: true, source: 'jsonl', tiers: readTierManifest()?.tiers ?? [], updatedAt: new Date(stat.mtimeMs).toISOString() }
   corpusStatsCache = { mtimeMs: stat.mtimeMs, size: stat.size, value }
   return value
 }
@@ -370,7 +405,7 @@ createServer(async (req, res) => {
   try {
     if (request.pathname === '/api/stats') {
       const stats = await scanCorpus()
-      return send(res, 200, stats || { articles: 0, links: 0, totalArticleBytes: 0, indexed: false, source: 'fallback' })
+      return send(res, 200, stats || { articles: 0, graphArticles: 0, links: 0, totalArticleBytes: 0, indexed: false, source: 'fallback' })
     }
     if (request.pathname === '/api/search') {
       const limit = Math.max(1, Math.min(100, Number(request.searchParams.get('limit') || 20) || 20))
@@ -388,8 +423,8 @@ createServer(async (req, res) => {
     let graph = null
     // Use the connected tier for every slider value when it exists. Small
     // requests take a prefix of the 1k tier, while larger requests take a
-    // prefix of the smallest adequate tier. This avoids reintroducing
-    // isolated nodes through the old hash-random sample path.
+    // prefix of the smallest adequate tier. If a request exceeds an older
+    // tier manifest, readTier deliberately yields to the complete JSONL path.
     let tier = readTier(count)
     if (tier) graph = sample(tier.graph, count)
     if (!graph && count <= 500 && existsSync(sampleFile)) { try { graph = sample(JSON.parse(readFileSync(sampleFile, 'utf8')), count) } catch { graph = null } }

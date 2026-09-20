@@ -17,7 +17,7 @@ import { articleDegree, selectHubIds } from '../graph/hubs'
 import { boundaryForce, boundaryRadius } from '../graph/boundary'
 import { articleRepulsionScale } from '../graph/density'
 import { roundSimulationNodesF32 } from '../graph/f32'
-import { createGpuGraphSimulation, nextPhysicsTickDelay, type PhysicsController } from '../graph/gpuSimulation'
+import { createGpuGraphSimulation, nextPhysicsTickDelay, PHYSICS_TICKS_PER_SECOND, type PhysicsController } from '../graph/gpuSimulation'
 import { layoutSpacing, seedLayout, symmetricAttraction, unrelatedRepulsion, hubInteractions } from '../graph/layout'
 
 export type GraphNode = SimulationNodeDatum & {
@@ -112,6 +112,10 @@ export type GraphSimulationSettings = {
   alphaTarget: number
 }
 
+const PHYSICS_COOLING_SECONDS = 30
+const DEFAULT_INITIAL_TEMPERATURE = 0.8
+const DEFAULT_ALPHA_MIN = 0.001
+
 export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
   baseCharge: 115,
   articleImportanceCharge: 126,
@@ -138,11 +142,14 @@ export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
   collisionIterations: 2,
   centerStrength: 0.035,
   velocityDecay: 0.4,
-  // Give the layout enough heat to cross shallow barriers, then let alpha
-  // decay to alphaMin so it can settle instead of running hot forever.
-  initialTemperature: 0.8,
-  alphaDecay: 0.01,
-  alphaMin: 0.001,
+  // D3 updates alpha once per tick. This decay reaches alphaMin in 30 seconds
+  // at 60 Hz when starting from the default initial temperature.
+  initialTemperature: DEFAULT_INITIAL_TEMPERATURE,
+  alphaDecay: 1 - Math.pow(
+    DEFAULT_ALPHA_MIN / DEFAULT_INITIAL_TEMPERATURE,
+    1 / (PHYSICS_TICKS_PER_SECOND * PHYSICS_COOLING_SECONDS),
+  ),
+  alphaMin: DEFAULT_ALPHA_MIN,
   alphaTarget: 0,
 }
 
@@ -154,6 +161,16 @@ type LayoutGraph = { nodes: GraphNode[]; links: GraphLink[] }
 type LayoutCache = { graph: GraphData | null; twoD: LayoutGraph | null; threeD: LayoutGraph | null }
 type RenderLink = { edge: GraphLink; index: number }
 type RenderSubset = { graph: LayoutGraph; visibleIds: ReadonlySet<string> | null; nodes: GraphNode[]; links: RenderLink[] }
+type LabelCandidate = {
+  node: GraphNode
+  x: number
+  y: number
+  radius: number
+  priority: number
+  active: boolean
+  isHub: boolean
+}
+type LabelRect = { left: number; top: number; right: number; bottom: number }
 
 const articleBytes = (node: GraphNode) => {
   const value = node.articleSize ?? node.byteLength ?? 0
@@ -234,9 +251,133 @@ const visualNodeRadius = (
   node: GraphNode,
   settings: GraphSimulationSettings = DEFAULT_SIMULATION_SETTINGS,
   scale = BASE_VISUAL_NODE_SCALE,
-) => nodeRadius(node, settings) * scale
+) => {
+  const physicsRadius = nodeRadius(node, settings)
+  // Sparse views enlarge dots for legibility, but never past a restrained
+  // fraction of the reserved collision gap. The physics remains responsible
+  // for spacing; the paint layer must not make correctly spaced centers look
+  // like nested nodes.
+  const visualCeiling = physicsRadius + Math.max(0, settings.collisionPadding) * 0.35
+  return Math.min(physicsRadius * scale, visualCeiling)
+}
+// Collision corrections are applied to velocity, then velocity decay is
+// applied before integration. Scale the correction so one pass can still
+// clear the requested gap instead of leaving a persistent overlap.
+const collisionStrength = (settings: GraphSimulationSettings) =>
+  1 / Math.max(0.25, 1 - Math.max(0, Math.min(0.9, settings.velocityDecay)))
 const LARGE_GRAPH_THRESHOLD = 2_000
 const HUB_OUTLINE_COLOR = '#2f9e44'
+const LABEL_MAX_LENGTH = 28
+const labelText = (node: GraphNode) => {
+  const text = node.label ?? node.title ?? node.id
+  return text.length > LABEL_MAX_LENGTH ? `${text.slice(0, LABEL_MAX_LENGTH - 1)}…` : text
+}
+const labelBudget = (count: number, zoom: number, hubCount: number, showAll: boolean) => {
+  if (showAll || count <= 12) return count
+  const base = count <= 40 ? 8 : count <= 100 ? 12 : count <= 250 ? 18 : count <= 800 ? 28 : 420
+  const zoomBoost = zoom >= 1.45 ? 2.2 : zoom >= 1.05 ? 1.55 : zoom < 0.5 ? 0.7 : 1
+  return Math.min(count, Math.max(hubCount + 4, Math.ceil(base * zoomBoost)))
+}
+const labelPriority = (node: GraphNode, active: boolean, isHub: boolean) => {
+  if (active) return 1_000_000
+  if (isHub) return 100_000 + articleDegree(node) * 10
+  return articleDegree(node)
+}
+const overlaps = (first: LabelRect, second: LabelRect, padding: number) =>
+  first.left < second.right + padding && first.right > second.left - padding
+    && first.top < second.bottom + padding && first.bottom > second.top - padding
+const circleTouchesRect = (circle: { x: number; y: number; radius: number }, rect: LabelRect, padding: number) => {
+  const x = Math.max(rect.left, Math.min(circle.x, rect.right))
+  const y = Math.max(rect.top, Math.min(circle.y, rect.bottom))
+  return Math.hypot(circle.x - x, circle.y - y) < circle.radius + padding
+}
+const repairNodeOverlaps = (nodes: GraphNode[], dimensions: 2 | 3, settings: GraphSimulationSettings) => {
+  if (nodes.length === 0 || nodes.length > LARGE_GRAPH_THRESHOLD) return
+  const radii = nodes.map((node) => nodeRadius(node, settings) + Math.max(0, settings.collisionPadding))
+  const cellSize = Math.max(16, Math.max(...radii) * 2)
+  const passes = Math.max(2, Math.min(4, Math.round(settings.collisionIterations) + 1))
+  for (let pass = 0; pass < passes; pass += 1) {
+    const cells = new Map<string, number[]>()
+    const cellOf = (node: GraphNode) => {
+      const x = Math.floor((node.x ?? 0) / cellSize)
+      const y = Math.floor((node.y ?? 0) / cellSize)
+      const z = dimensions === 3 ? Math.floor((node.z ?? 0) / cellSize) : 0
+      return { x, y, z, key: `${x}:${y}:${z}` }
+    }
+    const locations = nodes.map((node) => cellOf(node))
+    for (let index = 0; index < nodes.length; index += 1) {
+      const bucket = cells.get(locations[index].key)
+      if (bucket) bucket.push(index)
+      else cells.set(locations[index].key, [index])
+    }
+    for (let index = 0; index < nodes.length; index += 1) {
+      const node = nodes[index]
+      const own = locations[index]
+      for (let ox = -1; ox <= 1; ox += 1) {
+        for (let oy = -1; oy <= 1; oy += 1) {
+          const minZ = dimensions === 3 ? -1 : 0
+          const maxZ = dimensions === 3 ? 1 : 0
+          for (let oz = minZ; oz <= maxZ; oz += 1) {
+            for (const otherIndex of cells.get(`${own.x + ox}:${own.y + oy}:${own.z + oz}`) ?? []) {
+              if (otherIndex <= index) continue
+              const other = nodes[otherIndex]
+              let dx = (other.x ?? 0) - (node.x ?? 0)
+              let dy = (other.y ?? 0) - (node.y ?? 0)
+              let dz = dimensions === 3 ? (other.z ?? 0) - (node.z ?? 0) : 0
+              let distance = Math.hypot(dx, dy, dz)
+              if (distance < 1e-6) {
+                const angle = (index * 0.7548776662 + otherIndex * 1.3247179572) * Math.PI * 2
+                dx = Math.cos(angle)
+                dy = Math.sin(angle)
+                dz = dimensions === 3 ? Math.sin(angle * 0.61) : 0
+                distance = Math.hypot(dx, dy, dz)
+              }
+              const combined = radii[index] + radii[otherIndex]
+              if (distance >= combined) continue
+              const firstPinned = node.fx != null || node.fy != null || (dimensions === 3 && node.fz != null)
+              const secondPinned = other.fx != null || other.fy != null || (dimensions === 3 && other.fz != null)
+              if (firstPinned && secondPinned) continue
+              const nx = dx / distance
+              const ny = dy / distance
+              const nz = dz / distance
+              const overlap = (combined - distance) * 0.72
+              const firstWeight = radii[otherIndex] ** 2 / Math.max(1e-6, radii[index] ** 2 + radii[otherIndex] ** 2)
+              const secondWeight = 1 - firstWeight
+              const firstMove = secondPinned ? 0 : firstPinned ? overlap : overlap * firstWeight
+              const secondMove = firstPinned ? 0 : secondPinned ? overlap : overlap * secondWeight
+              if (firstMove > 0) {
+                node.x = (node.x ?? 0) - nx * firstMove
+                node.y = (node.y ?? 0) - ny * firstMove
+                if (dimensions === 3) node.z = (node.z ?? 0) - nz * firstMove
+              }
+              if (secondMove > 0) {
+                other.x = (other.x ?? 0) + nx * secondMove
+                other.y = (other.y ?? 0) + ny * secondMove
+                if (dimensions === 3) other.z = (other.z ?? 0) + nz * secondMove
+              }
+              const relativeVelocity = ((other.vx ?? 0) - (node.vx ?? 0)) * nx
+                + ((other.vy ?? 0) - (node.vy ?? 0)) * ny
+                + (dimensions === 3 ? ((other.vz ?? 0) - (node.vz ?? 0)) * nz : 0)
+              if (relativeVelocity < 0) {
+                const impulse = -relativeVelocity * 0.5
+                if (!firstPinned) {
+                  node.vx = (node.vx ?? 0) - nx * impulse * firstWeight
+                  node.vy = (node.vy ?? 0) - ny * impulse * firstWeight
+                  if (dimensions === 3) node.vz = (node.vz ?? 0) - nz * impulse * firstWeight
+                }
+                if (!secondPinned) {
+                  other.vx = (other.vx ?? 0) + nx * impulse * secondWeight
+                  other.vy = (other.vy ?? 0) + ny * impulse * secondWeight
+                  if (dimensions === 3) other.vz = (other.vz ?? 0) + nz * impulse * secondWeight
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
 
@@ -426,6 +567,83 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     }
   }
 
+  const drawPlacedLabels = (
+    ctx: CanvasRenderingContext2D,
+    candidates: LabelCandidate[],
+    allNodes: Array<{ x: number; y: number; radius: number }>,
+    bounds: { minX: number; maxX: number; minY: number; maxY: number },
+    screenScale: number,
+    showAll: boolean,
+  ) => {
+    if (!candidates.length || !showLabelsRef.current) return
+    const zoom = modeRef.current === '3d' ? 1 : viewRef.current.scale
+    const selectedCandidates = candidates
+      .slice()
+      .sort((first, second) => second.priority - first.priority)
+    const required = selectedCandidates.filter((candidate) => candidate.active || candidate.isHub)
+    const optional = selectedCandidates.filter((candidate) => !candidate.active && !candidate.isHub)
+    const budget = labelBudget(candidates.length, zoom, required.filter((candidate) => candidate.isHub).length, showAll)
+    const allowed = showAll
+      ? selectedCandidates
+      : required.concat(optional.slice(0, Math.max(0, budget - required.length)))
+    const occupied: LabelRect[] = []
+    const nodeObstacles = allNodes.length <= 800 ? allNodes : []
+    const gap = Math.max(5, 7 / Math.max(0.25, screenScale))
+    const padding = Math.max(3, 4 / Math.max(0.25, screenScale))
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'top'
+    for (const candidate of allowed) {
+      const fontSize = modeRef.current === '3d'
+        ? Math.max(9, Math.min(15, 10.5 * Math.max(0.85, screenScale)))
+        : Math.min(32, Math.max(9, 10.5 / Math.max(0.25, screenScale)))
+      ctx.font = `${candidate.active || candidate.isHub ? 600 : 500} ${fontSize}px 'Space Grotesk', ui-sans-serif, system-ui, sans-serif`
+      const text = labelText(candidate.node)
+      const width = ctx.measureText(text).width
+      const height = fontSize * 1.18
+      const positions = [
+        { x: candidate.x, y: candidate.y + candidate.radius + gap },
+        { x: candidate.x, y: candidate.y - candidate.radius - gap - height },
+        { x: candidate.x + candidate.radius + gap + width / 2, y: candidate.y - height / 2 },
+        { x: candidate.x - candidate.radius - gap - width / 2, y: candidate.y - height / 2 },
+        { x: candidate.x + candidate.radius + gap + width / 2, y: candidate.y + candidate.radius + gap },
+        { x: candidate.x - candidate.radius - gap - width / 2, y: candidate.y + candidate.radius + gap },
+      ]
+      let placement: { x: number; y: number; rect: LabelRect } | null = null
+      for (const position of positions) {
+        const rect = { left: position.x - width / 2, top: position.y, right: position.x + width / 2, bottom: position.y + height }
+        if (rect.right < bounds.minX || rect.left > bounds.maxX || rect.bottom < bounds.minY || rect.top > bounds.maxY) continue
+        if (occupied.some((other) => overlaps(rect, other, padding))) continue
+        if (nodeObstacles.some((node) => node.x !== candidate.x && circleTouchesRect(node, rect, padding))) continue
+        placement = { x: position.x, y: position.y, rect }
+        break
+      }
+      if (!placement) continue
+      occupied.push(placement.rect)
+      const nodeEdgeX = candidate.x
+      const nodeEdgeY = candidate.y + (placement.y >= candidate.y ? candidate.radius : -candidate.radius)
+      const labelEdgeY = placement.y >= candidate.y ? placement.rect.top : placement.rect.bottom
+      if (Math.abs(placement.x - nodeEdgeX) > candidate.radius + gap * 0.5 || Math.abs(labelEdgeY - nodeEdgeY) > candidate.radius + gap * 0.5) {
+        ctx.save()
+        ctx.globalAlpha = candidate.active ? 0.5 : 0.22
+        ctx.strokeStyle = candidate.isHub ? HUB_OUTLINE_COLOR : '#9aa4b8'
+        ctx.lineWidth = modeRef.current === '3d' ? 0.7 : 0.7 / Math.max(0.25, screenScale)
+        ctx.beginPath()
+        ctx.moveTo(nodeEdgeX, nodeEdgeY)
+        ctx.lineTo(placement.x, labelEdgeY)
+        ctx.stroke()
+        ctx.restore()
+      }
+      ctx.save()
+      ctx.globalAlpha = candidate.active ? 1 : candidate.isHub ? 0.9 : 0.72
+      ctx.lineWidth = modeRef.current === '3d' ? 3 : 3 / Math.max(0.25, screenScale)
+      ctx.strokeStyle = 'rgba(255, 255, 255, .94)'
+      ctx.strokeText(text, placement.x, placement.y)
+      ctx.fillStyle = candidate.active ? '#1c2027' : '#555c68'
+      ctx.fillText(text, placement.x, placement.y)
+      ctx.restore()
+    }
+  }
+
   const draw3D = (ctx: CanvasRenderingContext2D, currentGraph: LayoutGraph, selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
     const { nodes, links } = currentGraph
     const radius = boundaryRadius(nodes.length, 3)
@@ -433,7 +651,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const renderSubset = getRenderSubset(currentGraph)
     const visibleNodes = renderSubset.nodes
     const dotScale = visualNodeScale(visibleNodes.length, nodes.length, viewRef.current.scale, hubIds.size)
-    const showAllVisibleLabels = showAllLabelsRef.current || visibleNodes.length <= Math.max(80, hubIds.size)
+    const showAllVisibleLabels = showAllLabelsRef.current || visibleNodes.length <= 12
     ctx.save()
     ctx.strokeStyle = 'rgba(115, 119, 127, 0.28)'
     ctx.lineWidth = 1
@@ -494,9 +712,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     }
     const sortedNodes = visibleNodes.map((node) => ({ node, point: projected.get(node) })).filter((item): item is { node: GraphNode; point: ReturnType<typeof project3D> } => Boolean(item.point))
     if (sortedNodes.length <= 10_000) sortedNodes.sort((a, b) => b.point.depth - a.point.depth)
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'top'
-    ctx.font = `500 ${Math.max(9, Math.round(11 * dotScale))}px Inter, ui-sans-serif, system-ui, sans-serif`
+    const labelCandidates: LabelCandidate[] = []
     for (const { node, point } of sortedNodes) {
       const radius = visualNodeRadius(node, settingsRef.current, dotScale) * point.perspective * viewRef.current.scale
       const activeRing = 5 * viewRef.current.scale
@@ -518,53 +734,41 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.strokeStyle = isHub ? HUB_OUTLINE_COLOR : node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
       ctx.lineWidth = node === selected ? 2 : isHub ? 1.6 : 1
       ctx.stroke()
-      if (!showLabelsRef.current) continue
-      const text = node.label ?? node.title ?? node.id
-      if (showAllVisibleLabels || active || point.perspective > 0.92) {
-        ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
-        ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, point.x, point.y + radius + 5)
+      if (showLabelsRef.current) {
+        labelCandidates.push({ node, x: point.x, y: point.y, radius, priority: labelPriority(node, active, isHub), active, isHub })
       }
     }
+    drawPlacedLabels(
+      ctx,
+      labelCandidates,
+      sortedNodes.map(({ node, point }) => ({ x: point.x, y: point.y, radius: visualNodeRadius(node, settingsRef.current, dotScale) * point.perspective * viewRef.current.scale })),
+      { minX: 0, maxX: sizeRef.current.width, minY: 0, maxY: sizeRef.current.height },
+      1,
+      showAllVisibleLabels,
+    )
   }
 
   const drawLargeGraphLabels = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], hubIds: ReadonlySet<string>, selected: GraphNode | undefined, hovered: GraphNode | null, dotScale: number, showAllVisibleLabels: boolean) => {
     if (!showLabelsRef.current) return
-    // Keep dense maps legible, but let zooming out reveal a broader sample when
-    // fewer dots are being painted. Hubs remain labelled at every zoom level.
-    const zoom = viewRef.current.scale
-    const baseLabelBudget = nodes.length > 20_000 ? 300 : nodes.length > 8_000 ? 400 : nodes.length > 2_000 ? 520 : 950
-    const zoomBoost = zoom < 0.58 ? 2.4 : zoom < 0.85 ? 1.7 : zoom < 1.15 ? 1.25 : 1
-    const labelBudget = Math.min(nodes.length, Math.ceil(baseLabelBudget * zoomBoost))
-    const labelStride = showAllVisibleLabels ? 1 : Math.max(1, Math.ceil(nodes.length / Math.max(1, labelBudget)))
-    const minimumDegree = showAllVisibleLabels ? 0 : zoom < 0.85 ? 0 : zoom > 1.15 ? 0 : 8
-    const degreeReference = Math.max(10, settingsRef.current.hubDegreeReference)
-    ctx.save()
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'top'
-    for (let index = 0; index < nodes.length; index += 1) {
-      const node = nodes[index]
+    const candidates: LabelCandidate[] = []
+    const allNodes: Array<{ x: number; y: number; radius: number }> = []
+    for (const node of nodes) {
       if (node.x == null || node.y == null) continue
       const active = node === selected || node === hovered
-      const degree = articleDegree(node)
       const isHub = hubIds.has(node.id)
-      const show = showAllVisibleLabels || isHub || active || (degree >= minimumDegree && index % labelStride === 0)
-      if (!show) continue
-      const importance = Math.min(1, Math.log1p(degree) / Math.log1p(degreeReference))
-      const fontSize = (9 + importance * 3 + (active ? 1 : 0)) * dotScale
-      const text = node.label ?? node.title ?? node.id
-      const label = text.length > 30 ? `${text.slice(0, 28)}…` : text
-      const y = node.y + visualNodeRadius(node, settingsRef.current, dotScale) + 5
-      ctx.font = `${active || isHub ? 600 : 500} ${fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`
-      ctx.globalAlpha = active ? 1 : 0.48 + importance * 0.42
-      // A light halo keeps names readable over the dense link field.
-      ctx.lineWidth = 3
-      ctx.strokeStyle = 'rgba(255, 255, 255, .9)'
-      ctx.strokeText(label, node.x, y)
-      ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
-      ctx.fillText(label, node.x, y)
+      const radius = visualNodeRadius(node, settingsRef.current, dotScale)
+      allNodes.push({ x: node.x, y: node.y, radius })
+      candidates.push({ node, x: node.x, y: node.y, radius, priority: labelPriority(node, active, isHub), active, isHub })
     }
-    ctx.globalAlpha = 1
-    ctx.restore()
+    const view = viewRef.current
+    drawPlacedLabels(
+      ctx,
+      candidates,
+      allNodes,
+      { minX: -view.x / view.scale, maxX: (sizeRef.current.width - view.x) / view.scale, minY: -view.y / view.scale, maxY: (sizeRef.current.height - view.y) / view.scale },
+      view.scale,
+      showAllVisibleLabels,
+    )
   }
 
   const draw = () => {
@@ -593,13 +797,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const renderLargeGraph = largeGraph && visibleNodes.length > LARGE_GRAPH_THRESHOLD
     const hubIds = getHubIds(nodes, currentGraph.links)
     const dotScale = visualNodeScale(visibleNodes.length, nodes.length, view.scale, hubIds.size)
-    const showAllVisibleLabels = showAllLabelsRef.current || visibleNodes.length <= Math.max(80, hubIds.size)
-    const visibleLabelBudget = visibleNodes.length <= 120
-      ? visibleNodes.length
-      : visibleNodes.length <= 500
-        ? Math.ceil(visibleNodes.length * 0.8)
-        : Math.min(950, Math.ceil(visibleNodes.length * 0.55))
-    const visibleLabelStride = Math.max(1, Math.ceil(visibleNodes.length / Math.max(1, visibleLabelBudget)))
+    const showAllVisibleLabels = showAllLabelsRef.current || visibleNodes.length <= 12
     const cachedNodeMap = nodeMapRef.current?.graph === currentGraph
       ? nodeMapRef.current.map
       : new Map(nodes.map((node) => [node.id, node]))
@@ -654,11 +852,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.closePath()
       ctx.fill()
     }
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'top'
-    ctx.font = `500 ${Math.max(9, Math.round(11 * dotScale))}px Inter, ui-sans-serif, system-ui, sans-serif`
-    for (let visibleIndex = 0; visibleIndex < visibleNodes.length; visibleIndex += 1) {
-      const node = visibleNodes[visibleIndex]
+    const labelCandidates: LabelCandidate[] = []
+    for (const node of visibleNodes) {
       if (node.x == null || node.y == null) continue
       const radius = visualNodeRadius(node, settingsRef.current, dotScale)
       const active = node === selected || node === hovered
@@ -676,17 +871,17 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.strokeStyle = isHub ? HUB_OUTLINE_COLOR : node === selected ? '#254fef' : 'rgba(28, 32, 39, .28)'
       ctx.lineWidth = node === selected ? 2 : isHub ? 1.6 : 1
       ctx.stroke()
-      if (!showLabelsRef.current) continue
-      const text = node.label ?? node.title ?? node.id
-      // Keep the regular canvas path lightweight; large-map labels are drawn
-      // by the level-of-detail overlay below.
-      const showLabel = showAllVisibleLabels || active || (view.scale <= 0.58 && visibleIndex % visibleLabelStride === 0) || view.scale > 0.58
-      if (!renderLargeGraph && showLabel) {
-        ctx.fillStyle = node === selected ? '#1c2027' : '#555c68'
-        ctx.fillText(text.length > 30 ? `${text.slice(0, 28)}…` : text, node.x, node.y + radius + 5)
-      }
+      if (showLabelsRef.current) labelCandidates.push({ node, x: node.x, y: node.y, radius, priority: labelPriority(node, active, isHub), active, isHub })
     }
-    if (renderLargeGraph) drawLargeGraphLabels(ctx, visibleNodes, hubIds, selected, hovered, dotScale, showAllLabelsRef.current)
+    if (renderLargeGraph) drawLargeGraphLabels(ctx, visibleNodes, hubIds, selected, hovered, dotScale, showAllVisibleLabels)
+    else drawPlacedLabels(
+      ctx,
+      labelCandidates,
+      visibleNodes.filter((node): node is GraphNode & { x: number; y: number } => node.x != null && node.y != null).map((node) => ({ x: node.x, y: node.y, radius: visualNodeRadius(node, settingsRef.current, dotScale) })),
+      { minX: -view.x / view.scale, maxX: (width - view.x) / view.scale, minY: -view.y / view.scale, maxY: (height - view.y) / view.scale },
+      view.scale,
+      showAllVisibleLabels,
+    )
     ctx.restore()
     if (nodes.length > 0 && activeGraphRef.current === graphRef.current && graphRenderedRef.current !== graphRef.current) {
       graphRenderedRef.current = graphRef.current
@@ -742,6 +937,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const repulsionScale = articleRepulsionScale(layoutGraph.nodes, layoutGraph.links)
     seedLayout(layoutGraph.nodes, dimensions)
     roundSimulationNodesF32(layoutGraph.nodes, dimensions)
+    repairNodeOverlaps(layoutGraph.nodes, dimensions, settings)
+    roundSimulationNodesF32(layoutGraph.nodes, dimensions)
     // Keep every edge available for rendering, but cap the per-tick attraction
     // work in large maps. The representative stride preserves the overall
     // topology while preventing a dense dump tier from freezing the tab.
@@ -756,6 +953,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     let activeSimulation: PhysicsController | null = null
     const protectNumerics = largeGraph || settings.linkDistanceScale < 10_000 || settings.linkDistanceExponent > 2
     const afterTick = () => {
+      roundSimulationNodesF32(layoutGraph.nodes, dimensions)
+      repairNodeOverlaps(layoutGraph.nodes, dimensions, settingsRef.current)
       roundSimulationNodesF32(layoutGraph.nodes, dimensions)
       simulationTicks += 1
       if ((import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV && hostRef.current) {
@@ -807,6 +1006,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
           .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 3, () => settingsRef.current))
           .force('collision', forceCollide3D()
             .radius((node: GraphNode) => nodeRadius(node, settings) + settings.collisionPadding)
+            .strength(collisionStrength(settings))
             .iterations(Math.max(1, Math.round(settings.collisionIterations))))
       } else {
         sim
@@ -817,7 +1017,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
           .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
           .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 2, hubIds, () => settingsRef.current))
           .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 2, () => settingsRef.current))
-          .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + settings.collisionPadding).iterations(Math.max(1, Math.round(settings.collisionIterations))))
+          .force('collision', forceCollide<GraphNode>()
+            .radius((node) => nodeRadius(node, settings) + settings.collisionPadding)
+            .strength(collisionStrength(settings))
+            .iterations(Math.max(1, Math.round(settings.collisionIterations))))
       }
       sim
         .force('boundary', boundaryForce(boundaryRadius(layoutGraph.nodes.length, dimensions), dimensions))

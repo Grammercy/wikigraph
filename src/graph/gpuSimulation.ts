@@ -764,7 +764,7 @@ fn collision_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
           let distance = sqrt(max(1e-20, squared));
           let other_radius_squared = other_radius * other_radius;
           let weight = other_radius_squared / max(1e-20, own_radius_squared + other_radius_squared);
-          impulse += delta / distance * (combined - distance) * weight;
+          impulse += delta / distance * (combined - distance) * weight * collision_params.link.w;
         }
       }
     }
@@ -964,6 +964,7 @@ class GpuPhysicsKernel {
     floats[16] = Math.fround(Math.max(1, settings.linkDistanceScale))
     floats[17] = settings.linkDistanceExponent
     floats[18] = 1_024
+    floats[19] = Math.fround(1 / Math.max(0.25, 1 - Math.max(0, Math.min(0.9, settings.velocityDecay))))
     floats[20] = Math.fround(settings.hubTerritoryBase)
     floats[21] = Math.fround(settings.hubTerritoryScale)
     floats[22] = Math.fround(settings.hubForceBase)

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type GraphCanvasMode, type GraphData, type GraphSimulationSettings } from './components/GraphCanvas'
-import { fetchWikiGraphProgressive, usesLocalCorpus } from './data/wiki'
+import { fetchWikiGraphProgressive, fetchWikiStats, usesLocalCorpus } from './data/wiki'
 import { selectHubIds } from './graph/hubs'
 import { decayedLinkDistanceScale, LINK_DISTANCE_SCALE_DECAY_MS, LINK_DISTANCE_SCALE_PHYSICS_STEP_MS, LINK_DISTANCE_SCALE_START } from './graph/linkDistanceDecay'
 import { selectVisibleArticleIds } from './graph/visibility'
-import type { WikiGraph } from './types'
+import type { WikiGraph, WikiStats } from './types'
 
 function formatArticleSize(bytes?: number) {
   if (!Number.isFinite(bytes) || (bytes ?? 0) <= 0) return 'unknown'
@@ -102,7 +102,8 @@ function LogSlider({ id, label, value, min, max, step, center, onChange, format,
 
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
-  const MAX_LOCAL_ARTICLES = 100_000
+  const DEFAULT_LOCAL_ARTICLES = 100_000
+  const PUBLIC_MAX_ARTICLES = 500
   const [count, setCount] = useState(50)
   const [displayCount, setDisplayCount] = useState(0)
   const [graph, setGraph] = useState<WikiGraph>({ nodes: [], links: [] })
@@ -119,6 +120,7 @@ export default function App() {
   const [finderActiveIndex, setFinderActiveIndex] = useState(0)
   const [loadProgress, setLoadProgress] = useState({ loaded: 0, requested: 0 })
   const [largeMapAcknowledged, setLargeMapAcknowledged] = useState(false)
+  const [corpusStats, setCorpusStats] = useState<WikiStats | null>(null)
   const [simulationSettings, setSimulationSettings] = useState<GraphSimulationSettings>(() => ({ ...DEFAULT_SIMULATION_SETTINGS }))
   const requestRef = useRef<AbortController | null>(null)
   const requestVersionRef = useRef(0)
@@ -131,6 +133,19 @@ export default function App() {
   // Keep the display slider proportional when a newly generated graph has a
   // different number of loaded articles.
   const displayRatioRef = useRef(1)
+  const reportedGraphArticles = corpusStats?.graphArticles && corpusStats.graphArticles > 0
+    ? corpusStats.graphArticles
+    : corpusStats?.articles && corpusStats.articles > 0
+      ? corpusStats.articles
+      : DEFAULT_LOCAL_ARTICLES
+  const articleMaximum = usesLocalCorpus
+    ? Math.max(1, Math.floor(reportedGraphArticles))
+    : PUBLIC_MAX_ARTICLES
+  const articleMinimum = Math.min(10, articleMaximum)
+  const articleTicks = useMemo(() => {
+    const values = [...new Set([articleMinimum, 1_000, articleMaximum].filter((value) => value <= articleMaximum))]
+    return values.sort((a, b) => a - b).map((value) => ({ value, label: value.toLocaleString() }))
+  }, [articleMaximum, articleMinimum])
   const updateSimulationSetting = useCallback(<K extends keyof GraphSimulationSettings>(key: K, value: GraphSimulationSettings[K]) => {
     setSimulationSettings((previous) => ({ ...previous, [key]: value }))
   }, [])
@@ -161,6 +176,20 @@ export default function App() {
   }, [stopLinkDistanceDecay])
 
   useEffect(() => () => stopLinkDistanceDecay(), [stopLinkDistanceDecay])
+
+  useEffect(() => {
+    if (!usesLocalCorpus) return
+    const controller = new AbortController()
+    void fetchWikiStats(controller.signal).then((stats) => {
+      if (controller.signal.aborted || !stats) return
+      setCorpusStats(stats)
+    })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    setCount((previous) => Math.min(previous, articleMaximum))
+  }, [articleMaximum])
 
   const load = useCallback(async (amount: number) => {
     linkDistanceDecayPendingRef.current = true
@@ -360,7 +389,7 @@ export default function App() {
     <section className="workspace">
       <aside className="control-panel">
         <label className="field-label" htmlFor="article-count">ARTICLES <output>{count}</output></label>
-        <LogSlider id="article-count" label="" value={count} min={10} max={MAX_LOCAL_ARTICLES} step={10} center={1_000} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} ticks={[{ value: 10, label: '10' }, { value: 1_000, label: '1,000' }, { value: MAX_LOCAL_ARTICLES, label: MAX_LOCAL_ARTICLES.toLocaleString() }]} />
+        <LogSlider id="article-count" label="" value={Math.max(articleMinimum, Math.min(count, articleMaximum))} min={articleMinimum} max={articleMaximum} step={10} center={Math.min(1_000, articleMaximum)} onChange={(value) => { setCount(value); setLargeMapAcknowledged(false) }} format={(value) => Math.round(value).toLocaleString()} ticks={articleTicks} />
         {displayMaximum > 0 && <>
           <label className="field-label displayed-articles-label" htmlFor="displayed-article-count">DISPLAYED ARTICLES <output>{effectiveDisplayCount.toLocaleString()}</output></label>
           <LogSlider id="displayed-article-count" label="" value={effectiveDisplayCount} min={displayMinimum} max={displayMaximum} step={1} center={displaySliderCenter} onChange={updateDisplayCount} disabled={displayMinimum >= displayMaximum} format={(value) => Math.round(value).toLocaleString()} />
@@ -372,7 +401,7 @@ export default function App() {
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
         <button type="button" className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-label={`${showLabels ? 'Hide' : 'Show'} article names`} aria-pressed={showLabels}><span>Article names</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
-        <button type="button" className="toggle-row" onClick={() => setShowAllLabels(!showAllLabels)} aria-label={`${showAllLabels ? 'Stop showing' : 'Always show'} all article names for visible articles`} aria-pressed={showAllLabels} disabled={!showLabels}><span>Always show all names</span><span className={`toggle ${showAllLabels ? 'on' : ''}`}><i /></span></button>
+        <button type="button" className="toggle-row" onClick={() => setShowAllLabels(!showAllLabels)} aria-label={`${showAllLabels ? 'Show fewer' : 'Show all'} article names`} aria-pressed={showAllLabels} disabled={!showLabels}><span>Show all names</span><span className={`toggle ${showAllLabels ? 'on' : ''}`}><i /></span></button>
         <div className="view-mode-control" role="group" aria-label="Graph view">
           <span className="view-mode-label">Graph view</span>
           <div className="view-mode-options">

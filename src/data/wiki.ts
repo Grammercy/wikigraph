@@ -56,7 +56,10 @@ const localHost = typeof window !== 'undefined' && (window.location.hostname ===
 // Local development and the D:-drive production host share the same API
 // contract. GitHub Pages and other public hosts stay on Wikipedia's API.
 const LOCAL_INDEX_URL = configuredLocalIndex || (localHost ? '/api/graph' : undefined)
-const LOCAL_MAX_NODES = 100_000
+// The local corpus size is discovered from /api/stats. Keep this transport
+// guard above any realistic Wikipedia dump so a complete downloaded index is
+// not silently truncated before the request reaches the local server.
+const LOCAL_MAX_NODES = Number.MAX_SAFE_INTEGER
 export const usesLocalCorpus = Boolean(LOCAL_INDEX_URL)
 
 function isWikiGraph(value: unknown): value is WikiGraph {
@@ -435,7 +438,7 @@ export async function fetchWikiGraphProgressive(
     // Local tiers are nested snapshots. A small preview makes the interface
     // useful immediately, then one requested-size response replaces it with
     // the complete graph and correct degree metadata. Repeatedly fetching and
-    // merging every intermediate tier made a 100k request needlessly parse
+    // merging every intermediate tier would make a large request parse
     // more than twice as many records and restart the simulation each time.
     const previewTarget = Math.min(requested, 1_000)
     const preview = await fetchWikiGraph(previewTarget, signal)
