@@ -252,7 +252,13 @@ function tierGraphCapacity() {
       indexedValue = Number(parsed.records)
     } catch { /* use the tier count when the manifest is unreadable */ }
   }
-  const value = Math.max(tierValue, Number.isFinite(indexedValue) ? indexedValue : 0)
+  // The index manifest records how many articles were normalized, not how
+  // many are currently available as a graph snapshot. Only let it advertise
+  // that larger capacity when the full JSONL source is present; otherwise an
+  // older 100k `index.json` would make the UI promise more than the host can
+  // actually return.
+  const indexedCapacity = existsSync(jsonlFile) && Number.isFinite(indexedValue) ? indexedValue : 0
+  const value = Math.max(tierValue, indexedCapacity)
   if (!value) return null
   return Math.floor(Math.min(value, CACHE_LIMIT))
 }
@@ -428,8 +434,26 @@ createServer(async (req, res) => {
     let tier = readTier(count)
     if (tier) graph = sample(tier.graph, count)
     if (!graph && count <= 500 && existsSync(sampleFile)) { try { graph = sample(JSON.parse(readFileSync(sampleFile, 'utf8')), count) } catch { graph = null } }
-    if (!graph && existsSync(indexFile)) { try { graph = sample(JSON.parse(readFileSync(indexFile, 'utf8')), count) } catch { graph = null } }
+    if (!graph && existsSync(indexFile)) {
+      let legacy = null
+      try { legacy = JSON.parse(readFileSync(indexFile, 'utf8')) } catch { legacy = null }
+      if (legacy) {
+        // A legacy snapshot is often capped at 100k while articles.jsonl
+        // contains the complete normalized corpus. Prefer the source that can
+        // satisfy the requested count instead of returning a silent prefix.
+        const legacyCapacity = Array.isArray(legacy?.nodes) ? legacy.nodes.length : 0
+        if (count > legacyCapacity && existsSync(jsonlFile)) {
+          graph = await sampleJsonl(count)
+          if (!graph) throw new Error('The full article JSONL could not satisfy the requested graph size')
+        }
+        if (!graph) graph = sample(legacy, count)
+      }
+    }
     if (!graph) graph = await sampleJsonl(count)
+    const advertisedCapacity = tierGraphCapacity()
+    if (graph && advertisedCapacity != null && advertisedCapacity >= count && graph.nodes.length < count) {
+      throw new Error(`Graph source returned ${graph.nodes.length.toLocaleString()} of ${count.toLocaleString()} requested articles`)
+    }
     send(res, 200, graph ? { ...graph, source: 'wikipedia', indexed: true, tier: tier?.count ?? null } : { ...withDegrees(fallback), source: 'fallback', indexed: false })
   } catch (error) {
     send(res, 503, { error: 'Local Wikipedia index is unavailable', detail: error instanceof Error ? error.message : String(error) })

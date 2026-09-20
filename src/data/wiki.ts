@@ -95,6 +95,9 @@ async function fetchLocalGraph(count: number, signal?: AbortSignal): Promise<Wik
   // of truth instead of mislabeling synthetic edges as Wikipedia data.
   const metadata = graph as WikiGraph & { indexed?: boolean }
   if (metadata.source === 'fallback' || metadata.indexed === false) return null
+  if (graph.nodes.length < count) {
+    throw new Error(`Local Wikipedia index returned ${graph.nodes.length.toLocaleString()} of ${count.toLocaleString()} requested articles`)
+  }
   return { ...graph, source: 'wikipedia', local: true }
 }
 
@@ -304,7 +307,9 @@ export async function fetchWikiGraph(count: number, signal?: AbortSignal): Promi
       // A local index is optional: if it is offline, malformed, or still
       // rebuilding, continue with the public API instead of jumping straight
       // to demo data. Preserve cancellation semantics for the active request.
-      if (signal?.aborted) throw localError
+      // Once a large local request is made, do not silently replace it with a
+      // 1k public preview; that makes a stale 100k host look successful.
+      if (signal?.aborted || (LOCAL_INDEX_URL && wanted > LOCAL_API_PREVIEW_MAX_NODES)) throw localError
     }
     // A local endpoint can be present while its dump is still being parsed or
     // indexed. Never turn that temporary state into a huge public-API crawl.
