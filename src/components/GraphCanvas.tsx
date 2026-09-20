@@ -55,7 +55,7 @@ export type GraphCanvasHandle = {
 
 export type GraphCanvasProps = {
   graph: GraphData
-  /** Node ids to paint; large graphs also simulate this displayed subset. */
+  /** Node ids to paint; omitted means every node is visible. The simulation always uses the full graph. */
   visibleNodeIds?: ReadonlySet<string>
   /** Called after the current graph has been painted to the canvas. */
   onGraphRendered?: (graph: GraphData) => void
@@ -158,7 +158,7 @@ type View = { x: number; y: number; scale: number }
 type Bounds = { minX: number; maxX: number; minY: number; maxY: number }
 type Orbit = { yaw: number; pitch: number }
 type LayoutGraph = { nodes: GraphNode[]; links: GraphLink[] }
-type LayoutCache = { graph: GraphData | null; visibleIds: ReadonlySet<string> | null; twoD: LayoutGraph | null; threeD: LayoutGraph | null }
+type LayoutCache = { graph: GraphData | null; twoD: LayoutGraph | null; threeD: LayoutGraph | null }
 type RenderLink = { edge: GraphLink; index: number }
 type RenderSubset = { graph: LayoutGraph; visibleIds: ReadonlySet<string> | null; nodes: GraphNode[]; links: RenderLink[] }
 type LabelCandidate = {
@@ -381,8 +381,8 @@ const repairNodeOverlaps = (nodes: GraphNode[], dimensions: 2 | 3, settings: Gra
 const linkNode = (value: string | GraphNode, nodes: Map<string, GraphNode>) =>
   typeof value === 'string' ? nodes.get(value) : value
 
-function createLayoutGraph(graph: GraphData, visibleNodeIds?: ReadonlySet<string> | null): LayoutGraph {
-  const nodes = (visibleNodeIds ? graph.nodes.filter((node) => visibleNodeIds.has(node.id)) : graph.nodes).map((node) => {
+function createLayoutGraph(graph: GraphData): LayoutGraph {
+  const nodes = graph.nodes.map((node) => {
     const copy = { ...node }
     delete copy.index
     delete copy.x
@@ -396,13 +396,7 @@ function createLayoutGraph(graph: GraphData, visibleNodeIds?: ReadonlySet<string
     delete copy.fz
     return copy
   })
-  const nodeIds = visibleNodeIds ? new Set(nodes.map((node) => node.id)) : null
-  const links = graph.links.filter((link) => {
-    if (!nodeIds) return true
-    const source = typeof link.source === 'string' ? link.source : link.source.id
-    const target = typeof link.target === 'string' ? link.target : link.target.id
-    return nodeIds.has(source) && nodeIds.has(target)
-  }).map((link) => ({
+  const links = graph.links.map((link) => ({
     source: typeof link.source === 'string' ? link.source : link.source.id,
     target: typeof link.target === 'string' ? link.target : link.target.id,
   }))
@@ -452,7 +446,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   const simulationRef = useRef<PhysicsController | null>(null)
-  const layoutCacheRef = useRef<LayoutCache>({ graph: null, visibleIds: null, twoD: null, threeD: null })
+  const layoutCacheRef = useRef<LayoutCache>({ graph: null, twoD: null, threeD: null })
   const activeLayoutRef = useRef<LayoutGraph | null>(null)
   const activeGraphRef = useRef<GraphData | null>(null)
   const viewRef = useRef<View>({ x: 0, y: 0, scale: 1 })
@@ -507,18 +501,16 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   const getLayoutGraph = (requestedMode: GraphCanvasMode) => {
     const cache = layoutCacheRef.current
-    const layoutVisibleIds = graph.nodes.length > LARGE_GRAPH_THRESHOLD ? visibleNodeIds ?? null : null
-    if (cache.graph !== graph || cache.visibleIds !== layoutVisibleIds) {
+    if (cache.graph !== graph) {
       cache.graph = graph
-      cache.visibleIds = layoutVisibleIds
       cache.twoD = null
       cache.threeD = null
     }
     if (requestedMode === '3d') {
-      cache.threeD ??= createLayoutGraph(graph, layoutVisibleIds)
+      cache.threeD ??= createLayoutGraph(graph)
       return cache.threeD
     }
-    cache.twoD ??= createLayoutGraph(graph, layoutVisibleIds)
+    cache.twoD ??= createLayoutGraph(graph)
     return cache.twoD
   }
 
@@ -1117,7 +1109,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       manualTickRef.current = null
       if (simulationRef.current === activeSimulation) simulationRef.current = null
     }
-  }, [graph, layoutSettingsKey, mode, visibleNodeIds])
+  }, [graph, layoutSettingsKey, mode])
 
   useEffect(() => {
     const simulation = simulationRef.current
