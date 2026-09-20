@@ -102,7 +102,10 @@ function LogSlider({ id, label, value, min, max, step, center, onChange, format,
 
 export default function App() {
   const SAFE_NODE_THRESHOLD = 1000
-  const DEFAULT_LOCAL_ARTICLES = 100_000
+  // Stats normally replace this immediately. Keep the pre-fetch transport
+  // bound open so an unavailable/stale stats response cannot reintroduce the
+  // old 100k ceiling before the full local corpus is discovered.
+  const DEFAULT_LOCAL_ARTICLES = Number.MAX_SAFE_INTEGER
   const PUBLIC_MAX_ARTICLES = 500
   const [count, setCount] = useState(50)
   const [displayCount, setDisplayCount] = useState(0)

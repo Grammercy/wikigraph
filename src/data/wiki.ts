@@ -53,9 +53,11 @@ interface ApiResponse {
  */
 const configuredLocalIndex = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env?.VITE_WIKIGRAPH_INDEX_URL?.trim()
 const localHost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-// Local development and the D:-drive production host share the same API
-// contract. GitHub Pages and other public hosts stay on Wikipedia's API.
-const LOCAL_INDEX_URL = configuredLocalIndex || (localHost ? '/api/graph' : undefined)
+// Use the host directly for local browsers instead of relying only on the
+// Vite proxy. That keeps the corpus-size probe working from both `vite dev`
+// and `vite preview`; the host explicitly allows cross-origin local requests.
+// GitHub Pages and other public hosts stay on Wikipedia's API.
+const LOCAL_INDEX_URL = configuredLocalIndex || (localHost ? 'http://127.0.0.1:8787/api/graph' : undefined)
 // The local corpus size is discovered from /api/stats. Keep this transport
 // guard above any realistic Wikipedia dump so a complete downloaded index is
 // not silently truncated before the request reaches the local server.
