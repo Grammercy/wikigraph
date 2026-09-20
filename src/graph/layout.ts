@@ -114,14 +114,14 @@ export function symmetricAttraction(
       return source && target ? [[source, target] as [GraphNode, GraphNode]] : []
     })
     // Use loaded links for degree weights, including graphs without metadata.
-    // Hub-to-hub edges remain visible but do not act as springs.
+    // Hub links are handled separately by the asymmetric hub force.
     const degrees = new Map<GraphNode, number>()
     for (const [source, target] of candidates) {
       degrees.set(source, (degrees.get(source) ?? 0) + 1)
       degrees.set(target, (degrees.get(target) ?? 0) + 1)
     }
     const weighted = candidates
-      .filter(([source, target]) => source !== target && !(hubIds.has(source.id) && hubIds.has(target.id)))
+      .filter(([source, target]) => source !== target && !hubIds.has(source.id) && !hubIds.has(target.id))
       .map(([source, target]) => {
         const sourceDegree = Math.max(1, degrees.get(source) ?? 0)
         const targetDegree = Math.max(1, degrees.get(target) ?? 0)
@@ -145,6 +145,104 @@ export function symmetricAttraction(
 
 function pairKey(first: string, second: string) {
   return first < second ? `${first}\u0000${second}` : `${second}\u0000${first}`
+}
+
+/** Exact hub interactions cost O(articles × hubs), with at most 100 hubs. */
+export function hubInteractions(
+  links: GraphLink[],
+  settings: GraphSimulationSettings,
+  hubIds: ReadonlySet<string>,
+  hubScore: (node: GraphNode) => number,
+  dimensions: 2 | 3 = 2,
+  readSettings: () => GraphSimulationSettings = () => settings,
+) {
+  let nodes: GraphNode[] = []
+  let hubs: number[] = []
+  let neighbors = new Map<number, Set<number>>()
+  let memberships: number[] = []
+  let scores: number[] = []
+  let impulses = new Float64Array(0)
+  const force = (alpha: number) => {
+    const current = readSettings()
+    const temperature = Math.max(0, alpha)
+    impulses.fill(0)
+    const add = (index: number, x: number, y: number, z: number, magnitude: number) => {
+      impulses[index * 3] += x * magnitude
+      impulses[index * 3 + 1] += y * magnitude
+      impulses[index * 3 + 2] += z * magnitude
+    }
+    for (const hubIndex of hubs) {
+      const hub = nodes[hubIndex]
+      const connected = neighbors.get(hubIndex)!
+      for (let index = 0; index < nodes.length; index++) {
+        const node = nodes[index]
+        const otherHub = hubIds.has(node.id)
+        if (index === hubIndex || (otherHub && index < hubIndex)) continue
+        let dx = (node.x ?? 0) - (hub.x ?? 0)
+        let dy = (node.y ?? 0) - (hub.y ?? 0)
+        let dz = dimensions === 3 ? (node.z ?? 0) - (hub.z ?? 0) : 0
+        let distance = Math.hypot(dx, dy, dz)
+        if (!Number.isFinite(distance)) continue
+        if (distance < 0.001) {
+          const angle = (hubIndex * 7919 + index * 104729) * 2.399963229728653
+          dx = Math.cos(angle); dy = Math.sin(angle); dz = 0; distance = 1
+        }
+        const ux = dx / distance; const uy = dy / distance; const uz = dz / distance
+        if (!otherHub && connected.has(index)) {
+          const extension = Math.min(1024, Math.max(0, distance - 48))
+          const exponent = current.linkDistanceExponent === 3 ? 3 : 2
+          const distanceScale = Number.isFinite(current.linkDistanceScale) ? Math.max(1, current.linkDistanceScale) : 150_000
+          const pull = 3 * Math.min(192, extension ** exponent / distanceScale + 0.16 * extension) * temperature
+          // A hub's popularity does not weaken its pull on each article.
+          // Shared articles split their response between their linked hubs.
+          add(index, ux, uy, uz, -pull / Math.max(1, memberships[index]))
+          // All of a hub's articles together exert only a small reaction.
+          add(hubIndex, ux, uy, uz, pull * 0.02 / Math.max(1, connected.size))
+        } else {
+          const score = scores[hubIndex]
+          const radius = otherHub
+            ? current.hubTerritoryBase + current.hubTerritoryScale * (score + scores[index]) / 2
+            : current.unrelatedDistance
+          if (distance >= radius || radius <= 0) continue
+          const deficit = 1 - distance / radius
+          const strength = otherHub
+            ? current.hubForceBase + current.hubForceScale * (score * scores[index]) ** 1.2 + current.hubCharge / Math.max(28, distance)
+            : 4 * (current.unrelatedBaseStrength + current.unrelatedHubStrength * score) / Math.max(28, distance)
+          const push = Math.min(current.hubForceMax, strength * deficit) * temperature
+          add(index, ux, uy, uz, push)
+          // Unrelated articles move out of the territory without dragging its hub.
+          if (otherHub) add(hubIndex, ux, uy, uz, -push)
+        }
+      }
+    }
+    nodes.forEach((node, index) => {
+      const x = impulses[index * 3]; const y = impulses[index * 3 + 1]; const z = impulses[index * 3 + 2]
+      const magnitude = Math.hypot(x, y, z)
+      if (!Number.isFinite(magnitude) || magnitude === 0) return
+      const scale = Math.min(1, 1024 * temperature / magnitude)
+      node.vx = (node.vx ?? 0) + x * scale
+      node.vy = (node.vy ?? 0) + y * scale
+      if (dimensions === 3) node.vz = (node.vz ?? 0) + z * scale
+    })
+  }
+  force.initialize = (simulationNodes: GraphNode[]) => {
+    nodes = simulationNodes
+    hubs = nodes.flatMap((node, index) => hubIds.has(node.id) ? [index] : [])
+    neighbors = new Map(hubs.map(index => [index, new Set<number>()]))
+    const byId = new Map(nodes.map((node, index) => [node.id, index]))
+    for (const link of links) {
+      const source = byId.get(typeof link.source === 'string' ? link.source : link.source.id)
+      const target = byId.get(typeof link.target === 'string' ? link.target : link.target.id)
+      if (source == null || target == null || source === target) continue
+      if (!hubIds.has(nodes[target].id)) neighbors.get(source)?.add(target)
+      if (!hubIds.has(nodes[source].id)) neighbors.get(target)?.add(source)
+    }
+    memberships = nodes.map(() => 0)
+    for (const connected of neighbors.values()) for (const index of connected) memberships[index]++
+    scores = nodes.map(node => hubIds.has(node.id) ? hubScore(node) : 0)
+    impulses = new Float64Array(nodes.length * 3)
+  }
+  return force
 }
 
 /**
@@ -201,6 +299,8 @@ export function unrelatedRepulsion(
             if (examinedPairs > interactionBudget) break outer
             const targetIndex = nodeOrder.get(target)
             if (targetIndex == null || targetIndex <= sourceIndex) continue
+            // Hub interactions have their own exact, unbudgeted pass.
+            if (hubIds.has(source.id) || hubIds.has(target.id)) continue
             if (relatedPairs.has(pairKey(source.id, target.id))) continue
             let dx = source.x - (target.x as number)
             let dy = source.y - (target.y as number)

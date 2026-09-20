@@ -14,7 +14,8 @@ import {
   forceSimulation as forceSimulation3D,
 } from 'd3-force-3d'
 import { articleDegree, selectHubIds } from '../graph/hubs'
-import { layoutSpacing, seedLayout, symmetricAttraction, unrelatedRepulsion } from '../graph/layout'
+import { boundaryForce, boundaryRadius } from '../graph/boundary'
+import { layoutSpacing, seedLayout, symmetricAttraction, unrelatedRepulsion, hubInteractions } from '../graph/layout'
 
 export type GraphNode = SimulationNodeDatum & {
   id: string
@@ -101,8 +102,7 @@ export type GraphSimulationSettings = {
 export const DEFAULT_SIMULATION_SETTINGS: GraphSimulationSettings = {
   baseCharge: 115,
   articleImportanceCharge: 126,
-  // Hubs are structural anchors, not just slightly larger articles. Keep
-  // their whole-graph repulsion several times stronger than the base charge.
+  // Additional hub-to-hub repulsion; linked articles do not receive it.
   hubCharge: 1_500,
   chargeDistance: 480,
   articleSizeWeight: 0.45,
@@ -218,6 +218,20 @@ function graphBounds(nodes: GraphNode[]): Bounds | null {
   return bounds
 }
 
+function initialBoundaryView(width: number, height: number, count: number, mode: GraphCanvasMode): View {
+  const radius = boundaryRadius(count, mode === '3d' ? 3 : 2) * (mode === '3d' ? 1.1 : 1)
+  return { x: width / 2, y: height / 2, scale: Math.max(0.02, Math.min(2.2, 0.86 * Math.min(width, height) / (2 * radius + 80))) }
+}
+
+function boundedGraphBounds(nodes: GraphNode[], mode: GraphCanvasMode): Bounds {
+  const radius = boundaryRadius(nodes.length, mode === '3d' ? 3 : 2) * (mode === '3d' ? 1.1 : 1)
+  const bounds = graphBounds(nodes)
+  return {
+    minX: Math.min(-radius, bounds?.minX ?? 0), maxX: Math.max(radius, bounds?.maxX ?? 0),
+    minY: Math.min(-radius, bounds?.minY ?? 0), maxY: Math.max(radius, bounds?.maxY ?? 0),
+  }
+}
+
 /**
  * A responsive, canvas-rendered force graph. The active cached layout nodes are
  * mutated by d3-force (x/y/z/vx/vy/vz/fx/fy/fz), so callers should treat those
@@ -308,7 +322,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const sinPitch = Math.sin(orbit.pitch)
     const screenY = y * cosPitch - yawZ * sinPitch
     const depth = y * sinPitch + yawZ * cosPitch
-    const perspective = Math.max(0.42, Math.min(1.8, 900 / (900 + depth)))
+    const cameraDistance = Math.max(900, 3 * boundaryRadius(graphRef.current.nodes.length, 3))
+    const perspective = Math.max(0.42, Math.min(1.8, cameraDistance / Math.max(1, cameraDistance + depth)))
     return {
       x: view.x + yawX * view.scale * perspective,
       y: view.y + screenY * view.scale * perspective,
@@ -318,6 +333,24 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   }
 
   const draw3D = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
+    const radius = boundaryRadius(nodes.length, 3)
+    ctx.save()
+    ctx.strokeStyle = 'rgba(115, 119, 127, 0.28)'
+    ctx.lineWidth = 1
+    ctx.setLineDash([5, 5])
+    // Great circles show the sphere's orientation as the camera orbits.
+    for (let axis = 0; axis < 3; axis++) {
+      ctx.beginPath()
+      for (let step = 0; step <= 128; step++) {
+        const angle = step / 128 * Math.PI * 2
+        const a = radius * Math.cos(angle); const b = radius * Math.sin(angle)
+        const point = project3D({ id: '', x: axis === 0 ? 0 : a, y: axis === 1 ? 0 : axis === 0 ? a : b, z: axis === 2 ? 0 : b })
+        if (step === 0) ctx.moveTo(point.x, point.y)
+        else ctx.lineTo(point.x, point.y)
+      }
+      ctx.stroke()
+    }
+    ctx.restore()
     const projected = new Map<GraphNode, ReturnType<typeof project3D>>()
     for (const node of nodes) projected.set(node, project3D(node))
     const linkStride = links.length > 100_000 ? Math.ceil(links.length / 100_000) : 1
@@ -465,6 +498,14 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       draw3D(ctx, nodes, currentGraph.links, selected, hovered, nodeMap)
       return
     }
+    ctx.save()
+    ctx.strokeStyle = 'rgba(115, 119, 127, 0.35)'
+    ctx.lineWidth = 1 / view.scale
+    ctx.setLineDash([5 / view.scale, 5 / view.scale])
+    ctx.beginPath()
+    ctx.arc(0, 0, boundaryRadius(nodes.length, 2), 0, Math.PI * 2)
+    ctx.stroke()
+    ctx.restore()
     const linkStride = largeGraph ? Math.max(1, Math.ceil(currentGraph.links.length / 100_000)) : 1
 
     ctx.lineCap = 'round'
@@ -533,7 +574,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   useImperativeHandle(ref, () => ({
     fit: () => {
-      const bounds = graphBounds(activeLayoutRef.current?.nodes ?? graph.nodes)
+      const bounds = boundedGraphBounds(activeLayoutRef.current?.nodes ?? graph.nodes, modeRef.current)
       if (!bounds) return
       const { width, height } = sizeRef.current
       const scale = Math.max(0.02, Math.min(2.2, 0.86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80))))
@@ -541,7 +582,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       drawRef.current()
     },
     resetView: () => {
-      viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }
+      viewRef.current = initialBoundaryView(sizeRef.current.width, sizeRef.current.height, graphRef.current.nodes.length, modeRef.current)
       orbitRef.current = { yaw: -0.45, pitch: 0.24 }
       drawRef.current()
     },
@@ -552,7 +593,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     activeLayoutRef.current = layoutGraph
     const hubIds = getHubIds(layoutGraph.nodes, layoutGraph.links)
     const { width, height } = sizeRef.current
-    if (width > 1 && height > 1) viewRef.current = { x: width / 2, y: height / 2, scale: 1 }
+    if (width > 1 && height > 1) viewRef.current = initialBoundaryView(width, height, graph.nodes.length, mode)
     const largeGraph = layoutGraph.nodes.length > LARGE_GRAPH_THRESHOLD
     const spacing = layoutSpacing(layoutGraph.nodes.length)
     seedLayout(layoutGraph.nodes, mode === '3d' ? 3 : 2)
@@ -568,22 +609,20 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     if (mode === '3d') {
       sim
         .force('charge', forceManyBody3D()
-          .strength((node: GraphNode) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge - hubRepulsionScore(node, hubIds, settings) ** 3 * settings.hubCharge)
+          .strength((node: GraphNode) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge)
           .distanceMax(settings.chargeDistance * spacing))
         .force('center', forceCenter3D(0, 0, 0).strength(settings.centerStrength))
         .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 3, hubIds, () => settingsRef.current))
+        .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 3, () => settingsRef.current))
         .force('collision', forceCollide3D()
           .radius((node: GraphNode) => nodeRadius(node, settings) + settings.collisionPadding)
           .iterations(Math.max(1, Math.round(settings.collisionIterations))))
     } else {
       sim
-        // Hubs need more breathing room: their repulsion grows with degree, while
-        // the shared top-5%-capped-at-100 selector keeps the force bounded.
+        // Generic charge handles ordinary spacing. The hub force separates
+        // territories without repelling a hub's own linked articles.
         .force('charge', forceManyBody<GraphNode>()
-          // The cubic hub term makes high-degree pages repel the whole graph
-          // strongly enough to expose topic islands, while the dedicated
-          // hub-repulsion force below handles hub-to-hub separation directly.
-          .strength((node) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge - hubRepulsionScore(node, hubIds, settings) ** 3 * settings.hubCharge)
+          .strength((node) => -settings.baseCharge - articleImportance(node, settings) * settings.articleImportanceCharge)
           .distanceMax(settings.chargeDistance * spacing))
         // A direct link is allowed to pull its endpoints together, but a nearby
         // pair with no loaded link in either direction receives an extra push.
@@ -593,10 +632,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
         .force('center', forceCenter<GraphNode>(0, 0).strength(settings.centerStrength))
         .force('link-attraction', symmetricAttraction(attractionLinks, layoutGraph.nodes, settings, 2, hubIds, () => settingsRef.current))
         // Separate hubs, then resolve collisions using all proposed motion.
-        .force('hub-repulsion', hubRepulsion(settings, hubIds))
+        .force('hub-interactions', hubInteractions(layoutGraph.links, settings, hubIds, (node) => hubRepulsionScore(node, hubIds, settings), 2, () => settingsRef.current))
         .force('collision', forceCollide<GraphNode>().radius((node) => nodeRadius(node, settings) + settings.collisionPadding).iterations(Math.max(1, Math.round(settings.collisionIterations))))
     }
     sim
+      .force('boundary', boundaryForce(boundaryRadius(layoutGraph.nodes.length, mode === '3d' ? 3 : 2), mode === '3d' ? 3 : 2))
       .velocityDecay(settings.velocityDecay)
       .alphaDecay(settings.alphaDecay)
       .alphaMin(settings.alphaMin)
@@ -683,7 +723,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
 
   useEffect(() => {
     orbitRef.current = { yaw: -0.45, pitch: 0.24 }
-    viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }
+    viewRef.current = initialBoundaryView(sizeRef.current.width, sizeRef.current.height, graphRef.current.nodes.length, modeRef.current)
     hoverRef.current = null
     onHover?.(null)
     drawRef.current()
@@ -725,7 +765,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       sizeRef.current = { width: Math.max(1, rect.width), height: Math.max(1, rect.height), dpr }
       canvas.width = Math.round(rect.width * dpr); canvas.height = Math.round(rect.height * dpr)
       if (!viewInitializedRef.current) {
-        viewRef.current = { x: rect.width / 2, y: rect.height / 2, scale: 1 }
+        viewRef.current = initialBoundaryView(rect.width, rect.height, graphRef.current.nodes.length, modeRef.current)
         viewInitializedRef.current = true
       }
       canvas.style.width = `${rect.width}px`; canvas.style.height = `${rect.height}px`; drawRef.current()
@@ -764,64 +804,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       onWheel={(event) => { event.preventDefault(); const factor = Math.max(.75, Math.min(1.25, Math.exp(-event.deltaY * .001))); const view = viewRef.current; if (modeRef.current === '3d') { view.scale = Math.max(.02, Math.min(4, view.scale * factor)) } else { const before = localPoint(event); const screen = screenPoint(event); view.scale = Math.max(.02, Math.min(4, view.scale * factor)); view.x = screen.x - before.x * view.scale; view.y = screen.y - before.y * view.scale } draw() }}
       tabIndex={0}
       role="application"
-      onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.02, viewRef.current.scale / 1.15); draw() } else if (modeRef.current === '3d' && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); if (event.shiftKey) { const panStep = 36; if (event.key === 'ArrowLeft') viewRef.current.x += panStep; else if (event.key === 'ArrowRight') viewRef.current.x -= panStep; else if (event.key === 'ArrowUp') viewRef.current.y += panStep; else viewRef.current.y -= panStep } else { const orbitStep = 0.12; if (event.key === 'ArrowLeft') orbitRef.current.yaw -= orbitStep; else if (event.key === 'ArrowRight') orbitRef.current.yaw += orbitStep; else if (event.key === 'ArrowUp') orbitRef.current.pitch = Math.max(-1.2, orbitRef.current.pitch - orbitStep); else orbitRef.current.pitch = Math.min(1.2, orbitRef.current.pitch + orbitStep) } draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = { x: sizeRef.current.width / 2, y: sizeRef.current.height / 2, scale: 1 }; orbitRef.current = { yaw: -0.45, pitch: 0.24 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const bounds = graphBounds(activeLayoutRef.current?.nodes ?? graphRef.current.nodes); if (bounds) { const { width, height } = sizeRef.current; const scale = Math.max(.02, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
+      onKeyDown={(event) => { if (event.key === '+' || event.key === '=') { event.preventDefault(); viewRef.current.scale = Math.min(4, viewRef.current.scale * 1.15); draw() } else if (event.key === '-') { event.preventDefault(); viewRef.current.scale = Math.max(.02, viewRef.current.scale / 1.15); draw() } else if (modeRef.current === '3d' && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); if (event.shiftKey) { const panStep = 36; if (event.key === 'ArrowLeft') viewRef.current.x += panStep; else if (event.key === 'ArrowRight') viewRef.current.x -= panStep; else if (event.key === 'ArrowUp') viewRef.current.y += panStep; else viewRef.current.y -= panStep } else { const orbitStep = 0.12; if (event.key === 'ArrowLeft') orbitRef.current.yaw -= orbitStep; else if (event.key === 'ArrowRight') orbitRef.current.yaw += orbitStep; else if (event.key === 'ArrowUp') orbitRef.current.pitch = Math.max(-1.2, orbitRef.current.pitch - orbitStep); else orbitRef.current.pitch = Math.min(1.2, orbitRef.current.pitch + orbitStep) } draw() } else if (event.key === '0') { event.preventDefault(); viewRef.current = initialBoundaryView(sizeRef.current.width, sizeRef.current.height, graphRef.current.nodes.length, modeRef.current); orbitRef.current = { yaw: -0.45, pitch: 0.24 }; draw() } else if (event.key.toLowerCase() === 'f') { event.preventDefault(); const bounds = boundedGraphBounds(activeLayoutRef.current?.nodes ?? graphRef.current.nodes, modeRef.current); if (bounds) { const { width, height } = sizeRef.current; const scale = Math.max(.02, Math.min(2.2, .86 * Math.min(width / Math.max(1, bounds.maxX - bounds.minX + 80), height / Math.max(1, bounds.maxY - bounds.minY + 80)))); viewRef.current = { scale, x: width / 2 - ((bounds.minX + bounds.maxX) / 2) * scale, y: height / 2 - ((bounds.minY + bounds.maxY) / 2) * scale }; draw() } } }} />
   </div>
 })
-
-/**
- * Extra force for structural hubs. d3's many-body force is excellent at
- * scaling to large graphs, but its per-node charge cannot express the desired
- * "hub versus hub" boundary. We compare only the shared, degree-ranked hub set
- * (top 5% of the graph, capped at 100) and give every pair a preferred territory radius.
- */
-function hubRepulsion(settings: GraphSimulationSettings, hubIds: ReadonlySet<string>) {
-  let hubs: GraphNode[] = []
-  const force = (alpha: number) => {
-    const maxHubDistance = settings.hubTerritoryBase + settings.hubTerritoryScale + 100
-    for (let sourceIndex = 0; sourceIndex < hubs.length; sourceIndex += 1) {
-      const source = hubs[sourceIndex]
-      if (source.x == null || source.y == null) continue
-      const sourceScore = hubRepulsionScore(source, hubIds, settings)
-      for (let targetIndex = sourceIndex + 1; targetIndex < hubs.length; targetIndex += 1) {
-        const target = hubs[targetIndex]
-        if (target.x == null || target.y == null) continue
-        const targetScore = hubRepulsionScore(target, hubIds, settings)
-        const sourceX = source.x as number
-        const sourceY = source.y as number
-        let dx = sourceX - (target.x as number)
-        let dy = sourceY - (target.y as number)
-        let distance = Math.hypot(dx, dy)
-        // D3 can initialize multiple nodes at the same coordinate. A stable
-        // pair-specific direction avoids a zero vector without adding jitter.
-        if (distance < 0.001) {
-          const angle = ((sourceIndex * 92821 + targetIndex * 68917) % 360) * Math.PI / 180
-          dx = Math.cos(angle)
-          dy = Math.sin(angle)
-          distance = 1
-        }
-        const pairScore = Math.pow(sourceScore * targetScore, 1.2)
-        const preferredDistance = Math.min(maxHubDistance, settings.hubTerritoryBase + settings.hubTerritoryScale * ((sourceScore + targetScore) / 2))
-        if (distance >= preferredDistance) continue
-        const deficit = 1 - distance / preferredDistance
-        // This is intentionally much larger than the incident-link spring for
-        // visible hubs. It creates an exclusion territory, not just a small
-        // nudge, while the cap keeps the simulation finite at alpha=1.
-        const magnitude = Math.min(settings.hubForceMax, (settings.hubForceBase + settings.hubForceScale * pairScore) * deficit) * alpha
-        const vx = dx / distance * magnitude
-        const vy = dy / distance * magnitude
-        source.vx = (source.vx ?? 0) + vx
-        source.vy = (source.vy ?? 0) + vy
-        target.vx = (target.vx ?? 0) - vx
-        target.vy = (target.vy ?? 0) - vy
-      }
-    }
-  }
-  force.initialize = (simulationNodes: GraphNode[]) => {
-    hubs = [...simulationNodes]
-      .filter((node) => hubIds.has(node.id))
-      .sort((a, b) => articleDegree(b) - articleDegree(a) || a.id.localeCompare(b.id))
-  }
-  return force
-}
 
 export default GraphCanvas
