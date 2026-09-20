@@ -437,18 +437,12 @@ export async function fetchWikiGraphProgressive(
   const requested = Math.max(1, Math.min(Math.floor(count) || 1, LOCAL_INDEX_URL ? LOCAL_MAX_NODES : PUBLIC_MAX_NODES))
 
   if (LOCAL_INDEX_URL) {
-    // Local tiers are nested snapshots. A small preview makes the interface
-    // useful immediately, then one requested-size response replaces it with
-    // the complete graph and correct degree metadata. Repeatedly fetching and
-    // merging every intermediate tier would make a large request parse
-    // more than twice as many records and restart the simulation each time.
-    const previewTarget = Math.min(requested, 1_000)
-    const preview = await fetchWikiGraph(previewTarget, signal)
-    onProgress?.({ loaded: Math.min(preview.nodes.length, requested), requested, graph: preview })
-    if (!preview.local || previewTarget >= requested) return preview
-    const full = await fetchWikiGraph(requested, signal)
-    onProgress?.({ loaded: Math.min(full.nodes.length, requested), requested, graph: full })
-    return full
+    // Local tiers are nested snapshots, so one requested-size response is
+    // enough. Publishing the 1,000-node tier first makes a large graph render
+    // twice and briefly replaces the requested map with an unrelated preview.
+    const graph = await fetchWikiGraph(requested, signal)
+    onProgress?.({ loaded: Math.min(graph.nodes.length, requested), requested, graph })
+    return graph
   }
 
   const merged: WikiGraph = { nodes: [], links: [], source: 'wikipedia' }
