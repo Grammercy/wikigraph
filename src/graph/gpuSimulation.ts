@@ -45,6 +45,8 @@ type Topology = {
   nodeHubOffsetsBase: number
   nodeHubEntriesBase: number
   hubCountsBase: number
+  relationOffsetsBase: number
+  relationEntriesBase: number
   hubCount: number
   memberships: Float32Array
   relatedPairs: Set<number>
@@ -53,6 +55,34 @@ type Topology = {
 type SpatialTopology = {
   words: Uint32Array
   candidateCount: number
+}
+
+export const PHYSICS_TICKS_PER_SECOND = 60
+export const PHYSICS_TICK_INTERVAL_MS = 1_000 / PHYSICS_TICKS_PER_SECOND
+export const nextPhysicsTickDelay = (startedAt: number, completedAt: number) =>
+  Math.max(0, PHYSICS_TICK_INTERVAL_MS - Math.max(0, completedAt - startedAt))
+
+class Uint32Builder {
+  private words: Uint32Array
+  length = 0
+
+  constructor(initialCapacity: number) {
+    this.words = new Uint32Array(Math.max(16, initialCapacity))
+  }
+
+  push(value: number): void {
+    if (this.length === this.words.length) {
+      const grown = new Uint32Array(this.words.length * 2)
+      grown.set(this.words)
+      this.words = grown
+    }
+    this.words[this.length] = value
+    this.length += 1
+  }
+
+  finish(): Uint32Array {
+    return this.words.slice(0, this.length)
+  }
 }
 
 const floatBitsBuffer = new ArrayBuffer(4)
@@ -80,6 +110,7 @@ export function prepareGpuTopology(
   const resolved: Array<[number, number]> = []
   const degrees = new Uint32Array(count)
   const relatedPairs = new Set<number>()
+  const relatedEntries = Array.from({ length: count }, () => new Set<number>())
 
   for (const link of links) {
     const source = byId.get(endpointId(link.source))
@@ -88,6 +119,8 @@ export function prepareGpuTopology(
     resolved.push([source, target])
     if (!(hubIds.has(nodes[source].id) && hubIds.has(nodes[target].id))) {
       relatedPairs.add(pairNumber(source, target, count))
+      relatedEntries[source].add(target)
+      relatedEntries[target].add(source)
     }
   }
 
@@ -159,6 +192,15 @@ export function prepareGpuTopology(
   for (const memberships of nodeHubs) words.push(...memberships)
   const hubCountsBase = words.length
   words.push(...hubCounts)
+  const relationOffsetsBase = words.length
+  let relationEntryCount = 0
+  for (const entries of relatedEntries) {
+    words.push(relationEntryCount)
+    relationEntryCount += entries.size
+  }
+  words.push(relationEntryCount)
+  const relationEntriesBase = words.length
+  for (const entries of relatedEntries) words.push(...entries)
 
   return {
     words: Uint32Array.from(words.length ? words : [0]),
@@ -168,14 +210,13 @@ export function prepareGpuTopology(
     nodeHubOffsetsBase,
     nodeHubEntriesBase,
     hubCountsBase,
+    relationOffsetsBase,
+    relationEntriesBase,
     hubCount: hubIndices.length,
     memberships: membershipCounts,
     relatedPairs,
   }
 }
-
-const spatialKey = (x: number, y: number, z: number, dimensions: 2 | 3) =>
-  dimensions === 2 ? `${x},${y}` : `${x},${y},${z}`
 
 function spatialNeighborLimit(count: number): number {
   if (count > 50_000) return 64
@@ -193,6 +234,7 @@ export function buildSpatialTopology(
   radii: Float32Array,
   relatedPairs: ReadonlySet<number>,
   largeGraph: boolean,
+  skin = 0,
 ): SpatialTopology {
   const count = nodes.length
   const chargeDistance = Math.max(1, settings.chargeDistance * spacing)
@@ -206,11 +248,13 @@ export function buildSpatialTopology(
     maxVelocity = Math.max(maxVelocity, Math.hypot(nodes[index].vx ?? 0, nodes[index].vy ?? 0, dimensions === 3 ? nodes[index].vz ?? 0 : 0))
   }
   const collisionReach = 2 * maxRadius + Math.min(512, 2 * maxVelocity)
-  const cutoff = Math.max(64, chargeDistance, unrelatedDistance, collisionReach)
+  const safeSkin = Math.max(0, skin)
+  const cutoff = Math.max(64, chargeDistance, unrelatedDistance, collisionReach) + safeSkin
   const cellX = new Int32Array(count)
   const cellY = new Int32Array(count)
   const cellZ = new Int32Array(count)
-  const cells = new Map<string, number[]>()
+  const cells2D = new Map<number, Map<number, number[]>>()
+  const cells3D = new Map<number, Map<number, Map<number, number[]>>>()
   for (let index = 0; index < count; index += 1) {
     const node = nodes[index]
     const x = Math.floor((node.x ?? 0) / cutoff)
@@ -219,17 +263,37 @@ export function buildSpatialTopology(
     cellX[index] = x
     cellY[index] = y
     cellZ[index] = z
-    const key = spatialKey(x, y, z, dimensions)
-    const bucket = cells.get(key)
-    if (bucket) bucket.push(index)
-    else cells.set(key, [index])
+    if (dimensions === 2) {
+      let column = cells2D.get(x)
+      if (!column) {
+        column = new Map()
+        cells2D.set(x, column)
+      }
+      const bucket = column.get(y)
+      if (bucket) bucket.push(index)
+      else column.set(y, [index])
+    } else {
+      let plane = cells3D.get(x)
+      if (!plane) {
+        plane = new Map()
+        cells3D.set(x, plane)
+      }
+      let column = plane.get(y)
+      if (!column) {
+        column = new Map()
+        plane.set(y, column)
+      }
+      const bucket = column.get(z)
+      if (bucket) bucket.push(index)
+      else column.set(z, [index])
+    }
   }
 
-  const chargeDistanceSquared = chargeDistance * chargeDistance
-  const unrelatedDistanceSquared = unrelatedDistance * unrelatedDistance
+  const chargeDistanceSquared = (chargeDistance + safeSkin) * (chargeDistance + safeSkin)
+  const unrelatedDistanceSquared = (unrelatedDistance + safeSkin) * (unrelatedDistance + safeSkin)
   const neighborLimit = spatialNeighborLimit(count)
   const offsets = new Uint32Array(count + 1)
-  const entries: number[] = []
+  const entries = new Uint32Builder(Math.max(16, count * Math.min(16, neighborLimit + 1)))
   let candidateCount = 0
   for (let index = 0; index < count; index += 1) {
     offsets[index] = entries.length
@@ -240,13 +304,16 @@ export function buildSpatialTopology(
     const vx = node.vx ?? 0
     const vy = node.vy ?? 0
     const vz = dimensions === 3 ? node.vz ?? 0 : 0
-    const candidates: Array<{ index: number; distance: number }> = []
+    const candidateIndices: number[] = []
+    const candidateDistances: number[] = []
     for (let ox = -1; ox <= 1; ox += 1) {
       for (let oy = -1; oy <= 1; oy += 1) {
         const minZ = dimensions === 3 ? -1 : 0
         const maxZ = dimensions === 3 ? 1 : 0
         for (let oz = minZ; oz <= maxZ; oz += 1) {
-          const bucket = cells.get(spatialKey(cellX[index] + ox, cellY[index] + oy, cellZ[index] + oz, dimensions))
+          const bucket = dimensions === 2
+            ? cells2D.get(cellX[index] + ox)?.get(cellY[index] + oy)
+            : cells3D.get(cellX[index] + ox)?.get(cellY[index] + oy)?.get(cellZ[index] + oz)
           if (!bucket) continue
           for (const otherIndex of bucket) {
             if (otherIndex === index) continue
@@ -259,34 +326,41 @@ export function buildSpatialTopology(
             const predictedY = dy + (other.vy ?? 0) - vy
             const predictedZ = dimensions === 3 ? dz + (other.vz ?? 0) - vz : 0
             const predictedSquared = predictedX * predictedX + predictedY * predictedY + predictedZ * predictedZ
-            const collisionDistance = radii[index] + radii[otherIndex] + 2
+            const collisionDistance = radii[index] + radii[otherIndex] + 2 + safeSkin
             if (distanceSquared <= chargeDistanceSquared
               || distanceSquared <= unrelatedDistanceSquared
               || predictedSquared <= collisionDistance * collisionDistance) {
-              candidates.push({ index: otherIndex, distance: Math.min(distanceSquared, predictedSquared) })
+              candidateIndices.push(otherIndex)
+              candidateDistances.push(Math.min(distanceSquared, predictedSquared))
             }
           }
         }
       }
     }
-    const totalCandidates = candidates.length
+    const totalCandidates = candidateIndices.length
     candidateCount += totalCandidates
-    if (candidates.length > neighborLimit) {
-      candidates.sort((a, b) => a.distance - b.distance || a.index - b.index)
-      candidates.length = neighborLimit
+    let selected: number[]
+    if (totalCandidates > neighborLimit) {
+      const order = Array.from({ length: totalCandidates }, (_, candidate) => candidate)
+      order.sort((a, b) => candidateDistances[a] - candidateDistances[b] || candidateIndices[a] - candidateIndices[b])
+      selected = new Array<number>(neighborLimit)
+      for (let candidate = 0; candidate < neighborLimit; candidate += 1) selected[candidate] = candidateIndices[order[candidate]]
+    } else {
+      selected = candidateIndices
     }
-    candidates.sort((a, b) => a.index - b.index)
-    const scale = candidates.length ? Math.min(4, totalCandidates / candidates.length) : 1
+    selected.sort((a, b) => a - b)
+    const scale = selected.length ? Math.min(4, totalCandidates / selected.length) : 1
     entries.push(floatBits(scale))
-    for (const candidate of candidates) {
-      const related = relatedPairs.has(pairNumber(index, candidate.index, count))
-      entries.push(candidate.index | (related ? 0x80000000 : 0))
+    for (const otherIndex of selected) {
+      const related = relatedPairs.has(pairNumber(index, otherIndex, count))
+      entries.push(otherIndex | (related ? 0x80000000 : 0))
     }
   }
   offsets[count] = entries.length
-  const words = new Uint32Array(offsets.length + entries.length)
+  const entryWords = entries.finish()
+  const words = new Uint32Array(offsets.length + entryWords.length)
   words.set(offsets)
-  words.set(entries, offsets.length)
+  words.set(entryWords, offsets.length)
   return { words, candidateCount }
 }
 
@@ -305,29 +379,104 @@ struct Params {
   hub_a: vec4<f32>,
   hub_b: vec4<f32>,
   boundary: vec4<f32>,
+  grid: vec4<u32>,
+  grid_values: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> center_state: array<NodeState>;
-@group(0) @binding(1) var<storage, read_write> center_value: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> center_partials: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> center_params: Params;
+@group(0) @binding(3) var<storage, read_write> center_value: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> build_grid_heads: array<atomic<i32>>;
+@group(0) @binding(5) var<storage, read_write> build_grid_next: array<i32>;
+@group(0) @binding(6) var<storage, read_write> build_grid_cells: array<vec4<i32>>;
 
-@compute @workgroup_size(1)
-fn center_main() {
-  var sum = vec3<f32>(0.0);
-  for (var index = 0u; index < center_params.counts.x; index += 1u) {
-    sum += center_state[index].position.xyz;
+var<workgroup> center_partial_sums: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn center_partial_main(
+  @builtin(global_invocation_id) invocation: vec3<u32>,
+  @builtin(local_invocation_index) local_index: u32,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  var value = vec4<f32>(0.0);
+  if (invocation.x < center_params.counts.x) {
+    value = vec4<f32>(center_state[invocation.x].position.xyz, 0.0);
+  }
+  center_partial_sums[local_index] = value;
+  workgroupBarrier();
+  var stride = 128u;
+  loop {
+    if (local_index < stride) {
+      center_partial_sums[local_index] += center_partial_sums[local_index + stride];
+    }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (local_index == 0u) { center_partials[group.x] = center_partial_sums[0]; }
+}
+
+var<workgroup> center_final_sums: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn center_finish_main(@builtin(local_invocation_index) local_index: u32) {
+  let partial_count = (center_params.counts.x + 255u) / 256u;
+  var sum = vec4<f32>(0.0);
+  for (var index = local_index; index < partial_count; index += 256u) {
+    sum += center_partials[index];
+  }
+  center_final_sums[local_index] = sum;
+  workgroupBarrier();
+  var stride = 128u;
+  loop {
+    if (local_index < stride) {
+      center_final_sums[local_index] += center_final_sums[local_index + stride];
+    }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
   }
   let count = max(1.0, f32(center_params.counts.x));
-  center_value[0] = vec4<f32>(sum / count, 0.0);
+  if (local_index == 0u) { center_value[0] = center_final_sums[0] / count; }
+}
+
+fn grid_hash(cell: vec3<i32>, mask: u32) -> u32 {
+  let x = bitcast<u32>(cell.x);
+  let y = bitcast<u32>(cell.y);
+  let z = bitcast<u32>(cell.z);
+  return ((x * 73856093u) ^ (y * 19349663u) ^ (z * 83492791u)) & mask;
+}
+
+@compute @workgroup_size(256)
+fn grid_clear_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
+  if (invocation.x < center_params.grid.x) {
+    atomicStore(&build_grid_heads[invocation.x], -1);
+  }
+}
+
+@compute @workgroup_size(256)
+fn grid_build_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
+  let index = invocation.x;
+  if (index >= center_params.counts.x) { return; }
+  let cell_size = center_params.grid_values.x;
+  let position = center_state[index].position.xyz;
+  var cell = vec3<i32>(floor(position / cell_size));
+  if (center_params.counts.y == 2u) { cell.z = 0; }
+  build_grid_cells[index] = vec4<i32>(cell, 0);
+  let bucket = grid_hash(cell, center_params.grid.x - 1u);
+  build_grid_next[index] = atomicExchange(&build_grid_heads[bucket], i32(index));
 }
 
 @group(1) @binding(0) var<storage, read> force_in: array<NodeState>;
 @group(1) @binding(1) var<storage, read_write> force_out: array<NodeState>;
 @group(1) @binding(2) var<storage, read> node_meta: array<vec4<f32>>;
 @group(1) @binding(3) var<storage, read> topology_data: array<u32>;
-@group(1) @binding(4) var<storage, read> spatial_data: array<u32>;
-@group(1) @binding(5) var<storage, read> graph_center: array<vec4<f32>>;
-@group(1) @binding(6) var<uniform> force_params: Params;
+@group(1) @binding(4) var<storage, read_write> force_grid_heads: array<atomic<i32>>;
+@group(1) @binding(5) var<storage, read> force_grid_next: array<i32>;
+@group(1) @binding(6) var<storage, read> force_grid_cells: array<vec4<i32>>;
+@group(1) @binding(7) var<storage, read> graph_center: array<vec4<f32>>;
+@group(1) @binding(8) var<uniform> force_params: Params;
 
 fn pair_jiggle(first: u32, second: u32, axis: u32) -> f32 {
   let low = min(first, second);
@@ -349,6 +498,17 @@ fn connected_to_hub(node_index: u32, hub_ordinal: u32) -> bool {
   let end = topology_data[offset_base + node_index + 1u];
   for (var cursor = start; cursor < end; cursor += 1u) {
     if (topology_data[entry_base + cursor] == hub_ordinal) { return true; }
+  }
+  return false;
+}
+
+fn directly_related(first: u32, second: u32) -> bool {
+  let offset_base = force_params.topology2.z;
+  let entry_base = force_params.topology2.w;
+  let start = topology_data[offset_base + first];
+  let end = topology_data[offset_base + first + 1u];
+  for (var cursor = start; cursor < end; cursor += 1u) {
+    if (topology_data[entry_base + cursor] == second) { return true; }
   }
   return false;
 }
@@ -377,37 +537,72 @@ fn force_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   let charge_distance_squared = force_params.dynamics.y;
   let unrelated_distance = force_params.dynamics.z;
 
-  let spatial_base = node_count + 1u;
-  let spatial_start = spatial_base + spatial_data[index];
-  let spatial_end = spatial_base + spatial_data[index + 1u];
-  let charge_scale = bitcast<f32>(spatial_data[spatial_start]);
+  let own_cell = force_grid_cells[index].xyz;
+  let own_radius = node_meta[index].y;
+  let neighbor_limit = force_params.grid.y;
+  var selected_candidates = 0u;
+  var total_candidates = 0u;
+  var charge_impulse = vec3<f32>(0.0);
   var unrelated_used = 0u;
-  for (var cursor = spatial_start + 1u; cursor < spatial_end; cursor += 1u) {
-    let packed = spatial_data[cursor];
-    let other_index = packed & 0x7fffffffu;
-    let related = (packed & 0x80000000u) != 0u;
-    let other_position = centered_position(other_index);
-    var delta = other_position - position;
-    var squared = dot(delta, delta);
-    if (squared < charge_distance_squared) {
-      if (delta.x == 0.0) { delta.x = pair_jiggle(index, other_index, 0u); squared += delta.x * delta.x; }
-      if (delta.y == 0.0) { delta.y = pair_jiggle(index, other_index, 1u); squared += delta.y * delta.y; }
-      if (dimensions == 3u && delta.z == 0.0) { delta.z = pair_jiggle(index, other_index, 2u); squared += delta.z * delta.z; }
-      if (squared < 1.0) { squared = sqrt(max(1e-20, squared)); }
-      velocity += delta * node_meta[other_index].x * alpha * charge_scale / squared;
-    }
+  var seen_hashes: array<u32, 27>;
+  var seen_count = 0u;
+  for (var ox = -1; ox <= 1; ox += 1) {
+    for (var oy = -1; oy <= 1; oy += 1) {
+      for (var oz = -1; oz <= 1; oz += 1) {
+        if (dimensions == 2u && oz != 0) { continue; }
+        let neighbor_cell = own_cell + vec3<i32>(ox, oy, oz);
+        let bucket = grid_hash(neighbor_cell, force_params.grid.x - 1u);
+        var duplicate_bucket = false;
+        for (var seen = 0u; seen < seen_count; seen += 1u) {
+          if (seen_hashes[seen] == bucket) { duplicate_bucket = true; }
+        }
+        if (duplicate_bucket) { continue; }
+        seen_hashes[seen_count] = bucket;
+        seen_count += 1u;
+        var other = atomicLoad(&force_grid_heads[bucket]);
+        loop {
+          if (other < 0) { break; }
+          let other_index = u32(other);
+          other = force_grid_next[other_index];
+          if (other_index == index || any(force_grid_cells[other_index].xyz != neighbor_cell)) { continue; }
+          let other_position = centered_position(other_index);
+          var delta = other_position - position;
+          var squared = dot(delta, delta);
+          let predicted_delta = delta + force_in[other_index].velocity.xyz - state.velocity.xyz;
+          let collision_distance = own_radius + node_meta[other_index].y + 2.0;
+          let qualifies = squared <= charge_distance_squared
+            || squared <= unrelated_distance * unrelated_distance
+            || dot(predicted_delta, predicted_delta) <= collision_distance * collision_distance;
+          if (!qualifies) { continue; }
+          total_candidates += 1u;
+          if (selected_candidates >= neighbor_limit) { continue; }
+          selected_candidates += 1u;
+          if (squared < charge_distance_squared) {
+            if (delta.x == 0.0) { delta.x = pair_jiggle(index, other_index, 0u); squared += delta.x * delta.x; }
+            if (delta.y == 0.0) { delta.y = pair_jiggle(index, other_index, 1u); squared += delta.y * delta.y; }
+            if (dimensions == 3u && delta.z == 0.0) { delta.z = pair_jiggle(index, other_index, 2u); squared += delta.z * delta.z; }
+            if (squared < 1.0) { squared = sqrt(max(1e-20, squared)); }
+            charge_impulse += delta * node_meta[other_index].x * alpha / squared;
+          }
 
-    if (dimensions == 2u && !related && node_meta[index].z == 0.0 && node_meta[other_index].z == 0.0
-        && unrelated_used < force_params.counts.w) {
-      var away = position - other_position;
-      let direction = safe_direction(away, other_index, index, dimensions);
-      if (direction.w <= unrelated_distance) {
-        let falloff = 1.0 - direction.w / unrelated_distance;
-        let magnitude = min(14.0, force_params.hub_b.z / max(28.0, direction.w) * falloff) * alpha;
-        velocity += direction.xyz * magnitude;
-        unrelated_used += 1u;
+          if (dimensions == 2u && node_meta[index].z == 0.0 && node_meta[other_index].z == 0.0
+              && unrelated_used < force_params.counts.w && !directly_related(index, other_index)) {
+            var away = position - other_position;
+            let direction = safe_direction(away, other_index, index, dimensions);
+            if (direction.w <= unrelated_distance) {
+              let falloff = 1.0 - direction.w / unrelated_distance;
+              let magnitude = min(14.0, force_params.hub_b.z / max(28.0, direction.w) * falloff) * alpha;
+              velocity += direction.xyz * magnitude;
+              unrelated_used += 1u;
+            }
+          }
+        }
       }
     }
+  }
+  if (selected_candidates > 0u) {
+    let charge_scale = min(4.0, f32(total_candidates) / f32(selected_candidates));
+    velocity += charge_impulse * charge_scale;
   }
 
   var link_impulse = vec3<f32>(0.0);
@@ -505,8 +700,10 @@ fn force_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
 @group(2) @binding(0) var<storage, read> collision_in: array<NodeState>;
 @group(2) @binding(1) var<storage, read_write> collision_out: array<NodeState>;
 @group(2) @binding(2) var<storage, read> collision_meta: array<vec4<f32>>;
-@group(2) @binding(3) var<storage, read> collision_spatial: array<u32>;
-@group(2) @binding(4) var<uniform> collision_params: Params;
+@group(2) @binding(3) var<storage, read_write> collision_grid_heads: array<atomic<i32>>;
+@group(2) @binding(4) var<storage, read> collision_grid_next: array<i32>;
+@group(2) @binding(5) var<storage, read> collision_grid_cells: array<vec4<i32>>;
+@group(2) @binding(6) var<uniform> collision_params: Params;
 
 @compute @workgroup_size(128)
 fn collision_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
@@ -519,25 +716,58 @@ fn collision_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   let own_radius = collision_meta[index].y;
   let own_radius_squared = own_radius * own_radius;
   var impulse = vec3<f32>(0.0);
-  let spatial_base = node_count + 1u;
-  let start = spatial_base + collision_spatial[index] + 1u;
-  let end = spatial_base + collision_spatial[index + 1u];
-  for (var cursor = start; cursor < end; cursor += 1u) {
-    let other_index = collision_spatial[cursor] & 0x7fffffffu;
-    let other = collision_in[other_index];
-    let other_radius = collision_meta[other_index].y;
-    let combined = own_radius + other_radius;
-    var delta = predicted - other.position.xyz - other.velocity.xyz;
-    if (dimensions == 2u) { delta.z = 0.0; }
-    var squared = dot(delta, delta);
-    if (squared >= combined * combined) { continue; }
-    if (delta.x == 0.0) { delta.x = pair_jiggle(other_index, index, 0u); squared += delta.x * delta.x; }
-    if (delta.y == 0.0) { delta.y = pair_jiggle(other_index, index, 1u); squared += delta.y * delta.y; }
-    if (dimensions == 3u && delta.z == 0.0) { delta.z = pair_jiggle(other_index, index, 2u); squared += delta.z * delta.z; }
-    let distance = sqrt(max(1e-20, squared));
-    let other_radius_squared = other_radius * other_radius;
-    let weight = other_radius_squared / max(1e-20, own_radius_squared + other_radius_squared);
-    impulse += delta / distance * (combined - distance) * weight;
+  let own_cell = collision_grid_cells[index].xyz;
+  let charge_distance_squared = collision_params.dynamics.y;
+  let unrelated_distance_squared = collision_params.dynamics.z * collision_params.dynamics.z;
+  let neighbor_limit = collision_params.grid.y;
+  var selected_candidates = 0u;
+  var seen_hashes: array<u32, 27>;
+  var seen_count = 0u;
+  for (var ox = -1; ox <= 1; ox += 1) {
+    for (var oy = -1; oy <= 1; oy += 1) {
+      for (var oz = -1; oz <= 1; oz += 1) {
+        if (dimensions == 2u && oz != 0) { continue; }
+        let neighbor_cell = own_cell + vec3<i32>(ox, oy, oz);
+        let bucket = grid_hash(neighbor_cell, collision_params.grid.x - 1u);
+        var duplicate_bucket = false;
+        for (var seen = 0u; seen < seen_count; seen += 1u) {
+          if (seen_hashes[seen] == bucket) { duplicate_bucket = true; }
+        }
+        if (duplicate_bucket) { continue; }
+        seen_hashes[seen_count] = bucket;
+        seen_count += 1u;
+        var other_pointer = atomicLoad(&collision_grid_heads[bucket]);
+        loop {
+          if (other_pointer < 0) { break; }
+          let other_index = u32(other_pointer);
+          other_pointer = collision_grid_next[other_index];
+          if (other_index == index || any(collision_grid_cells[other_index].xyz != neighbor_cell)) { continue; }
+          let other = collision_in[other_index];
+          let other_radius = collision_meta[other_index].y;
+          let candidate_delta = other.position.xyz - state.position.xyz;
+          let candidate_squared = dot(candidate_delta, candidate_delta);
+          let combined_with_padding = own_radius + other_radius + 2.0;
+          var delta = predicted - other.position.xyz - other.velocity.xyz;
+          if (dimensions == 2u) { delta.z = 0.0; }
+          var squared = dot(delta, delta);
+          let qualifies = candidate_squared <= charge_distance_squared
+            || candidate_squared <= unrelated_distance_squared
+            || squared <= combined_with_padding * combined_with_padding;
+          if (!qualifies) { continue; }
+          if (selected_candidates >= neighbor_limit) { continue; }
+          selected_candidates += 1u;
+          let combined = own_radius + other_radius;
+          if (squared >= combined * combined) { continue; }
+          if (delta.x == 0.0) { delta.x = pair_jiggle(other_index, index, 0u); squared += delta.x * delta.x; }
+          if (delta.y == 0.0) { delta.y = pair_jiggle(other_index, index, 1u); squared += delta.y * delta.y; }
+          if (dimensions == 3u && delta.z == 0.0) { delta.z = pair_jiggle(other_index, index, 2u); squared += delta.z * delta.z; }
+          let distance = sqrt(max(1e-20, squared));
+          let other_radius_squared = other_radius * other_radius;
+          let weight = other_radius_squared / max(1e-20, own_radius_squared + other_radius_squared);
+          impulse += delta / distance * (combined - distance) * weight;
+        }
+      }
+    }
   }
   state.velocity = vec4<f32>(state.velocity.xyz + impulse, 0.0);
   collision_out[index] = state;
@@ -574,6 +804,12 @@ function createBuffer(device: GpuObject, size: number, usage: number): GpuObject
   return device.createBuffer({ size: Math.max(4, Math.ceil(size / 4) * 4), usage })
 }
 
+function nextPowerOfTwo(value: number): number {
+  let result = 1
+  while (result < value) result *= 2
+  return result
+}
+
 class GpuPhysicsKernel {
   private readonly device: GpuObject
   private readonly options: GpuSimulationOptions
@@ -586,36 +822,57 @@ class GpuPhysicsKernel {
   private readonly pinsBuffer: GpuObject
   private readonly paramsBuffer: GpuObject
   private readonly centerBuffer: GpuObject
+  private readonly centerPartialBuffer: GpuObject
   private readonly readbackBuffer: GpuObject
-  private spatialBuffer: GpuObject
-  private spatialCapacity: number
+  private readonly gridHeadsBuffer: GpuObject
+  private readonly gridNextBuffer: GpuObject
+  private readonly gridCellsBuffer: GpuObject
+  private readonly gridCapacity: number
   private activeState = 0
   private destroyed = false
-  private readonly centerPipeline: GpuObject
+  private readonly centerPartialPipeline: GpuObject
+  private readonly centerFinishPipeline: GpuObject
+  private readonly gridClearPipeline: GpuObject
+  private readonly gridBuildPipeline: GpuObject
   private readonly forcePipeline: GpuObject
   private readonly collisionPipeline: GpuObject
   private readonly integratePipeline: GpuObject
-  private readonly radii: Float32Array
+  private readonly maxRadius: number
+  private readonly pins: Float32Array
+  private readonly params: ArrayBuffer
+  private gridClearGroup: GpuObject | null = null
+  private gridBuildGroups: [GpuObject | null, GpuObject | null] = [null, null]
+  private centerPartialGroups: [GpuObject | null, GpuObject | null] = [null, null]
+  private centerFinishGroup: GpuObject | null = null
+  private forceGroups: [GpuObject | null, GpuObject | null] = [null, null]
+  private collisionGroups: [GpuObject | null, GpuObject | null] = [null, null]
+  private integrateGroups: [GpuObject | null, GpuObject | null] = [null, null]
 
   static async create(device: GpuObject, options: GpuSimulationOptions): Promise<GpuPhysicsKernel> {
     const shader = device.createShaderModule({ label: 'WikiGraph f32 physics', code: GPU_SHADER })
-    const [centerPipeline, forcePipeline, collisionPipeline, integratePipeline] = await Promise.all([
-      device.createComputePipelineAsync({ label: 'WikiGraph center', layout: 'auto', compute: { module: shader, entryPoint: 'center_main' } }),
+    const [centerPartialPipeline, centerFinishPipeline, gridClearPipeline, gridBuildPipeline, forcePipeline, collisionPipeline, integratePipeline] = await Promise.all([
+      device.createComputePipelineAsync({ label: 'WikiGraph center partials', layout: 'auto', compute: { module: shader, entryPoint: 'center_partial_main' } }),
+      device.createComputePipelineAsync({ label: 'WikiGraph center finish', layout: 'auto', compute: { module: shader, entryPoint: 'center_finish_main' } }),
+      device.createComputePipelineAsync({ label: 'WikiGraph grid clear', layout: 'auto', compute: { module: shader, entryPoint: 'grid_clear_main' } }),
+      device.createComputePipelineAsync({ label: 'WikiGraph grid build', layout: 'auto', compute: { module: shader, entryPoint: 'grid_build_main' } }),
       device.createComputePipelineAsync({ label: 'WikiGraph forces', layout: 'auto', compute: { module: shader, entryPoint: 'force_main' } }),
       device.createComputePipelineAsync({ label: 'WikiGraph collisions', layout: 'auto', compute: { module: shader, entryPoint: 'collision_main' } }),
       device.createComputePipelineAsync({ label: 'WikiGraph integration', layout: 'auto', compute: { module: shader, entryPoint: 'integrate_main' } }),
     ])
-    return new GpuPhysicsKernel(device, options, { centerPipeline, forcePipeline, collisionPipeline, integratePipeline })
+    return new GpuPhysicsKernel(device, options, { centerPartialPipeline, centerFinishPipeline, gridClearPipeline, gridBuildPipeline, forcePipeline, collisionPipeline, integratePipeline })
   }
 
   private constructor(
     device: GpuObject,
     options: GpuSimulationOptions,
-    pipelines: { centerPipeline: GpuObject; forcePipeline: GpuObject; collisionPipeline: GpuObject; integratePipeline: GpuObject },
+    pipelines: { centerPartialPipeline: GpuObject; centerFinishPipeline: GpuObject; gridClearPipeline: GpuObject; gridBuildPipeline: GpuObject; forcePipeline: GpuObject; collisionPipeline: GpuObject; integratePipeline: GpuObject },
   ) {
     this.device = device
     this.options = options
-    this.centerPipeline = pipelines.centerPipeline
+    this.centerPartialPipeline = pipelines.centerPartialPipeline
+    this.centerFinishPipeline = pipelines.centerFinishPipeline
+    this.gridClearPipeline = pipelines.gridClearPipeline
+    this.gridBuildPipeline = pipelines.gridBuildPipeline
     this.forcePipeline = pipelines.forcePipeline
     this.collisionPipeline = pipelines.collisionPipeline
     this.integratePipeline = pipelines.integratePipeline
@@ -631,12 +888,17 @@ class GpuPhysicsKernel {
     this.metadataBuffer = createBuffer(device, Math.max(16, options.nodes.length * 4 * Float32Array.BYTES_PER_ELEMENT), this.usage.STORAGE | this.usage.COPY_DST)
     this.topologyBuffer = createBuffer(device, this.topology.words.byteLength, this.usage.STORAGE | this.usage.COPY_DST)
     this.pinsBuffer = createBuffer(device, Math.max(16, options.nodes.length * 4 * Float32Array.BYTES_PER_ELEMENT), this.usage.STORAGE | this.usage.COPY_DST)
-    this.paramsBuffer = createBuffer(device, 128, this.usage.UNIFORM | this.usage.COPY_DST)
+    this.paramsBuffer = createBuffer(device, 160, this.usage.UNIFORM | this.usage.COPY_DST)
     this.centerBuffer = createBuffer(device, 16, this.usage.STORAGE | this.usage.COPY_DST)
+    this.centerPartialBuffer = createBuffer(device, Math.ceil(options.nodes.length / 256) * 4 * Float32Array.BYTES_PER_ELEMENT, this.usage.STORAGE)
     this.readbackBuffer = createBuffer(device, stateBytes, this.usage.MAP_READ | this.usage.COPY_DST)
-    this.spatialCapacity = 4
-    this.spatialBuffer = createBuffer(device, this.spatialCapacity, this.usage.STORAGE | this.usage.COPY_DST)
-    this.radii = Float32Array.from(options.nodeParameters, (parameter) => Math.fround(parameter.radius))
+    this.gridCapacity = nextPowerOfTwo(Math.max(256, options.nodes.length * 4))
+    this.gridHeadsBuffer = createBuffer(device, this.gridCapacity * Int32Array.BYTES_PER_ELEMENT, this.usage.STORAGE)
+    this.gridNextBuffer = createBuffer(device, options.nodes.length * Int32Array.BYTES_PER_ELEMENT, this.usage.STORAGE)
+    this.gridCellsBuffer = createBuffer(device, options.nodes.length * 4 * Int32Array.BYTES_PER_ELEMENT, this.usage.STORAGE)
+    this.maxRadius = options.nodeParameters.reduce((maximum, parameter) => Math.max(maximum, parameter.radius), 1)
+    this.pins = new Float32Array(options.nodes.length * 4)
+    this.params = new ArrayBuffer(160)
 
     const state = new Float32Array(options.nodes.length * 8)
     const metadata = new Float32Array(options.nodes.length * 4)
@@ -662,32 +924,21 @@ class GpuPhysicsKernel {
     device.queue.writeBuffer(this.topologyBuffer, 0, this.topology.words)
   }
 
-  private ensureSpatialCapacity(byteLength: number): void {
-    if (byteLength <= this.spatialCapacity) return
-    let capacity = this.spatialCapacity
-    while (capacity < byteLength) capacity *= 2
-    this.spatialBuffer.destroy()
-    this.spatialCapacity = capacity
-    this.spatialBuffer = createBuffer(this.device, capacity, this.usage.STORAGE | this.usage.COPY_DST)
-  }
-
   private writePins(): void {
     const sentinel = Math.fround(3.4e38)
-    const pins = new Float32Array(this.options.nodes.length * 4)
     for (let index = 0; index < this.options.nodes.length; index += 1) {
       const node = this.options.nodes[index]
       const offset = index * 4
-      pins[offset] = node.fx == null ? sentinel : Math.fround(node.fx)
-      pins[offset + 1] = node.fy == null ? sentinel : Math.fround(node.fy)
-      pins[offset + 2] = this.options.dimensions === 3 && node.fz != null ? Math.fround(node.fz) : sentinel
+      this.pins[offset] = node.fx == null ? sentinel : Math.fround(node.fx)
+      this.pins[offset + 1] = node.fy == null ? sentinel : Math.fround(node.fy)
+      this.pins[offset + 2] = this.options.dimensions === 3 && node.fz != null ? Math.fround(node.fz) : sentinel
     }
-    this.device.queue.writeBuffer(this.pinsBuffer, 0, pins)
+    this.device.queue.writeBuffer(this.pinsBuffer, 0, this.pins)
   }
 
   private writeParams(alpha: number, settings: GraphSimulationSettings): void {
-    const buffer = new ArrayBuffer(128)
-    const floats = new Float32Array(buffer)
-    const integers = new Uint32Array(buffer)
+    const floats = new Float32Array(this.params)
+    const integers = new Uint32Array(this.params)
     const unrelatedQuota = this.options.nodes.length < 2_000
       ? 0xffffffff
       : Math.max(1, Math.ceil(settings.unrelatedInteractionBudget / Math.max(1, this.options.nodes.length)))
@@ -701,6 +952,8 @@ class GpuPhysicsKernel {
     integers[7] = this.topology.nodeHubOffsetsBase
     integers[8] = this.topology.nodeHubEntriesBase
     integers[9] = this.topology.hubCountsBase
+    integers[10] = this.topology.relationOffsetsBase
+    integers[11] = this.topology.relationEntriesBase
     floats[12] = Math.fround(alpha)
     const chargeDistance = Math.fround(settings.chargeDistance * this.options.spacing)
     floats[13] = Math.fround(chargeDistance * chargeDistance)
@@ -721,7 +974,15 @@ class GpuPhysicsKernel {
     floats[27] = Math.fround(settings.unrelatedHubStrength)
     floats[28] = Math.fround(this.options.boundaryRadius)
     floats[29] = Math.fround(1 - settings.velocityDecay)
-    this.device.queue.writeBuffer(this.paramsBuffer, 0, buffer)
+    integers[32] = this.gridCapacity
+    integers[33] = spatialNeighborLimit(this.options.nodes.length)
+    floats[36] = Math.fround(Math.max(
+      64,
+      chargeDistance,
+      this.options.dimensions === 2 ? floats[14] : 0,
+      2 * this.maxRadius + 512,
+    ))
+    this.device.queue.writeBuffer(this.paramsBuffer, 0, this.params)
   }
 
   private bindGroup(pipeline: GpuObject, group: number, entries: Array<{ binding: number; buffer: GpuObject }>): GpuObject {
@@ -731,75 +992,123 @@ class GpuPhysicsKernel {
     })
   }
 
+  private centerPartialGroup(input: number): GpuObject {
+    this.centerPartialGroups[input] ??= this.bindGroup(this.centerPartialPipeline, 0, [
+      { binding: 0, buffer: this.stateBuffers[input] },
+      { binding: 1, buffer: this.centerPartialBuffer },
+      { binding: 2, buffer: this.paramsBuffer },
+    ])
+    return this.centerPartialGroups[input]
+  }
+
+  private getCenterFinishGroup(): GpuObject {
+    this.centerFinishGroup ??= this.bindGroup(this.centerFinishPipeline, 0, [
+      { binding: 1, buffer: this.centerPartialBuffer },
+      { binding: 2, buffer: this.paramsBuffer },
+      { binding: 3, buffer: this.centerBuffer },
+    ])
+    return this.centerFinishGroup
+  }
+
+  private getGridClearGroup(): GpuObject {
+    this.gridClearGroup ??= this.bindGroup(this.gridClearPipeline, 0, [
+      { binding: 2, buffer: this.paramsBuffer },
+      { binding: 4, buffer: this.gridHeadsBuffer },
+    ])
+    return this.gridClearGroup
+  }
+
+  private gridBuildGroup(input: number): GpuObject {
+    this.gridBuildGroups[input] ??= this.bindGroup(this.gridBuildPipeline, 0, [
+      { binding: 0, buffer: this.stateBuffers[input] },
+      { binding: 2, buffer: this.paramsBuffer },
+      { binding: 4, buffer: this.gridHeadsBuffer },
+      { binding: 5, buffer: this.gridNextBuffer },
+      { binding: 6, buffer: this.gridCellsBuffer },
+    ])
+    return this.gridBuildGroups[input]
+  }
+
+  private forceGroup(input: number): GpuObject {
+    this.forceGroups[input] ??= this.bindGroup(this.forcePipeline, 1, [
+      { binding: 0, buffer: this.stateBuffers[input] },
+      { binding: 1, buffer: this.stateBuffers[1 - input] },
+      { binding: 2, buffer: this.metadataBuffer },
+      { binding: 3, buffer: this.topologyBuffer },
+      { binding: 4, buffer: this.gridHeadsBuffer },
+      { binding: 5, buffer: this.gridNextBuffer },
+      { binding: 6, buffer: this.gridCellsBuffer },
+      { binding: 7, buffer: this.centerBuffer },
+      { binding: 8, buffer: this.paramsBuffer },
+    ])
+    return this.forceGroups[input]
+  }
+
+  private collisionGroup(input: number): GpuObject {
+    this.collisionGroups[input] ??= this.bindGroup(this.collisionPipeline, 2, [
+      { binding: 0, buffer: this.stateBuffers[input] },
+      { binding: 1, buffer: this.stateBuffers[1 - input] },
+      { binding: 2, buffer: this.metadataBuffer },
+      { binding: 3, buffer: this.gridHeadsBuffer },
+      { binding: 4, buffer: this.gridNextBuffer },
+      { binding: 5, buffer: this.gridCellsBuffer },
+      { binding: 6, buffer: this.paramsBuffer },
+    ])
+    return this.collisionGroups[input]
+  }
+
+  private integrateGroup(input: number): GpuObject {
+    this.integrateGroups[input] ??= this.bindGroup(this.integratePipeline, 3, [
+      { binding: 0, buffer: this.stateBuffers[input] },
+      { binding: 1, buffer: this.stateBuffers[1 - input] },
+      { binding: 2, buffer: this.pinsBuffer },
+      { binding: 3, buffer: this.paramsBuffer },
+    ])
+    return this.integrateGroups[input]
+  }
+
   async tick(alpha: number, settings: GraphSimulationSettings): Promise<void> {
     if (this.destroyed || this.options.nodes.length === 0) return
-    const spatial = buildSpatialTopology(
-      this.options.nodes,
-      this.options.dimensions,
-      settings,
-      this.options.spacing,
-      this.radii,
-      this.topology.relatedPairs,
-      this.options.largeGraph,
-    )
-    this.ensureSpatialCapacity(spatial.words.byteLength)
-    this.device.queue.writeBuffer(this.spatialBuffer, 0, spatial.words)
     this.writePins()
     this.writeParams(alpha, settings)
 
     const workgroups = Math.ceil(this.options.nodes.length / 128)
+    const centerWorkgroups = Math.ceil(this.options.nodes.length / 256)
+    const gridHeadWorkgroups = Math.ceil(this.gridCapacity / 256)
     const encoder = this.device.createCommandEncoder({ label: 'WikiGraph physics tick' })
     const pass = encoder.beginComputePass({ label: 'WikiGraph physics' })
-    const centerGroup = this.bindGroup(this.centerPipeline, 0, [
-      { binding: 0, buffer: this.stateBuffers[this.activeState] },
-      { binding: 1, buffer: this.centerBuffer },
-      { binding: 2, buffer: this.paramsBuffer },
-    ])
-    pass.setPipeline(this.centerPipeline)
-    pass.setBindGroup(0, centerGroup)
+    pass.setPipeline(this.gridClearPipeline)
+    pass.setBindGroup(0, this.getGridClearGroup())
+    pass.dispatchWorkgroups(gridHeadWorkgroups)
+    pass.setPipeline(this.gridBuildPipeline)
+    pass.setBindGroup(0, this.gridBuildGroup(this.activeState))
+    pass.dispatchWorkgroups(centerWorkgroups)
+    pass.setPipeline(this.centerPartialPipeline)
+    pass.setBindGroup(0, this.centerPartialGroup(this.activeState))
+    pass.dispatchWorkgroups(centerWorkgroups)
+    pass.setPipeline(this.centerFinishPipeline)
+    pass.setBindGroup(0, this.getCenterFinishGroup())
     pass.dispatchWorkgroups(1)
 
     let input = this.activeState
     let output = 1 - input
-    const forceGroup = this.bindGroup(this.forcePipeline, 1, [
-      { binding: 0, buffer: this.stateBuffers[input] },
-      { binding: 1, buffer: this.stateBuffers[output] },
-      { binding: 2, buffer: this.metadataBuffer },
-      { binding: 3, buffer: this.topologyBuffer },
-      { binding: 4, buffer: this.spatialBuffer },
-      { binding: 5, buffer: this.centerBuffer },
-      { binding: 6, buffer: this.paramsBuffer },
-    ])
     pass.setPipeline(this.forcePipeline)
-    pass.setBindGroup(1, forceGroup)
+    pass.setBindGroup(1, this.forceGroup(input))
     pass.dispatchWorkgroups(workgroups)
     input = output
 
     const collisionIterations = Math.max(1, Math.round(settings.collisionIterations))
     for (let iteration = 0; iteration < collisionIterations; iteration += 1) {
       output = 1 - input
-      const collisionGroup = this.bindGroup(this.collisionPipeline, 2, [
-        { binding: 0, buffer: this.stateBuffers[input] },
-        { binding: 1, buffer: this.stateBuffers[output] },
-        { binding: 2, buffer: this.metadataBuffer },
-        { binding: 3, buffer: this.spatialBuffer },
-        { binding: 4, buffer: this.paramsBuffer },
-      ])
       pass.setPipeline(this.collisionPipeline)
-      pass.setBindGroup(2, collisionGroup)
+      pass.setBindGroup(2, this.collisionGroup(input))
       pass.dispatchWorkgroups(workgroups)
       input = output
     }
 
     output = 1 - input
-    const integrateGroup = this.bindGroup(this.integratePipeline, 3, [
-      { binding: 0, buffer: this.stateBuffers[input] },
-      { binding: 1, buffer: this.stateBuffers[output] },
-      { binding: 2, buffer: this.pinsBuffer },
-      { binding: 3, buffer: this.paramsBuffer },
-    ])
     pass.setPipeline(this.integratePipeline)
-    pass.setBindGroup(3, integrateGroup)
+    pass.setBindGroup(3, this.integrateGroup(input))
     pass.dispatchWorkgroups(workgroups)
     pass.end()
     this.activeState = output
@@ -807,8 +1116,7 @@ class GpuPhysicsKernel {
     this.device.queue.submit([encoder.finish()])
 
     await this.readbackBuffer.mapAsync(this.mapMode.READ)
-    const state = new Float32Array(this.readbackBuffer.getMappedRange().slice(0))
-    this.readbackBuffer.unmap()
+    const state = new Float32Array(this.readbackBuffer.getMappedRange())
     for (let index = 0; index < this.options.nodes.length; index += 1) {
       const node = this.options.nodes[index]
       const offset = index * 8
@@ -823,6 +1131,7 @@ class GpuPhysicsKernel {
         throw new Error(`WebGPU produced a non-finite state for node ${node.id}`)
       }
     }
+    this.readbackBuffer.unmap()
   }
 
   destroy(): void {
@@ -834,8 +1143,11 @@ class GpuPhysicsKernel {
     this.pinsBuffer.destroy()
     this.paramsBuffer.destroy()
     this.centerBuffer.destroy()
+    this.centerPartialBuffer.destroy()
     this.readbackBuffer.destroy()
-    this.spatialBuffer.destroy()
+    this.gridHeadsBuffer.destroy()
+    this.gridNextBuffer.destroy()
+    this.gridCellsBuffer.destroy()
   }
 }
 
@@ -846,9 +1158,9 @@ class GpuSimulationController implements PhysicsController {
   private alphaTargetValue: number
   private running = false
   private destroyed = false
-  private frameHandle: number | null = null
   private timerHandle: number | null = null
   private inFlight = false
+  private nextTickAt = 0
 
   constructor(kernel: GpuPhysicsKernel, options: GpuSimulationOptions) {
     this.kernel = kernel
@@ -876,6 +1188,7 @@ class GpuSimulationController implements PhysicsController {
 
   restart(): PhysicsController {
     if (this.destroyed) return this
+    if (!this.running) this.nextTickAt = typeof performance === 'undefined' ? Date.now() : performance.now()
     this.running = true
     this.schedule()
     return this
@@ -883,32 +1196,26 @@ class GpuSimulationController implements PhysicsController {
 
   stop(): PhysicsController {
     this.running = false
-    if (this.frameHandle != null) cancelAnimationFrame(this.frameHandle)
     if (this.timerHandle != null) window.clearTimeout(this.timerHandle)
-    this.frameHandle = null
     this.timerHandle = null
     return this
   }
 
   private schedule(): void {
-    if (!this.running || this.destroyed || this.inFlight || this.frameHandle != null || this.timerHandle != null) return
-    if (this.options.largeGraph) {
-      const delay = Math.min(250, Math.max(50, Math.round(this.options.nodes.length / 500)))
-      this.timerHandle = window.setTimeout(() => {
-        this.timerHandle = null
-        void this.runTick()
-      }, delay)
-    } else {
-      this.frameHandle = requestAnimationFrame(() => {
-        this.frameHandle = null
-        void this.runTick()
-      })
-    }
+    if (!this.running || this.destroyed || this.inFlight || this.timerHandle != null) return
+    const now = typeof performance === 'undefined' ? Date.now() : performance.now()
+    const delay = Math.max(0, this.nextTickAt - now)
+    this.timerHandle = window.setTimeout(() => {
+      this.timerHandle = null
+      void this.runTick()
+    }, delay)
   }
 
   private async runTick(): Promise<void> {
     if (!this.running || this.destroyed || this.inFlight) return
     this.inFlight = true
+    const startedAt = typeof performance === 'undefined' ? Date.now() : performance.now()
+    this.nextTickAt = startedAt + PHYSICS_TICK_INTERVAL_MS
     const settings = this.options.readSettings()
     this.alphaValue = Math.fround(this.alphaValue + Math.fround((this.alphaTargetValue - this.alphaValue) * settings.alphaDecay))
     try {

@@ -17,7 +17,7 @@ import { articleDegree, selectHubIds } from '../graph/hubs'
 import { boundaryForce, boundaryRadius } from '../graph/boundary'
 import { articleRepulsionScale } from '../graph/density'
 import { roundSimulationNodesF32 } from '../graph/f32'
-import { createGpuGraphSimulation, type PhysicsController } from '../graph/gpuSimulation'
+import { createGpuGraphSimulation, nextPhysicsTickDelay, type PhysicsController } from '../graph/gpuSimulation'
 import { layoutSpacing, seedLayout, symmetricAttraction, unrelatedRepulsion, hubInteractions } from '../graph/layout'
 
 export type GraphNode = SimulationNodeDatum & {
@@ -148,6 +148,8 @@ type Bounds = { minX: number; maxX: number; minY: number; maxY: number }
 type Orbit = { yaw: number; pitch: number }
 type LayoutGraph = { nodes: GraphNode[]; links: GraphLink[] }
 type LayoutCache = { graph: GraphData | null; twoD: LayoutGraph | null; threeD: LayoutGraph | null }
+type RenderLink = { edge: GraphLink; index: number }
+type RenderSubset = { graph: LayoutGraph; visibleIds: ReadonlySet<string> | null; nodes: GraphNode[]; links: RenderLink[] }
 
 const articleBytes = (node: GraphNode) => {
   const value = node.articleSize ?? node.byteLength ?? 0
@@ -293,6 +295,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
   const settingsRef = useRef(settings)
   const drawRef = useRef<() => void>(() => undefined)
   const nodeMapRef = useRef<{ graph: GraphData; map: Map<string, GraphNode> } | null>(null)
+  const renderSubsetRef = useRef<RenderSubset | null>(null)
   const last3DDrawRef = useRef(0)
   const largeTickTimerRef = useRef<number | null>(null)
   const manualTickRef = useRef<(() => void) | null>(null)
@@ -338,6 +341,28 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     return hubSelectionRef.current.ids
   }
 
+  const getRenderSubset = (currentGraph: LayoutGraph): RenderSubset => {
+    const visibleIds = visibleNodeIdsRef.current
+    const cached = renderSubsetRef.current
+    if (cached?.graph === currentGraph && cached.visibleIds === visibleIds) return cached
+    const nodes = visibleIds
+      ? currentGraph.nodes.filter((node) => visibleIds.has(node.id))
+      : currentGraph.nodes
+    const links: RenderLink[] = []
+    for (let index = 0; index < currentGraph.links.length; index += 1) {
+      const edge = currentGraph.links[index]
+      if (visibleIds) {
+        const sourceId = typeof edge.source === 'string' ? edge.source : edge.source.id
+        const targetId = typeof edge.target === 'string' ? edge.target : edge.target.id
+        if (!visibleIds.has(sourceId) || !visibleIds.has(targetId)) continue
+      }
+      links.push({ edge, index })
+    }
+    const subset = { graph: currentGraph, visibleIds, nodes, links }
+    renderSubsetRef.current = subset
+    return subset
+  }
+
   const project3D = (node: GraphNode) => {
     const view = viewRef.current
     const orbit = orbitRef.current
@@ -362,11 +387,12 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     }
   }
 
-  const draw3D = (ctx: CanvasRenderingContext2D, nodes: GraphNode[], links: GraphLink[], selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
+  const draw3D = (ctx: CanvasRenderingContext2D, currentGraph: LayoutGraph, selected: GraphNode | undefined, hovered: GraphNode | null, nodeMap: Map<string, GraphNode>) => {
+    const { nodes, links } = currentGraph
     const radius = boundaryRadius(nodes.length, 3)
     const hubIds = getHubIds(nodes, links)
-    const isVisible = (node: GraphNode) => !visibleNodeIdsRef.current || visibleNodeIdsRef.current.has(node.id)
-    const visibleNodes = nodes.filter(isVisible)
+    const renderSubset = getRenderSubset(currentGraph)
+    const visibleNodes = renderSubset.nodes
     const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
     const showAllLabels = visibleNodes.length <= Math.max(80, hubIds.size)
     ctx.save()
@@ -387,11 +413,11 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     }
     ctx.restore()
     const projected = new Map<GraphNode, ReturnType<typeof project3D>>()
-    for (const node of nodes) projected.set(node, project3D(node))
-    const visibleLinks = links.map((edge) => {
+    for (const node of visibleNodes) projected.set(node, project3D(node))
+    const visibleLinks = renderSubset.links.map(({ edge }) => {
       const source = linkNode(edge.source, nodeMap)
       const target = linkNode(edge.target, nodeMap)
-      return source && target && isVisible(source) && isVisible(target)
+      return source && target
         ? { source, target, sourcePoint: projected.get(source), targetPoint: projected.get(target) }
         : null
     }).filter((edge): edge is { source: GraphNode; target: GraphNode; sourcePoint: ReturnType<typeof project3D>; targetPoint: ReturnType<typeof project3D> } => Boolean(edge?.sourcePoint && edge.targetPoint))
@@ -427,7 +453,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       ctx.closePath()
       ctx.fill()
     }
-    const sortedNodes = nodes.filter(isVisible).map((node) => ({ node, point: projected.get(node) })).filter((item): item is { node: GraphNode; point: ReturnType<typeof project3D> } => Boolean(item.point))
+    const sortedNodes = visibleNodes.map((node) => ({ node, point: projected.get(node) })).filter((item): item is { node: GraphNode; point: ReturnType<typeof project3D> } => Boolean(item.point))
     if (sortedNodes.length <= 10_000) sortedNodes.sort((a, b) => b.point.depth - a.point.depth)
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
@@ -508,7 +534,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const { width, height, dpr } = sizeRef.current
     const ctx = canvas.getContext('2d')
     if (!ctx) return
-    if (modeRef.current === '3d' && graphRef.current.nodes.length > LARGE_GRAPH_THRESHOLD) {
+    const displayedNodeCount = visibleNodeIdsRef.current?.size ?? graphRef.current.nodes.length
+    if (modeRef.current === '3d' && displayedNodeCount > LARGE_GRAPH_THRESHOLD) {
       const now = typeof performance === 'undefined' ? Date.now() : performance.now()
       if (now - last3DDrawRef.current < 32) return
       last3DDrawRef.current = now
@@ -521,9 +548,8 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     ctx.scale(view.scale, view.scale)
     const currentGraph = activeLayoutRef.current ?? graphRef.current
     const nodes = currentGraph.nodes
-    const visibleNodes = visibleNodeIdsRef.current
-      ? nodes.filter((node) => visibleNodeIdsRef.current?.has(node.id))
-      : nodes
+    const renderSubset = getRenderSubset(currentGraph)
+    const visibleNodes = renderSubset.nodes
     const largeGraph = nodes.length > LARGE_GRAPH_THRESHOLD
     const renderLargeGraph = largeGraph && visibleNodes.length > LARGE_GRAPH_THRESHOLD
     const dotScale = visualNodeScale(visibleNodes.length, nodes.length)
@@ -543,7 +569,7 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const hovered = hoverRef.current
     if (modeRef.current === '3d') {
       ctx.restore()
-      draw3D(ctx, nodes, currentGraph.links, selected, hovered, nodeMap)
+      draw3D(ctx, currentGraph, selected, hovered, nodeMap)
       if (nodes.length > 0 && activeGraphRef.current === graphRef.current && graphRenderedRef.current !== graphRef.current) {
         graphRenderedRef.current = graphRef.current
         graphRenderedCallbackRef.current?.(graphRef.current)
@@ -562,12 +588,10 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const hubIds = getHubIds(nodes, currentGraph.links)
 
     ctx.lineCap = 'round'
-    for (let edgeIndex = 0; edgeIndex < currentGraph.links.length; edgeIndex += 1) {
-      const edge = currentGraph.links[edgeIndex]
+    for (const { edge, index: edgeIndex } of renderSubset.links) {
       const source = linkNode(edge.source, nodeMap)
       const target = linkNode(edge.target, nodeMap)
       if (!source || !target || source.x == null || target.x == null || source.y == null || target.y == null) continue
-      if (visibleNodeIdsRef.current && (!visibleNodeIdsRef.current.has(source.id) || !visibleNodeIdsRef.current.has(target.id))) continue
       const isRelated = source === selected || target === selected
       if (renderLargeGraph && !isRelated && edgeIndex % linkStride !== 0) continue
       ctx.strokeStyle = isRelated ? 'rgba(37, 79, 239, .72)' : renderLargeGraph ? 'rgba(115, 119, 127, .16)' : 'rgba(115, 119, 127, .22)'
@@ -678,6 +702,9 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
     const afterTick = () => {
       roundSimulationNodesF32(layoutGraph.nodes, dimensions)
       simulationTicks += 1
+      if ((import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV && hostRef.current) {
+        hostRef.current.dataset.physicsTicks = String(simulationTicks)
+      }
       physicsTickCallbackRef.current?.()
       if (!invalidState && protectNumerics && (simulationTicks <= 120 || simulationTicks % 32 === 0)) {
         const numericLimit = 1_000_000
@@ -752,13 +779,16 @@ const GraphCanvas = forwardRef<GraphCanvasHandle, GraphCanvasProps>(function Gra
       sim.on('tick', afterTick)
       if (largeGraph) {
         sim.stop()
-        const tickDelay = Math.min(250, Math.max(50, Math.round(layoutGraph.nodes.length / 500)))
         const runLargeTick = () => {
           largeTickTimerRef.current = null
           if (pausedRef.current || invalidState || disposed) return
+          const startedAt = typeof performance === 'undefined' ? Date.now() : performance.now()
           sim.tick()
           afterTick()
-          if (!pausedRef.current && !invalidState && sim.alpha() >= sim.alphaMin()) largeTickTimerRef.current = window.setTimeout(runLargeTick, tickDelay)
+          if (!pausedRef.current && !invalidState && sim.alpha() >= sim.alphaMin()) {
+            const now = typeof performance === 'undefined' ? Date.now() : performance.now()
+            largeTickTimerRef.current = window.setTimeout(runLargeTick, nextPhysicsTickDelay(startedAt, now))
+          }
         }
         manualTickRef.current = runLargeTick
         if (!pausedRef.current) largeTickTimerRef.current = window.setTimeout(runLargeTick, 0)

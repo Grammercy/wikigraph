@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { roundSimulationNodesF32 } from '../src/graph/f32.ts'
-import { buildSpatialTopology, prepareGpuTopology } from '../src/graph/gpuSimulation.ts'
+import { buildSpatialTopology, nextPhysicsTickDelay, PHYSICS_TICKS_PER_SECOND, prepareGpuTopology } from '../src/graph/gpuSimulation.ts'
+
+test('physics uses the same 60 Hz target at every graph size', () => {
+  assert.equal(PHYSICS_TICKS_PER_SECOND, 60)
+  assert.equal(nextPhysicsTickDelay(100, 104), 1_000 / 60 - 4)
+  assert.equal(nextPhysicsTickDelay(100, 120), 0)
+})
 
 test('CPU fallback stores every simulation coordinate as f32', () => {
   const nodes = [{
@@ -37,6 +43,13 @@ test('GPU topology preserves non-hub links and hub memberships', () => {
   assert.equal(bEnd - bStart, 1)
   assert.equal(topology.words[topology.linkEntriesBase + aStart * 2], 2)
   assert.equal(topology.words[topology.linkEntriesBase + bStart * 2], 1)
+
+  const relatedStart = topology.words[topology.relationOffsetsBase + 1]
+  const relatedEnd = topology.words[topology.relationOffsetsBase + 2]
+  assert.deepEqual(
+    [...topology.words.slice(topology.relationEntriesBase + relatedStart, topology.relationEntriesBase + relatedEnd)].sort((a, b) => a - b),
+    [0, 2],
+  )
 })
 
 test('GPU spatial topology marks related neighbors and omits distant nodes', () => {
