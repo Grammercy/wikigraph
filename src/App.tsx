@@ -3,6 +3,7 @@ import GraphCanvas, { DEFAULT_SIMULATION_SETTINGS, type GraphCanvasHandle, type 
 import { fetchWikiGraphProgressive, fetchWikiStats, usesLocalCorpus } from './data/wiki'
 import { selectHubIds } from './graph/hubs'
 import { decayedLinkDistanceScale, LINK_DISTANCE_SCALE_DECAY_MS, LINK_DISTANCE_SCALE_PHYSICS_STEP_MS, LINK_DISTANCE_SCALE_START } from './graph/linkDistanceDecay'
+import { isYearOrDayArticle } from './graph/articleFilters'
 import { selectVisibleArticleIds } from './graph/visibility'
 import type { WikiGraph, WikiStats } from './types'
 
@@ -116,6 +117,7 @@ export default function App() {
   const [paused, setPaused] = useState(false)
   const [showLabels, setShowLabels] = useState(true)
   const [showAllLabels, setShowAllLabels] = useState(false)
+  const [removeYearAndDayArticles, setRemoveYearAndDayArticles] = useState(false)
   const [graphMode, setGraphMode] = useState<GraphCanvasMode>('2d')
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const [finderOpen, setFinderOpen] = useState(false)
@@ -194,7 +196,11 @@ export default function App() {
     setCount((previous) => Math.min(previous, articleMaximum))
   }, [articleMaximum])
 
-  const load = useCallback(async (amount: number) => {
+  const load = useCallback(async (amount: number, options: { replaceCalendarArticles?: boolean; maximum?: number } = {}) => {
+    const targetAmount = Math.max(1, Math.floor(amount) || 1)
+    const replaceCalendarArticles = options.replaceCalendarArticles ?? false
+    const maximum = Math.max(targetAmount, Math.floor(options.maximum ?? (usesLocalCorpus ? Number.MAX_SAFE_INTEGER : PUBLIC_MAX_ARTICLES)))
+    let requestAmount = targetAmount
     linkDistanceDecayPendingRef.current = true
     renderedGraphRef.current = null
     stopLinkDistanceDecay()
@@ -206,21 +212,40 @@ export default function App() {
     const controller = new AbortController()
     requestRef.current = controller
     setLoading(true)
-    setLoadProgress({ loaded: 0, requested: amount })
     setError(null)
     try {
-      const next = await fetchWikiGraphProgressive(amount, controller.signal, ({ loaded, requested, graph: partial }) => {
-        if (version !== requestVersionRef.current) return
-        setLoadProgress({ loaded, requested })
-        setGraph(partial)
-      })
+      let next: WikiGraph = { nodes: [], links: [] }
+      let previousNodeCount = -1
+      let previousEligibleCount = -1
+      while (true) {
+        setLoadProgress({ loaded: 0, requested: requestAmount })
+        next = await fetchWikiGraphProgressive(requestAmount, controller.signal, ({ loaded, requested, graph: partial }) => {
+          if (version !== requestVersionRef.current) return
+          setLoadProgress({ loaded, requested })
+          setGraph(partial)
+        })
+        if (!replaceCalendarArticles) break
+        const eligibleCount = next.nodes.reduce((total, node) => total + (isYearOrDayArticle(node.title) ? 0 : 1), 0)
+        if (eligibleCount >= targetAmount || requestAmount >= maximum) break
+        // Stop when a local tier, a public preview, or the finite fallback
+        // cannot provide any more records. Hosted public-API batches can still
+        // yield new records after a sparse response, so keep topping those up.
+        if (next.nodes.length <= previousNodeCount && eligibleCount <= previousEligibleCount
+          && (usesLocalCorpus || next.source === 'fallback')) break
+        previousNodeCount = next.nodes.length
+        previousEligibleCount = eligibleCount
+        const missing = targetAmount - eligibleCount
+        const nextRequestAmount = Math.min(maximum, Math.max(requestAmount + 1, requestAmount + missing))
+        if (nextRequestAmount <= requestAmount) break
+        requestAmount = nextRequestAmount
+      }
       if (version !== requestVersionRef.current) return
       setGraph(next)
       setSelectedId(null)
       setHoveredId(null)
       if (next.source === 'fallback') setError('Wikipedia is unavailable — showing a local demo graph (up to 51 articles).')
-      else if (amount > 500 && usesLocalCorpus && next.local !== true) setError('The local Wikipedia index is still building — showing a 1,000-article public-API preview until its tiers are ready.')
-      else if (amount > 500 && !usesLocalCorpus) setError('The hosted public API is limited to 500 articles. Run the local D: host for the full indexed corpus.')
+      else if (requestAmount > 500 && usesLocalCorpus && next.local !== true) setError('The local Wikipedia index is still building — showing a 1,000-article public-API preview until its tiers are ready.')
+      else if (requestAmount > 500 && !usesLocalCorpus) setError('The hosted public API is limited to 500 articles. Run the local D: host for the full indexed corpus.')
     } catch (cause) {
       if (controller.signal.aborted || (cause instanceof DOMException && cause.name === 'AbortError')) return
       if (version === requestVersionRef.current) setError('Unable to load Wikipedia articles. Try generating the map again.')
@@ -237,12 +262,32 @@ export default function App() {
     }
   }, [load])
 
-  const nodeById = useMemo(() => new Map(graph.nodes.map((node) => [node.id, node])), [graph.nodes])
+  const filteredGraph = useMemo(() => {
+    if (!removeYearAndDayArticles) return graph
+    const removedIds = new Set(graph.nodes.filter((node) => isYearOrDayArticle(node.title)).map((node) => node.id))
+    if (!removedIds.size) return graph
+    const endpointId = (endpoint: string | WikiGraph['nodes'][number]) => typeof endpoint === 'string' ? endpoint : endpoint.id
+    const nodes = graph.nodes.filter((node) => !removedIds.has(node.id))
+    const links = graph.links.filter((link) => !removedIds.has(endpointId(link.source)) && !removedIds.has(endpointId(link.target)))
+    const degrees = new Map(nodes.map((node) => [node.id, { inDegree: 0, outDegree: 0 }]))
+    for (const link of links) {
+      const source = degrees.get(endpointId(link.source))
+      const target = degrees.get(endpointId(link.target))
+      if (source) source.outDegree += 1
+      if (target) target.inDegree += 1
+    }
+    return {
+      ...graph,
+      nodes: nodes.map((node) => ({ ...node, ...degrees.get(node.id) })),
+      links,
+    }
+  }, [graph, removeYearAndDayArticles])
+  const nodeById = useMemo(() => new Map(filteredGraph.nodes.map((node) => [node.id, node])), [filteredGraph.nodes])
   const selected = selectedId ? nodeById.get(selectedId) : undefined
   const finderResults = useMemo(() => {
     const query = finderQuery.trim().toLocaleLowerCase()
     if (!query) return []
-    return graph.nodes
+    return filteredGraph.nodes
       .map((node) => {
         const title = node.title.toLocaleLowerCase()
         const id = node.id.toLocaleLowerCase()
@@ -255,8 +300,8 @@ export default function App() {
       .filter((result): result is { node: WikiGraph['nodes'][number]; score: number; matchIndex: number } => Boolean(result))
       .sort((a, b) => a.score - b.score || a.matchIndex - b.matchIndex || a.node.title.localeCompare(b.node.title))
       .slice(0, 18)
-  }, [finderQuery, graph.nodes])
-  const selectedLinks = selected ? graph.links.filter((edge) => {
+  }, [finderQuery, filteredGraph.nodes])
+  const selectedLinks = selected ? filteredGraph.links.filter((edge) => {
     const source = typeof edge.source === 'string' ? edge.source : edge.source.id
     const target = typeof edge.target === 'string' ? edge.target : edge.target.id
     return source === selected.id || target === selected.id
@@ -264,17 +309,17 @@ export default function App() {
   const relatedArticles = useMemo(() => {
     if (!selected) return []
     const relatedIds = new Set<string>()
-    for (const edge of graph.links) {
+    for (const edge of filteredGraph.links) {
       const source = typeof edge.source === 'string' ? edge.source : edge.source.id
       const target = typeof edge.target === 'string' ? edge.target : edge.target.id
       if (source === selected.id) relatedIds.add(target)
       if (target === selected.id) relatedIds.add(source)
     }
     return [...relatedIds].slice(0, 5).map((id) => nodeById.get(id)).filter((node): node is WikiGraph['nodes'][number] => Boolean(node))
-  }, [graph.links, nodeById, selected])
-  const hubIds = useMemo(() => selectHubIds(graph.nodes, graph.links), [graph])
+  }, [filteredGraph.links, nodeById, selected])
+  const hubIds = useMemo(() => selectHubIds(filteredGraph.nodes, filteredGraph.links), [filteredGraph])
   const displayMinimum = hubIds.size
-  const displayMaximum = graph.nodes.length
+  const displayMaximum = filteredGraph.nodes.length
   const effectiveDisplayCount = displayMaximum > 0
     ? Math.max(displayMinimum, Math.min(displayMaximum, displayCount || displayMinimum))
     : 0
@@ -282,22 +327,22 @@ export default function App() {
     ? displayMaximum > 1_000 ? 1_000 : Math.sqrt(Math.max(1, displayMinimum) * displayMaximum)
     : displayMinimum
   const visibleNodeIds = useMemo(
-    () => selectVisibleArticleIds(graph.nodes, graph.links, effectiveDisplayCount, selectedId),
-    [effectiveDisplayCount, graph, selectedId],
+    () => selectVisibleArticleIds(filteredGraph.nodes, filteredGraph.links, effectiveDisplayCount, selectedId),
+    [effectiveDisplayCount, filteredGraph, selectedId],
   )
-  const visibleArticleCount = graph.nodes.reduce((count, node) => count + (visibleNodeIds.has(node.id) ? 1 : 0), 0)
+  const visibleArticleCount = filteredGraph.nodes.reduce((count, node) => count + (visibleNodeIds.has(node.id) ? 1 : 0), 0)
   const graphForCanvas = useMemo(() => {
     return {
-      nodes: graph.nodes.map((node) => {
+      nodes: filteredGraph.nodes.map((node) => {
         const degree = (node.inDegree ?? 0) + (node.outDegree ?? 0)
         return {
           ...node,
           color: hubIds.has(node.id) ? '#254fef' : degree >= 4 ? '#6e86f2' : '#b6c4ff',
         }
       }),
-      links: graph.links,
+      links: filteredGraph.links,
     }
-  }, [graph, hubIds])
+  }, [filteredGraph, hubIds])
   useEffect(() => {
     if (!displayMaximum) {
       setDisplayCount(0)
@@ -309,11 +354,21 @@ export default function App() {
   useEffect(() => {
     if (hoveredId && !visibleNodeIds.has(hoveredId)) setHoveredId(null)
   }, [hoveredId, visibleNodeIds])
+  useEffect(() => {
+    if (selectedId && !nodeById.has(selectedId)) setSelectedId(null)
+  }, [nodeById, selectedId])
   const updateDisplayCount = useCallback((value: number) => {
     const next = Math.max(displayMinimum, Math.min(displayMaximum, Math.round(value)))
     setDisplayCount(next)
     if (displayMaximum > 0) displayRatioRef.current = next / displayMaximum
   }, [displayMaximum, displayMinimum])
+  const toggleCalendarArticleFilter = useCallback(() => {
+    const next = !removeYearAndDayArticles
+    setRemoveYearAndDayArticles(next)
+    // Refresh immediately so deleted calendar pages are replaced without
+    // making the user press Generate again.
+    if (count <= SAFE_NODE_THRESHOLD || largeMapAcknowledged) void load(count, { replaceCalendarArticles: next, maximum: articleMaximum })
+  }, [articleMaximum, count, largeMapAcknowledged, load, removeYearAndDayArticles])
   const handleSelect = useCallback((node: GraphData['nodes'][number]) => {
     setSelectedId((current) => current === node.id ? null : node.id)
   }, [])
@@ -370,10 +425,10 @@ export default function App() {
   // case the canvas already painted it while loading, so acknowledge the
   // render when loading completes as well.
   useEffect(() => {
-    if (loading || !graph.nodes.length || renderedGraphRef.current !== graphForCanvas) return
+    if (loading || !filteredGraph.nodes.length || renderedGraphRef.current !== graphForCanvas) return
     startPendingLinkDistanceDecay()
-  }, [graph.nodes.length, graphForCanvas, loading, startPendingLinkDistanceDecay])
-  const averageLinks = graph.nodes.length ? graph.links.length / graph.nodes.length : 0
+  }, [filteredGraph.nodes.length, graphForCanvas, loading, startPendingLinkDistanceDecay])
+  const averageLinks = filteredGraph.nodes.length ? filteredGraph.links.length / filteredGraph.nodes.length : 0
   const largeMap = count > SAFE_NODE_THRESHOLD
   const progressLabel = loading && loadProgress.requested > 500
     ? `Loading ${loadProgress.loaded.toLocaleString()} / ${loadProgress.requested.toLocaleString()}…`
@@ -399,12 +454,13 @@ export default function App() {
           <div className="range-labels"><span>{displayMinimum.toLocaleString()}</span><span>{Math.round(displaySliderCenter).toLocaleString()}</span><span>{displayMaximum.toLocaleString()}</span></div>
         </>}
         {largeMap && <label className="large-map-warning"><input type="checkbox" checked={largeMapAcknowledged} onChange={(event) => setLargeMapAcknowledged(event.target.checked)} /> Large maps may use significant memory and processing time. Continue past {SAFE_NODE_THRESHOLD.toLocaleString()} articles.</label>}
-        <button className="primary-button" onClick={() => void load(count)} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
+        <button className="primary-button" onClick={() => void load(count, { replaceCalendarArticles: removeYearAndDayArticles, maximum: articleMaximum })} disabled={loading || (largeMap && !largeMapAcknowledged)}><span>{loading ? '◌' : '↻'}</span>{loading ? progressLabel : 'Generate new map'}</button>
         <div className="rule" />
         <div className="field-label">SIMULATION</div>
         <button className="toggle-row" onClick={() => setPaused(!paused)} aria-pressed={!paused}><span>Physics engine</span><span className={`toggle ${!paused ? 'on' : ''}`}><i /></span></button>
         <button type="button" className="toggle-row" onClick={() => setShowLabels(!showLabels)} aria-label={`${showLabels ? 'Hide' : 'Show'} article names`} aria-pressed={showLabels}><span>Article names</span><span className={`toggle ${showLabels ? 'on' : ''}`}><i /></span></button>
         <button type="button" className="toggle-row" onClick={() => setShowAllLabels(!showAllLabels)} aria-label={`${showAllLabels ? 'Show fewer' : 'Show all'} article names`} aria-pressed={showAllLabels} disabled={!showLabels}><span>Show all names</span><span className={`toggle ${showAllLabels ? 'on' : ''}`}><i /></span></button>
+        <button type="button" className="toggle-row" onClick={toggleCalendarArticleFilter} aria-label={`${removeYearAndDayArticles ? 'Show' : 'Remove'} year and day articles`} aria-pressed={removeYearAndDayArticles}><span>Remove year and day articles</span><span className={`toggle ${removeYearAndDayArticles ? 'on' : ''}`}><i /></span></button>
         <div className="view-mode-control" role="group" aria-label="Graph view">
           <span className="view-mode-label">Graph view</span>
           <div className="view-mode-options">
@@ -459,7 +515,7 @@ export default function App() {
         </details>
       </aside>
       <section className="canvas-panel" aria-label="Wikipedia article graph">
-        <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === graph.nodes.length ? ' articles' : ` of ${graph.nodes.length.toLocaleString()} articles`} <i /> <b>{graph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={openFinder} disabled={!graph.nodes.length}>Find</button><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!graph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!graph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
+        <div className="canvas-toolbar"><span><b>{visibleArticleCount}</b>{visibleArticleCount === filteredGraph.nodes.length ? ' articles' : ` of ${filteredGraph.nodes.length.toLocaleString()} articles`} <i /> <b>{filteredGraph.links.length}</b> connections <i /> <span className="muted">{averageLinks.toFixed(1)} avg links/article</span>{hoveredId && <><i /> <span className="hover-readout">{nodeById.get(hoveredId)?.title}</span></>}</span><span className="toolbar-actions"><span className="view-badge">{graphMode.toUpperCase()} VIEW</span><button type="button" onClick={openFinder} disabled={!filteredGraph.nodes.length}>Find</button><button type="button" onClick={() => canvasRef.current?.fit()} disabled={!filteredGraph.nodes.length}>Fit</button><button type="button" onClick={() => canvasRef.current?.resetView()} disabled={!filteredGraph.nodes.length}>Reset</button><span className="zoom-hint">{graphMode === '3d' ? 'DRAG OR ARROWS TO ORBIT · SCROLL TO ZOOM' : 'SCROLL TO ZOOM'}</span></span></div>
         {finderOpen && <div className="finder-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setFinderOpen(false) }}>
           <section className="article-finder" role="dialog" aria-modal="true" aria-label="Article finder">
             <header className="article-finder-header">
