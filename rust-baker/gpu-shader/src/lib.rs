@@ -40,6 +40,7 @@ pub struct Params {
     pub hub_force: f32,
     pub hub_territory_base: f32,
     pub hub_territory_scale: f32,
+    pub node_offset: u32,
 }
 
 #[spirv(compute(threads(64)))]
@@ -51,7 +52,7 @@ pub fn main(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] hubs: &[u32],
     #[spirv(uniform, descriptor_set = 0, binding = 4)] params: &Params,
 ) {
-    let index = gid.x as usize;
+    let index = params.node_offset as usize + gid.x as usize;
     if index >= params.node_count as usize {
         return;
     }

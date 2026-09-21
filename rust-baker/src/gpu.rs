@@ -6,8 +6,8 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use crate::{
-    article_importance, hub_score, layout_spacing, node_radius, seed_layout, select_hubs, Graph,
-    Settings,
+    article_importance, hub_score, layout_spacing, node_radius, seed_layout,
+    select_hubs_with_adjacency, Graph, Settings,
 };
 
 const SHADER: &[u8] = include_bytes!(concat!(
@@ -16,6 +16,11 @@ const SHADER: &[u8] = include_bytes!(concat!(
 ));
 const WORKGROUP_SIZE: u32 = 64;
 const BATCH_SIZE: usize = 32;
+const LARGE_GRAPH_BATCH_THRESHOLD: usize = 1_000_000;
+const LARGE_GRAPH_CHARGE_SAMPLES: usize = 64;
+const MAX_WORKGROUPS_PER_DISPATCH: u32 = 65_535;
+const MAX_NODES_PER_DISPATCH: usize =
+    MAX_WORKGROUPS_PER_DISPATCH as usize * WORKGROUP_SIZE as usize;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,6 +58,7 @@ struct Params {
     hub_force: f32,
     hub_territory_base: f32,
     hub_territory_scale: f32,
+    node_offset: u32,
 }
 
 struct Buffer {
@@ -78,6 +84,7 @@ struct Runtime {
     params: Buffer,
     params_stride: vk::DeviceSize,
     adjacency_count: u32,
+    dispatch_chunks: usize,
 }
 
 struct GpuProgress {
@@ -262,7 +269,13 @@ fn create_buffer(
 }
 
 impl Runtime {
-    fn new(graph: &Graph, hubs: &[bool], settings: &Settings) -> io::Result<Self> {
+    fn new(
+        graph: &Graph,
+        hubs: &[bool],
+        settings: &Settings,
+        offsets: &[u32],
+        targets: &[u32],
+    ) -> io::Result<Self> {
         let entry = unsafe { Entry::load().map_err(|e| error(format!("load Vulkan: {e}")))? };
         let app_name = CString::new("wikigraph-baker").expect("static string");
         let engine_name = CString::new("rust-gpu").expect("static string");
@@ -319,18 +332,6 @@ impl Runtime {
                 .map_err(|e| error(format!("create Vulkan command pool: {e:?}")))?
         };
 
-        let mut adjacency = vec![Vec::<u32>::new(); graph.nodes.len()];
-        for link in &graph.links {
-            adjacency[link.source].push(link.target as u32);
-            adjacency[link.target].push(link.source as u32);
-        }
-        let mut targets: Vec<u32> = Vec::new();
-        let mut offsets = Vec::with_capacity(graph.nodes.len() + 1);
-        offsets.push(0u32);
-        for neighbors in &adjacency {
-            targets.extend(neighbors);
-            offsets.push(targets.len() as u32);
-        }
         let hub_indices: Vec<u32> = hubs
             .iter()
             .enumerate()
@@ -385,12 +386,13 @@ impl Runtime {
         let params_alignment = limits.min_uniform_buffer_offset_alignment.max(16) as u64;
         let params_stride = (size_of::<Params>() as u64 + params_alignment - 1) / params_alignment
             * params_alignment;
+        let dispatch_chunks = graph.nodes.len().div_ceil(MAX_NODES_PER_DISPATCH);
         let params = create_buffer(
             &instance,
             &device,
             physical,
             &properties,
-            params_stride * BATCH_SIZE as u64,
+            params_stride * (BATCH_SIZE * dispatch_chunks) as u64,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
         )?;
         write_bytes(&device, &nodes, 0, &gpu_nodes);
@@ -533,6 +535,7 @@ impl Runtime {
             params,
             params_stride,
             adjacency_count: targets.len() as u32,
+            dispatch_chunks,
         })
     }
 
@@ -545,11 +548,26 @@ impl Runtime {
         repulsion_scale: f32,
         hub_count: usize,
     ) -> io::Result<()> {
-        let sample_stride = ((graph.nodes.len() as f64 / 256.0).ceil() as u32).max(1);
+        let charge_samples = if graph.nodes.len() > LARGE_GRAPH_BATCH_THRESHOLD {
+            LARGE_GRAPH_CHARGE_SAMPLES
+        } else {
+            256
+        };
+        let sample_stride =
+            ((graph.nodes.len() as f64 / charge_samples as f64).ceil() as u32).max(1);
+        println!("GPU charge sample budget: {} per node", charge_samples);
         let mut alpha = settings.initial_temperature.clamp(settings.alpha_min, 1.0) as f32;
         let mut completed = 0usize;
         let mut progress = GpuProgress::new(iterations);
         let mut pending: Option<(vk::Fence, Vec<vk::CommandBuffer>, usize)> = None;
+        // A large graph makes one tick expensive enough to trip integrated-GPU
+        // watchdogs when many ticks are recorded into a single submission.
+        // Keep each submission to one tick above this threshold.
+        let batch_limit = if graph.nodes.len() > LARGE_GRAPH_BATCH_THRESHOLD {
+            1
+        } else {
+            BATCH_SIZE
+        };
         while completed < iterations {
             if let Some((fence, command_buffers, batch_count)) = pending.take() {
                 unsafe {
@@ -563,33 +581,37 @@ impl Runtime {
                 completed += batch_count;
                 progress.report(completed, false);
             }
-            let batch_count = (iterations - completed).min(BATCH_SIZE);
+            let batch_count = (iterations - completed).min(batch_limit);
             let mut params_values = Vec::with_capacity(batch_count);
             for _ in 0..batch_count {
                 alpha += (settings.alpha_target as f32 - alpha) * settings.alpha_decay as f32;
-                params_values.push(Params {
-                    node_count: graph.nodes.len() as u32,
-                    adjacency_count: 0,
-                    hub_count: hub_count as u32,
-                    sample_stride,
-                    alpha,
-                    boundary,
-                    charge_distance: (settings.charge_distance * layout_spacing(graph.nodes.len()))
-                        as f32,
-                    repulsion_scale,
-                    base_charge: settings.base_charge as f32,
-                    importance_charge: settings.article_importance_charge as f32,
-                    velocity_decay: settings.velocity_decay as f32,
-                    center_strength: settings.center_strength as f32,
-                    link_distance_scale: settings.link_distance_scale as f32,
-                    link_distance_exponent: settings.link_distance_exponent as f32,
-                    link_weight_floor: settings.link_weight_floor as f32,
-                    unrelated_distance: settings.unrelated_distance as f32,
-                    unrelated_strength: settings.unrelated_base_strength as f32,
-                    hub_force: settings.hub_force_max as f32,
-                    hub_territory_base: settings.hub_territory_base as f32,
-                    hub_territory_scale: settings.hub_territory_scale as f32,
-                });
+                for chunk in 0..self.dispatch_chunks {
+                    params_values.push(Params {
+                        node_count: graph.nodes.len() as u32,
+                        adjacency_count: 0,
+                        hub_count: hub_count as u32,
+                        sample_stride,
+                        alpha,
+                        boundary,
+                        charge_distance: (settings.charge_distance
+                            * layout_spacing(graph.nodes.len()))
+                            as f32,
+                        repulsion_scale,
+                        base_charge: settings.base_charge as f32,
+                        importance_charge: settings.article_importance_charge as f32,
+                        velocity_decay: settings.velocity_decay as f32,
+                        center_strength: settings.center_strength as f32,
+                        link_distance_scale: settings.link_distance_scale as f32,
+                        link_distance_exponent: settings.link_distance_exponent as f32,
+                        link_weight_floor: settings.link_weight_floor as f32,
+                        unrelated_distance: settings.unrelated_distance as f32,
+                        unrelated_strength: settings.unrelated_base_strength as f32,
+                        hub_force: settings.hub_force_max as f32,
+                        hub_territory_base: settings.hub_territory_base as f32,
+                        hub_territory_scale: settings.hub_territory_scale as f32,
+                        node_offset: (chunk * MAX_NODES_PER_DISPATCH) as u32,
+                    });
+                }
             }
             // The adjacency count is constant, so fill it after constructing the values.
             for value in &mut params_values {
@@ -648,9 +670,15 @@ impl Runtime {
                         std::slice::from_ref(&self.descriptor_set),
                         std::slice::from_ref(&dynamic_offset),
                     );
+                    let chunk = index % self.dispatch_chunks;
+                    let remaining = graph
+                        .nodes
+                        .len()
+                        .saturating_sub(chunk * MAX_NODES_PER_DISPATCH);
+                    let chunk_nodes = remaining.min(MAX_NODES_PER_DISPATCH);
                     self.device.cmd_dispatch(
                         command_buffer,
-                        (graph.nodes.len() as u32).div_ceil(WORKGROUP_SIZE),
+                        (chunk_nodes as u32).div_ceil(WORKGROUP_SIZE),
                         1,
                         1,
                     );
@@ -772,7 +800,7 @@ pub(crate) fn bake_gpu(
         return Err(error("cannot run GPU physics with no nodes"));
     }
     seed_layout(&mut graph.nodes);
-    let hubs = select_hubs(&graph.nodes, &graph.links);
+    let (hubs, offsets, targets) = select_hubs_with_adjacency(&graph.nodes, &graph.links);
     let hub_ids = graph
         .nodes
         .iter()
@@ -791,7 +819,9 @@ pub(crate) fn bake_gpu(
         graph.links.len(),
         hubs.iter().filter(|selected| **selected).count()
     );
-    let mut runtime = Runtime::new(graph, &hubs, settings)?;
+    let mut runtime = Runtime::new(graph, &hubs, settings, &offsets, &targets)?;
+    drop(offsets);
+    drop(targets);
     runtime.run(
         graph,
         iterations,

@@ -108,7 +108,9 @@ cp rust-baker/gpu/wikigraph_gpu_shader.spv rust-baker/gpu/wikigraph_gpu.spv
 
 The GPU kernel uses bounded long-range charge sampling plus CSR link and hub
 buffers so work stays data-parallel; it is not bit-for-bit identical to the
-CPU spatial-grid and collision ordering.
+CPU spatial-grid and collision ordering. Graphs above one million nodes use a
+64-sample charge budget and bounded dispatch submissions to keep integrated
+GPU watchdogs from resetting the device.
 
 ## Run locally
 

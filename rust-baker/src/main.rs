@@ -15,6 +15,8 @@ const DEFAULT_ROOT_WINDOWS: &str = r"D:\WikiGraphData";
 const LARGE_GRAPH_THRESHOLD: usize = 2_000;
 const MAX_HUB_COUNT: usize = 100;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const IO_BUFFER_CAPACITY: usize = 8 * 1024 * 1024;
+const SVG_PROGRESS_GRANULARITY: u64 = 16 * 1024;
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -146,11 +148,22 @@ struct Options {
 }
 
 fn key(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            if !normalized.is_empty() {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.extend(character.to_lowercase());
+    }
+    normalized
 }
 
 fn ref_value(value: &Value) -> Option<String> {
@@ -411,7 +424,7 @@ fn load_jsonl(path: &Path, limit: Option<usize>, edge_limit: Option<usize>) -> i
     let mut by_ref = HashMap::new();
     let mut progress = Progress::new("Load nodes", total_bytes, "bytes");
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, file);
     let mut line = String::new();
     let mut bytes_read = 0u64;
     while reader.read_line(&mut line)? > 0 {
@@ -442,7 +455,7 @@ fn load_jsonl(path: &Path, limit: Option<usize>, edge_limit: Option<usize>) -> i
     let mut edge_keys = HashSet::new();
     let mut progress = Progress::new("Load links", total_bytes, "bytes");
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_CAPACITY, file);
     let mut line = String::new();
     let mut bytes_read = 0u64;
     let mut scanned = 0usize;
@@ -606,14 +619,35 @@ fn hub_score(node: &Node, settings: &Settings) -> f64 {
     0.8 + 0.2 * degree_score
 }
 
-fn select_hubs(nodes: &[Node], links: &[Link]) -> Vec<bool> {
+pub(crate) fn select_hubs_with_adjacency(
+    nodes: &[Node],
+    links: &[Link],
+) -> (Vec<bool>, Vec<u32>, Vec<u32>) {
     let count = ((nodes.len() as f64 * 0.05).ceil() as usize)
         .clamp(1, MAX_HUB_COUNT)
         .min(nodes.len());
-    let mut adjacency = vec![Vec::<usize>::new(); nodes.len()];
+    let mut degrees = vec![0usize; nodes.len()];
     for link in links {
-        adjacency[link.source].push(link.target);
-        adjacency[link.target].push(link.source);
+        degrees[link.source] += 1;
+        degrees[link.target] += 1;
+    }
+    let mut offsets = Vec::with_capacity(nodes.len() + 1);
+    offsets.push(0u32);
+    for degree in &degrees {
+        let next = offsets.last().copied().unwrap_or(0) as usize + degree;
+        offsets.push(next as u32);
+    }
+    let mut targets = vec![0u32; offsets.last().copied().unwrap_or(0) as usize];
+    let mut cursors: Vec<usize> = offsets[..nodes.len()]
+        .iter()
+        .map(|offset| *offset as usize)
+        .collect();
+    drop(degrees);
+    for link in links {
+        targets[cursors[link.source]] = link.target as u32;
+        cursors[link.source] += 1;
+        targets[cursors[link.target]] = link.source as u32;
+        cursors[link.target] += 1;
     }
     let mut order: Vec<usize> = (0..nodes.len()).collect();
     order.sort_unstable_by(|&a, &b| {
@@ -624,7 +658,12 @@ fn select_hubs(nodes: &[Node], links: &[Link]) -> Vec<bool> {
     let mut selected = vec![false; nodes.len()];
     let mut selected_count = 0;
     for index in order {
-        if adjacency[index].iter().any(|neighbor| selected[*neighbor]) {
+        let start = offsets[index] as usize;
+        let end = offsets[index + 1] as usize;
+        if targets[start..end]
+            .iter()
+            .any(|neighbor| selected[*neighbor as usize])
+        {
             continue;
         }
         selected[index] = true;
@@ -633,6 +672,11 @@ fn select_hubs(nodes: &[Node], links: &[Link]) -> Vec<bool> {
             break;
         }
     }
+    (selected, offsets, targets)
+}
+
+fn select_hubs(nodes: &[Node], links: &[Link]) -> Vec<bool> {
+    let (selected, _, _) = select_hubs_with_adjacency(nodes, links);
     selected
 }
 
@@ -1312,7 +1356,7 @@ fn write_positions(path: &Path, nodes: &[Node]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let partial = path.with_extension(format!("jsonl.part-{}", std::process::id()));
-    let mut writer = BufWriter::new(File::create(&partial)?);
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&partial)?);
     let mut progress = Progress::new("Positions", nodes.len() as u64, "nodes");
     for (index, node) in nodes.iter().enumerate() {
         serde_json::to_writer(
@@ -1339,7 +1383,7 @@ fn write_svg(
         fs::create_dir_all(parent)?;
     }
     let partial = path.with_extension(format!("svg.part-{}", std::process::id()));
-    let mut writer = BufWriter::new(File::create(&partial)?);
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_CAPACITY, File::create(&partial)?);
     let label_font = 12.0;
     let label_gap = 10.0;
     let points: Vec<(f64, f64, f64)> = graph
@@ -1374,23 +1418,32 @@ fn write_svg(
     let height = (max_y - min_y).max(1.0);
     let display_width = options.width.unwrap_or(width);
     let display_height = options.height.unwrap_or(height);
-    writeln!(writer, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")?;
-    writeln!(writer, "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\" role=\"img\" aria-labelledby=\"wikigraph-title wikigraph-description\">", svg_number(display_width), svg_number(display_height), svg_number(min_x), svg_number(min_y), svg_number(width), svg_number(height))?;
-    writeln!(
-        writer,
+    let mut svg_chunk = String::with_capacity(IO_BUFFER_CAPACITY);
+    macro_rules! emit_svg {
+        ($($arg:tt)*) => {{
+            use std::fmt::Write as _;
+            writeln!(&mut svg_chunk, $($arg)*).expect("writing SVG to memory");
+            if svg_chunk.len() >= IO_BUFFER_CAPACITY {
+                writer.write_all(svg_chunk.as_bytes())?;
+                svg_chunk.clear();
+            }
+        }};
+    }
+    emit_svg!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    emit_svg!("<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"{}\" height=\"{}\" viewBox=\"{} {} {} {}\" role=\"img\" aria-labelledby=\"wikigraph-title wikigraph-description\">", svg_number(display_width), svg_number(display_height), svg_number(min_x), svg_number(min_y), svg_number(width), svg_number(height));
+    emit_svg!(
         "<title id=\"wikigraph-title\">WikiGraph — {} articles</title>",
         graph.nodes.len()
-    )?;
-    writeln!(writer, "<desc id=\"wikigraph-description\">Full-resolution Wikipedia article graph with {} connections and labels for every article.</desc>", graph.links.len())?;
-    writeln!(writer, "<defs><marker id=\"wikigraph-arrow\" viewBox=\"0 0 8 8\" refX=\"7\" refY=\"4\" markerWidth=\"8\" markerHeight=\"8\" orient=\"auto\" markerUnits=\"userSpaceOnUse\"><path d=\"M 0 0 L 8 4 L 0 8 z\" fill=\"#73777f\" fill-opacity=\".34\" /></marker></defs>")?;
-    writeln!(
-        writer,
+    );
+    emit_svg!("<desc id=\"wikigraph-description\">Full-resolution Wikipedia article graph with {} connections and labels for every article.</desc>", graph.links.len());
+    emit_svg!("<defs><marker id=\"wikigraph-arrow\" viewBox=\"0 0 8 8\" refX=\"7\" refY=\"4\" markerWidth=\"8\" markerHeight=\"8\" orient=\"auto\" markerUnits=\"userSpaceOnUse\"><path d=\"M 0 0 L 8 4 L 0 8 z\" fill=\"#73777f\" fill-opacity=\".34\" /></marker></defs>");
+    emit_svg!(
         "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#fbfcfe\" />",
         svg_number(min_x),
         svg_number(min_y),
         svg_number(width),
         svg_number(height)
-    )?;
+    );
     let total_elements = (if options.no_links {
         0
     } else {
@@ -1404,48 +1457,54 @@ fn write_svg(
     let mut progress = Progress::new("SVG", total_elements as u64, "elements");
     let mut written = 0u64;
     if !options.no_links {
-        writeln!(writer, "<g class=\"wikigraph-links\" fill=\"none\" stroke=\"#73777f\" stroke-opacity=\".28\" stroke-width=\"1\" stroke-linecap=\"round\" marker-end=\"url(#wikigraph-arrow)\">")?;
+        emit_svg!("<g class=\"wikigraph-links\" fill=\"none\" stroke=\"#73777f\" stroke-opacity=\".28\" stroke-width=\"1\" stroke-linecap=\"round\" marker-end=\"url(#wikigraph-arrow)\">");
         for link in &graph.links {
             let (sx, sy, _) = points[link.source];
             let (tx, ty, _) = points[link.target];
-            writeln!(
-                writer,
+            emit_svg!(
                 "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" />",
                 svg_number(sx),
                 svg_number(sy),
                 svg_number(tx),
                 svg_number(ty)
-            )?;
+            );
             written += 1;
-            progress.update(written, "", false);
+            if written % SVG_PROGRESS_GRANULARITY == 0 {
+                progress.update(written, "", false);
+            }
         }
-        writeln!(writer, "</g>")?;
+        emit_svg!("</g>");
     }
-    writeln!(writer, "<g class=\"wikigraph-nodes\">")?;
+    emit_svg!("<g class=\"wikigraph-nodes\">");
     for (index, node) in graph.nodes.iter().enumerate() {
         let (x, y, radius) = points[index];
         let hub = hub_ids.contains(&node.id);
-        writeln!(writer, "<circle data-node-id=\"{}\" cx=\"{}\" cy=\"{}\" r=\"{}\" fill=\"#9aabf8\" stroke=\"{}\" stroke-width=\"{}\" />", xml(&node.id), svg_number(x), svg_number(y), svg_number(radius), if hub { "#2f9e44" } else { "rgba(28, 32, 39, .28)" }, if hub { "1.6" } else { "1" })?;
+        emit_svg!("<circle data-node-id=\"{}\" cx=\"{}\" cy=\"{}\" r=\"{}\" fill=\"#9aabf8\" stroke=\"{}\" stroke-width=\"{}\" />", xml(&node.id), svg_number(x), svg_number(y), svg_number(radius), if hub { "#2f9e44" } else { "rgba(28, 32, 39, .28)" }, if hub { "1.6" } else { "1" });
         written += 1;
-        progress.update(written, "", false);
+        if written % SVG_PROGRESS_GRANULARITY == 0 {
+            progress.update(written, "", false);
+        }
     }
-    writeln!(writer, "</g>")?;
+    emit_svg!("</g>");
     if !options.no_labels {
-        writeln!(writer, "<g class=\"wikigraph-labels\" font-family=\"Space Grotesk, sans-serif\" font-size=\"12\" text-anchor=\"middle\" dominant-baseline=\"central\">")?;
+        emit_svg!("<g class=\"wikigraph-labels\" font-family=\"Space Grotesk, sans-serif\" font-size=\"12\" text-anchor=\"middle\" dominant-baseline=\"central\">");
         for (index, node) in graph.nodes.iter().enumerate() {
             let (x, y, radius) = points[index];
             let hub = hub_ids.contains(&node.id);
             let width = (node.title.len() as f64 * 7.2).max(label_font);
             let label_x = x + radius + label_gap + width / 2.0;
             let text = node.title.replace(['\r', '\n'], " ");
-            writeln!(writer, "<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"{}\" stroke-opacity=\".34\" stroke-width=\".7\" />", svg_number(x + radius), svg_number(y), svg_number(x + radius + 3.0), svg_number(y), if hub { "#2f9e44" } else { "#9aa4b8" })?;
-            writeln!(writer, "<text data-node-label=\"{}\" x=\"{}\" y=\"{}\" fill=\"#555c68\" font-weight=\"{}\" stroke=\"#fbfcfe\" stroke-width=\"3\" paint-order=\"stroke\">{}</text>", xml(&node.id), svg_number(label_x), svg_number(y), if hub { "600" } else { "500" }, xml(&text))?;
+            emit_svg!("<line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"{}\" stroke-opacity=\".34\" stroke-width=\".7\" />", svg_number(x + radius), svg_number(y), svg_number(x + radius + 3.0), svg_number(y), if hub { "#2f9e44" } else { "#9aa4b8" });
+            emit_svg!("<text data-node-label=\"{}\" x=\"{}\" y=\"{}\" fill=\"#555c68\" font-weight=\"{}\" stroke=\"#fbfcfe\" stroke-width=\"3\" paint-order=\"stroke\">{}</text>", xml(&node.id), svg_number(label_x), svg_number(y), if hub { "600" } else { "500" }, xml(&text));
             written += 2;
-            progress.update(written, "", false);
+            if written % SVG_PROGRESS_GRANULARITY == 0 {
+                progress.update(written, "", false);
+            }
         }
-        writeln!(writer, "</g>")?;
+        emit_svg!("</g>");
     }
-    writeln!(writer, "</svg>")?;
+    emit_svg!("</svg>");
+    writer.write_all(svg_chunk.as_bytes())?;
     writer.flush()?;
     fs::rename(partial, path)?;
     progress.finish(written, "");

@@ -123,7 +123,9 @@ Pass `--gpu` to run the physics through the Rust-authored Vulkan compute shader
 in `rust-baker/gpu-shader/src/lib.rs`. The precompiled module is stored in
 `rust-baker/gpu/wikigraph_gpu.spv`; without `--gpu`, Rayon CPU physics is used.
 The GPU kernel is intentionally data-parallel and uses bounded charge samples,
-so its final coordinates are not bit-for-bit identical to the CPU path.
+so its final coordinates are not bit-for-bit identical to the CPU path. For
+graphs above one million nodes it reduces the charge budget to 64 samples per
+node and submits bounded dispatches to avoid integrated-GPU watchdog resets.
 
 ## Local API
 
