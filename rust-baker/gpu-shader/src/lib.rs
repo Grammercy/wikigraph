@@ -61,20 +61,22 @@ pub fn main(
     let mut force_x = 0.0f32;
     let mut force_y = 0.0f32;
     let alpha = params.alpha.max(0.0);
+    let node_count = params.node_count.max(1);
+    let sample_stride = params.sample_stride.max(1);
+    let max_distance_squared = params.charge_distance * params.charge_distance;
 
     // Bounded long-range charge sampling. The CPU path uses a spatial grid;
     // this deterministic sample keeps each GPU invocation bounded while still
     // preserving the graph-wide separation force.
     let mut sample = 0u32;
-    let offset = (index as u32 * 37u32) % params.node_count.max(1);
+    let mut other_index = (index as u32 * 37u32) % node_count;
     while sample < params.node_count {
-        let other_index = ((sample + offset) % params.node_count.max(1)) as usize;
-        if other_index != index {
-            let other = nodes[other_index];
+        let other_index_usize = other_index as usize;
+        if other_index_usize != index {
+            let other = nodes[other_index_usize];
             let dx = other.x - current.x;
             let dy = other.y - current.y;
             let distance_squared = dx * dx + dy * dy;
-            let max_distance_squared = params.charge_distance * params.charge_distance;
             if distance_squared > 0.0001 && distance_squared < max_distance_squared {
                 let safe_squared = distance_squared.max(1.0);
                 let strength = -(params.base_charge + other.importance * params.importance_charge)
@@ -85,10 +87,16 @@ pub fn main(
                 force_y += dy * strength;
             }
         }
-        sample += params.sample_stride.max(1);
+        sample += sample_stride;
+        other_index += sample_stride;
+        if other_index >= node_count {
+            other_index -= node_count;
+        }
     }
 
     // Link attraction uses a compact CSR adjacency list built by the CLI.
+    let link_distance_scale = params.link_distance_scale.max(1.0);
+    let cubic_link_force = params.link_distance_exponent > 2.5;
     let start = offsets[index] as usize;
     let end = offsets[index + 1] as usize;
     let mut cursor = start;
@@ -99,12 +107,13 @@ pub fn main(
         let dy = target.y - current.y;
         let distance = (dx * dx + dy * dy).sqrt().max(1.0);
         let extension = (distance - 48.0).max(0.0).min(1024.0);
-        let distance_force = if params.link_distance_exponent > 2.5 {
-            extension * extension * extension / params.link_distance_scale.max(1.0)
+        let distance_force = if cubic_link_force {
+            extension * extension * extension / link_distance_scale
         } else {
-            extension * extension / params.link_distance_scale.max(1.0)
+            extension * extension / link_distance_scale
         } + 0.16 * extension;
-        let weight = params.link_weight_floor
+        let weight = params
+            .link_weight_floor
             .max(1.0 / ((current.radius + target.radius).max(1.0)));
         let magnitude = distance_force.min(192.0) * weight * alpha;
         force_x += dx / distance * magnitude;
