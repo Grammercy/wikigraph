@@ -96,6 +96,26 @@ dependent random sample. These files are external data and must not be
 committed to Git; the browser/API can load them incrementally and warn before
 selecting a large tier.
 
+### Bake a static SVG
+
+Run the local 2D physics outside the browser and write a static layout:
+
+```powershell
+$env:WIKIGRAPH_DATA_DIR = 'D:\WikiGraphData'
+npm run wiki:bake
+npm run wiki:serve
+```
+
+The baker reads `index/articles.jsonl` by default, writes
+`index/baked/positions.jsonl`, `index/baked/wikigraph.svg`, and a reproducible
+`index/baked/manifest.json`, and uses the same shared force helpers as the interactive canvas. Open
+`http://127.0.0.1:8787/baked.svg`. Use `--count`, `--iterations`, `--seed`,
+`--edge-limit`, or `--no-links` when testing a smaller bake. A full corpus bake
+is an offline batch job and can take hours; Node.js 22 or newer is required.
+The command reports progress for both input passes, physics ticks, and output
+writes. Each report includes percentage, throughput, elapsed time, and an ETA;
+long phases report at least every 5% or every 30 seconds.
+
 ## Local API
 
 Start the dependency-free local API after preparing an index:

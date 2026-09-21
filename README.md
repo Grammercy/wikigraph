@@ -59,9 +59,40 @@ To serve the production website and local API from one origin, run
 SPA fallback plus `/health`, `/api/stats`, `/api/search`, `/api/article`, and
 `/api/graph`.
 
+## Bake and view the complete layout locally
+
+The browser is not a suitable place to force-simulate millions of nodes. The
+offline baker uses the same 2D forces as `GraphCanvas`, runs them as a local
+batch job, and writes a static SVG plus a JSONL position file. It defaults to
+the complete indexed corpus:
+
+```bash
+npm run wiki:bake
+npm run wiki:serve
+```
+
+Open [http://127.0.0.1:8787/baked.svg](http://127.0.0.1:8787/baked.svg) to view
+the result. The default outputs are `index/baked/wikigraph.svg`,
+`index/baked/positions.jsonl`, and `index/baked/manifest.json` under
+`WIKIGRAPH_DATA_DIR`. A full snapshot can require hours and substantial RAM.
+On a machine with more than the default V8 heap, set for example
+`NODE_OPTIONS=--max-old-space-size=65536` before running the bake.
+For a first test, bake a smaller graph without SVG edge lines:
+
+```bash
+npm run wiki:bake -- --count 25000 --iterations 600 --no-links
+```
+
+Useful options include `--iterations`, `--seed`, `--settings`, `--edge-limit`,
+`--labels`, `--width`, and `--height`. Use `--no-links` for the practical
+seven-million-node overview; keeping every edge in one SVG can produce a very
+large file. The baker prints phase progress with throughput, elapsed time, and
+an ETA while it loads the index, runs physics, and writes the output files.
+
 ## Run locally
 
-Requirements: Node.js 18+.
+Requirements: Node.js 18+ for the web app. The offline baker uses Node.js 22+
+because it loads the shared TypeScript physics modules directly.
 
 ```bash
 npm install

@@ -3,7 +3,7 @@
 // It never downloads or parses raw Wikimedia XML.
 import { createServer } from 'node:http'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
-import { extname, resolve, sep } from 'node:path'
+import { extname, join, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 
 const dataRoot = resolve(process.env.WIKIGRAPH_DATA_DIR || (process.platform === 'win32' ? 'D:\\WikiGraphData' : '/mnt/d/WikiGraphData'))
@@ -12,6 +12,7 @@ const jsonlFile = resolve(dataRoot, 'index', 'articles.jsonl')
 const sampleFile = resolve(dataRoot, 'index', 'sample.json')
 const indexManifestFile = resolve(dataRoot, 'index', 'manifest.json')
 const tiersDir = resolve(dataRoot, 'index', 'tiers')
+const bakedSvgFile = resolve(process.env.WIKIGRAPH_BAKED_SVG || join(dataRoot, 'index', 'baked', 'wikigraph.svg'))
 const parserCheckpoint = resolve(dataRoot, 'articles.checkpoint.json')
 const port = Number(process.env.WIKIGRAPH_PORT || 8787)
 const webRoot = resolve(process.env.WIKIGRAPH_WEB_ROOT || 'dist')
@@ -414,7 +415,15 @@ createServer(async (req, res) => {
   const request = new URL(req.url || '/', `http://127.0.0.1:${port}`)
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, OPTIONS' }); return res.end() }
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, { allow: 'GET, HEAD, OPTIONS' }); return res.end() }
-  if (request.pathname === '/health') return send(res, 200, { ok: true, indexed: existsSync(indexFile) || existsSync(jsonlFile) || existsSync(sampleFile) || existsSync(tiersDir), dataRoot, tiers: readTierManifest()?.tiers ?? [] })
+  if (request.pathname === '/health') return send(res, 200, { ok: true, indexed: existsSync(indexFile) || existsSync(jsonlFile) || existsSync(sampleFile) || existsSync(tiersDir), bakedSvg: existsSync(bakedSvgFile), dataRoot, tiers: readTierManifest()?.tiers ?? [] })
+  if (request.pathname === '/baked') {
+    res.writeHead(302, { location: '/baked.svg' })
+    return res.end()
+  }
+  if (request.pathname === '/baked.svg') {
+    if (serveFile(res, bakedSvgFile)) return
+    return send(res, 404, { error: 'No baked SVG found. Run `npm run wiki:bake` first.' })
+  }
   try {
     if (request.pathname === '/api/stats') {
       const stats = await scanCorpus()
