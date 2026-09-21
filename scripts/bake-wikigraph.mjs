@@ -18,7 +18,7 @@ import { createInterface } from 'node:readline'
 import { dirname, extname, join, resolve } from 'node:path'
 import { once } from 'node:events'
 import { forceCenter, forceCollide, forceManyBody, forceSimulation } from 'd3-force'
-import { articleDegree, selectHubIds } from '../src/graph/hubs.ts'
+import { selectHubIds } from '../src/graph/hubs.ts'
 import { boundaryForce, boundaryRadius } from '../src/graph/boundary.ts'
 import { articleRepulsionScale } from '../src/graph/density.ts'
 import { roundSimulationNodesF32 } from '../src/graph/f32.ts'
@@ -352,22 +352,10 @@ function number(value) {
   return Number.isFinite(value) ? Number(value.toFixed(3)).toString() : '0'
 }
 
-function projectedBounds(nodes, padding) {
-  let minX = Infinity; let maxX = -Infinity; let minY = Infinity; let maxY = -Infinity
-  for (const node of nodes) {
-    minX = Math.min(minX, node.x ?? 0); maxX = Math.max(maxX, node.x ?? 0)
-    minY = Math.min(minY, node.y ?? 0); maxY = Math.max(maxY, node.y ?? 0)
-  }
-  if (!Number.isFinite(minX)) return { minX: -1, maxX: 1, minY: -1, maxY: 1 }
-  return { minX: minX - padding, maxX: maxX + padding, minY: minY - padding, maxY: maxY + padding }
-}
-
-function project(node, bounds, width, height, scale = Math.min(width / Math.max(1, bounds.maxX - bounds.minX), height / Math.max(1, bounds.maxY - bounds.minY))) {
-  return {
-    x: (node.x - bounds.minX) * scale + (width - (bounds.maxX - bounds.minX) * scale) / 2,
-    y: (bounds.maxY - node.y) * scale + (height - (bounds.maxY - bounds.minY) * scale) / 2,
-    scale,
-  }
+function exportNodeRadius(node, settings) {
+  const physicsRadius = nodeRadius(node, settings)
+  const visualCeiling = physicsRadius + Math.max(0, settings.collisionPadding) * 0.35
+  return Math.min(physicsRadius, visualCeiling)
 }
 
 async function writeChunk(stream, value) {
@@ -407,39 +395,89 @@ async function writeSvg(file, graph, hubIds, settings, options) {
   mkdirSync(dirname(file), { recursive: true })
   const partial = `${file}.part-${process.pid}`
   const stream = createWriteStream(partial, { flags: 'wx' })
-  const padding = Math.max(40, Math.max(...nodes.slice(0, Math.min(nodes.length, 1000)).map((node) => nodeRadius(node, settings) + settings.collisionPadding), 40))
-  const bounds = projectedBounds(nodes, padding)
-  const width = options.width
-  const height = options.height
-  const svgScale = Math.min(width / Math.max(1, bounds.maxX - bounds.minX), height / Math.max(1, bounds.maxY - bounds.minY))
-  const pointFor = (node) => project(node, bounds, width, height, svgScale)
+  const labelFontSize = 12
+  const labelGap = 10
+  const points = new Map()
+  let minX = Infinity; let maxX = -Infinity; let minY = Infinity; let maxY = -Infinity
+  const includeBounds = (x, y) => {
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x)
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y)
+  }
+  for (const node of nodes) {
+    const point = {
+      x: Number.isFinite(node.x) ? node.x : 0,
+      y: Number.isFinite(node.y) ? node.y : 0,
+      radius: exportNodeRadius(node, settings),
+    }
+    points.set(node.id, point)
+    includeBounds(point.x - point.radius, point.y - point.radius)
+    includeBounds(point.x + point.radius, point.y + point.radius)
+    if (options.labels) {
+      const text = String(node.title ?? node.id).replace(/[\r\n]+/g, ' ')
+      const estimatedWidth = Math.max(labelFontSize, text.length * 7.2)
+      const labelX = point.x + point.radius + labelGap + estimatedWidth / 2
+      includeBounds(labelX - estimatedWidth / 2, point.y - labelFontSize * 0.7)
+      includeBounds(labelX + estimatedWidth / 2, point.y + labelFontSize * 0.7)
+    }
+  }
+  if (!Number.isFinite(minX)) throw new Error('Cannot write an SVG for an empty graph')
+  const margin = 42
+  minX -= margin; maxX += margin; minY -= margin; maxY += margin
+  const width = Math.max(1, maxX - minX)
+  const height = Math.max(1, maxY - minY)
+  const svgWidth = options.width ?? width
+  const svgHeight = options.height ?? height
   const startedAt = Date.now()
-  const progress = createProgressReporter('SVG', (options.noLinks ? 0 : links.length) + nodes.length, 'elements')
+  const labelElements = options.labels ? nodes.length * 2 : 0
+  const progress = createProgressReporter('SVG', (options.noLinks ? 0 : links.length) + nodes.length + labelElements, 'elements')
   let elementsWritten = 0
   try {
-    await writeChunk(stream, `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="Baked WikiGraph with ${nodes.length.toLocaleString()} articles">\n`)
-    await writeChunk(stream, `<title>WikiGraph baked layout (${nodes.length.toLocaleString()} articles)</title>\n<defs><marker id="wikigraph-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 8 4 L 0 8 z" fill="#73777f" fill-opacity=".34"/></marker></defs>\n<rect width="100%" height="100%" fill="#ffffff"/>\n`)
+    await writeChunk(stream, `<?xml version="1.0" encoding="UTF-8"?>\n`)
+    await writeChunk(stream, `<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="${number(svgWidth)}" height="${number(svgHeight)}" viewBox="${number(minX)} ${number(minY)} ${number(width)} ${number(height)}" role="img" aria-labelledby="wikigraph-title wikigraph-description">\n`)
+    await writeChunk(stream, `<title id="wikigraph-title">WikiGraph — ${nodes.length.toLocaleString()} articles</title>\n`)
+    await writeChunk(stream, `<desc id="wikigraph-description">Full-resolution Wikipedia article graph with ${links.length.toLocaleString()} connections and labels for every article.</desc>\n`)
+    await writeChunk(stream, '<defs><marker id="wikigraph-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 8 4 L 0 8 z" fill="#73777f" fill-opacity=".34" /></marker></defs>\n')
+    await writeChunk(stream, `<rect x="${number(minX)}" y="${number(minY)}" width="${number(width)}" height="${number(height)}" fill="#fbfcfe" />\n`)
     if (!options.noLinks) {
-      await writeChunk(stream, '<g fill="none" stroke="#73777f" stroke-opacity=".16" stroke-width=".45" marker-end="url(#wikigraph-arrow)">\n')
+      await writeChunk(stream, '<g class="wikigraph-links" fill="none" stroke="#73777f" stroke-opacity=".28" stroke-width="1" stroke-linecap="round" marker-end="url(#wikigraph-arrow)">\n')
       for (const link of links) {
-        const source = pointFor(link.source); const target = pointFor(link.target)
-        await writeChunk(stream, `<line x1="${number(source.x)}" y1="${number(source.y)}" x2="${number(target.x)}" y2="${number(target.y)}"/>\n`)
+        const source = points.get(link.source.id); const target = points.get(link.target.id)
+        if (!source || !target) continue
+        await writeChunk(stream, `<line x1="${number(source.x)}" y1="${number(source.y)}" x2="${number(target.x)}" y2="${number(target.y)}" />\n`)
         elementsWritten += 1
         progress.update(elementsWritten)
       }
       await writeChunk(stream, '</g>\n')
     }
-    await writeChunk(stream, '<g stroke="#ffffff" stroke-width=".35">\n')
+    await writeChunk(stream, '<g class="wikigraph-nodes">\n')
     for (const node of nodes) {
-      const point = pointFor(node)
-      const degree = articleDegree(node)
-      const fill = hubIds.has(node.id) ? '#254fef' : degree >= 4 ? '#6e86f2' : '#b6c4ff'
-      const radius = Math.max(0.6, Math.min(7, nodeRadius(node, settings) * options.nodeScale * point.scale))
-      await writeChunk(stream, `<circle cx="${number(point.x)}" cy="${number(point.y)}" r="${number(radius)}" fill="${fill}">${options.labels ? `<title>${xml(node.title)}</title>` : ''}</circle>\n`)
+      const point = points.get(node.id)
+      const isHub = hubIds.has(node.id)
+      const color = '#9aabf8'
+      const stroke = isHub ? '#2f9e44' : 'rgba(28, 32, 39, .28)'
+      const strokeWidth = isHub ? '1.6' : '1'
+      await writeChunk(stream, `<circle data-node-id="${xml(node.id)}" cx="${number(point.x)}" cy="${number(point.y)}" r="${number(point.radius)}" fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}" />\n`)
       elementsWritten += 1
       progress.update(elementsWritten)
     }
-    await writeChunk(stream, '</g>\n</svg>\n')
+    await writeChunk(stream, '</g>\n')
+    if (options.labels) {
+      await writeChunk(stream, `<g class="wikigraph-labels" font-family="Space Grotesk, sans-serif" font-size="${labelFontSize}" text-anchor="middle" dominant-baseline="central">\n`)
+      for (const node of nodes) {
+        const point = points.get(node.id)
+        const isHub = hubIds.has(node.id)
+        const text = String(node.title ?? node.id).replace(/[\r\n]+/g, ' ')
+        const estimatedWidth = Math.max(labelFontSize, text.length * 7.2)
+        const labelX = point.x + point.radius + labelGap + estimatedWidth / 2
+        const labelStart = point.x + point.radius + 3
+        await writeChunk(stream, `<line x1="${number(point.x + point.radius)}" y1="${number(point.y)}" x2="${number(labelStart)}" y2="${number(point.y)}" stroke="${isHub ? '#2f9e44' : '#9aa4b8'}" stroke-opacity=".34" stroke-width=".7" />\n`)
+        await writeChunk(stream, `<text data-node-label="${xml(node.id)}" x="${number(labelX)}" y="${number(point.y)}" fill="#555c68" font-weight="${isHub ? '600' : '500'}" stroke="#fbfcfe" stroke-width="3" paint-order="stroke">${xml(text)}</text>\n`)
+        elementsWritten += 2
+        progress.update(elementsWritten)
+      }
+      await writeChunk(stream, '</g>\n')
+    }
+    await writeChunk(stream, '</svg>\n')
     await new Promise((resolveWrite, rejectWrite) => stream.end((error) => error ? rejectWrite(error) : resolveWrite()))
     renameSync(partial, file)
     progress.finish(elementsWritten)
@@ -466,11 +504,11 @@ Options:
   --seed <n>              deterministic physics seed (default: 1)
   --settings <file>       JSON settings override (default: browser defaults)
   --edge-limit <n>        optional link cap for a smaller SVG (default: all)
-  --width <n>             SVG width (default: 16000)
-  --height <n>            SVG height (default: 10000)
-  --node-scale <n>        SVG node-size multiplier (default: 1)
+  --width <n>             optional SVG display width (default: export bounds)
+  --height <n>            optional SVG display height (default: export bounds)
+  --node-scale <n>        accepted for compatibility; export uses browser radius
   --no-links              omit SVG lines while retaining all baked nodes
-  --labels                add a title tooltip to every SVG node
+  --no-labels             omit article labels (website export includes them)
   --help                  show this help
 
 The full corpus can take hours and requires substantial RAM. Use --no-links
@@ -492,11 +530,11 @@ async function main() {
   const edgeLimit = option(args, '--edge-limit') == null ? Infinity : numberOption(args, '--edge-limit', 1, { integer: true, min: 1 })
   const settingsFile = option(args, '--settings')
   const options = {
-    width: numberOption(args, '--width', 16_000, { integer: true, min: 1 }),
-    height: numberOption(args, '--height', 10_000, { integer: true, min: 1 }),
+    width: option(args, '--width') == null ? null : numberOption(args, '--width', 1, { integer: true, min: 1 }),
+    height: option(args, '--height') == null ? null : numberOption(args, '--height', 1, { integer: true, min: 1 }),
     nodeScale: numberOption(args, '--node-scale', 1, { min: 0.01 }),
     noLinks: args.includes('--no-links'),
-    labels: args.includes('--labels'),
+    labels: !args.includes('--no-labels'),
   }
   const graph = await loadGraph(input, count, edgeLimit)
   if (!graph.nodes.length) throw new Error('The input contained no usable articles')

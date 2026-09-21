@@ -62,9 +62,9 @@ SPA fallback plus `/health`, `/api/stats`, `/api/search`, `/api/article`, and
 ## Bake and view the complete layout locally
 
 The browser is not a suitable place to force-simulate millions of nodes. The
-offline baker uses the same 2D forces as `GraphCanvas`, runs them as a local
-batch job, and writes a static SVG plus a JSONL position file. It defaults to
-the complete indexed corpus:
+offline baker is a native Rust batch program using the same 2D force model as
+`GraphCanvas`; it writes a static SVG plus a JSONL position file. It defaults
+to the complete indexed corpus:
 
 ```bash
 npm run wiki:bake
@@ -74,9 +74,8 @@ npm run wiki:serve
 Open [http://127.0.0.1:8787/baked.svg](http://127.0.0.1:8787/baked.svg) to view
 the result. The default outputs are `index/baked/wikigraph.svg`,
 `index/baked/positions.jsonl`, and `index/baked/manifest.json` under
-`WIKIGRAPH_DATA_DIR`. A full snapshot can require hours and substantial RAM.
-On a machine with more than the default V8 heap, set for example
-`NODE_OPTIONS=--max-old-space-size=65536` before running the bake.
+`WIKIGRAPH_DATA_DIR`. A full snapshot can require hours and substantial RAM;
+run it on a host with enough memory for the in-memory node and link index.
 For a first test, bake a smaller graph without SVG edge lines:
 
 ```bash
@@ -84,15 +83,37 @@ npm run wiki:bake -- --count 25000 --iterations 600 --no-links
 ```
 
 Useful options include `--iterations`, `--seed`, `--settings`, `--edge-limit`,
-`--labels`, `--width`, and `--height`. Use `--no-links` for the practical
+`--no-labels`, `--width`, and `--height`. Use `--no-links` for the practical
 seven-million-node overview; keeping every edge in one SVG can produce a very
 large file. The baker prints phase progress with throughput, elapsed time, and
 an ETA while it loads the index, runs physics, and writes the output files.
 
+To dispatch the physics through a Rust-authored `rust-gpu` Vulkan compute
+shader, add `--gpu`:
+
+```bash
+npm run wiki:bake -- --gpu
+```
+
+The GPU path requires a Vulkan compute device and uses the checked-in SPIR-V
+module at `rust-baker/gpu/wikigraph_gpu.spv`; the CPU/Rayon path remains the
+fallback when `--gpu` is omitted. To regenerate the module after editing the
+shader, install `cargo-gpu` and run:
+
+```bash
+cargo gpu build --shader-crate rust-baker/gpu-shader \
+  --output-dir rust-baker/gpu --target spirv-unknown-vulkan1.2
+cp rust-baker/gpu/wikigraph_gpu_shader.spv rust-baker/gpu/wikigraph_gpu.spv
+```
+
+The GPU kernel uses bounded long-range charge sampling plus CSR link and hub
+buffers so work stays data-parallel; it is not bit-for-bit identical to the
+CPU spatial-grid and collision ordering.
+
 ## Run locally
 
-Requirements: Node.js 18+ for the web app. The offline baker uses Node.js 22+
-because it loads the shared TypeScript physics modules directly.
+Requirements: Node.js 18+ for the web app, and Rust/Cargo for the offline
+baker. Cargo caches the optimized baker after its first build.
 
 ```bash
 npm install

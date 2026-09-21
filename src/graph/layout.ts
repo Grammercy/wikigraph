@@ -171,47 +171,96 @@ export function hubInteractions(
       impulses[index * 3 + 1] += y * magnitude
       impulses[index * 3 + 2] += z * magnitude
     }
-    for (const hubIndex of hubs) {
+    const applyPair = (hubIndex: number, index: number, connected: Set<number>) => {
       const hub = nodes[hubIndex]
-      const connected = neighbors.get(hubIndex)!
-      for (let index = 0; index < nodes.length; index++) {
-        const node = nodes[index]
-        const otherHub = hubIds.has(node.id)
-        if (index === hubIndex || (otherHub && index < hubIndex)) continue
-        let dx = (node.x ?? 0) - (hub.x ?? 0)
-        let dy = (node.y ?? 0) - (hub.y ?? 0)
-        let dz = dimensions === 3 ? (node.z ?? 0) - (hub.z ?? 0) : 0
-        let distance = Math.hypot(dx, dy, dz)
-        if (!Number.isFinite(distance)) continue
-        if (distance < 0.001) {
-          const angle = (hubIndex * 7919 + index * 104729) * 2.399963229728653
-          dx = Math.cos(angle); dy = Math.sin(angle); dz = 0; distance = 1
+      const node = nodes[index]
+      const otherHub = hubIds.has(node.id)
+      let dx = (node.x ?? 0) - (hub.x ?? 0)
+      let dy = (node.y ?? 0) - (hub.y ?? 0)
+      let dz = dimensions === 3 ? (node.z ?? 0) - (hub.z ?? 0) : 0
+      let distance = Math.hypot(dx, dy, dz)
+      if (!Number.isFinite(distance)) return
+      if (distance < 0.001) {
+        const angle = (hubIndex * 7919 + index * 104729) * 2.399963229728653
+        dx = Math.cos(angle); dy = Math.sin(angle); dz = 0; distance = 1
+      }
+      const ux = dx / distance; const uy = dy / distance; const uz = dz / distance
+      if (!otherHub && connected.has(index)) {
+        const extension = Math.min(1024, Math.max(0, distance - 48))
+        const exponent = current.linkDistanceExponent === 3 ? 3 : 2
+        const distanceScale = Number.isFinite(current.linkDistanceScale) ? Math.max(1, current.linkDistanceScale) : 150_000
+        const pull = 3 * Math.min(192, extension ** exponent / distanceScale + 0.16 * extension) * temperature
+        // A hub's popularity does not weaken its pull on each article.
+        // Shared articles split their response between their linked hubs.
+        add(index, ux, uy, uz, -pull / Math.max(1, memberships[index]))
+        // All of a hub's articles together exert only a small reaction.
+        add(hubIndex, ux, uy, uz, pull * 0.02 / Math.max(1, connected.size))
+        return
+      }
+      const score = scores[hubIndex]
+      const radius = otherHub
+        ? current.hubTerritoryBase + current.hubTerritoryScale * (score + scores[index]) / 2
+        : current.unrelatedDistance
+      if (distance >= radius || radius <= 0) return
+      const deficit = 1 - distance / radius
+      const strength = otherHub
+        ? current.hubForceBase + current.hubForceScale * (score * scores[index]) ** 1.2 + current.hubCharge / Math.max(28, distance)
+        : 4 * (current.unrelatedBaseStrength + current.unrelatedHubStrength * score) / Math.max(28, distance)
+      const push = Math.min(current.hubForceMax, strength * deficit) * temperature
+      add(index, ux, uy, uz, push)
+      // Unrelated articles move out of the territory without dragging its hub.
+      if (otherHub) add(hubIndex, ux, uy, uz, -push)
+    }
+    if (nodes.length <= 10_000) {
+      for (const hubIndex of hubs) {
+        const connected = neighbors.get(hubIndex)!
+        for (let index = 0; index < nodes.length; index++) {
+          if (index === hubIndex || (hubIds.has(nodes[index].id) && index < hubIndex)) continue
+          applyPair(hubIndex, index, connected)
         }
-        const ux = dx / distance; const uy = dy / distance; const uz = dz / distance
-        if (!otherHub && connected.has(index)) {
-          const extension = Math.min(1024, Math.max(0, distance - 48))
-          const exponent = current.linkDistanceExponent === 3 ? 3 : 2
-          const distanceScale = Number.isFinite(current.linkDistanceScale) ? Math.max(1, current.linkDistanceScale) : 150_000
-          const pull = 3 * Math.min(192, extension ** exponent / distanceScale + 0.16 * extension) * temperature
-          // A hub's popularity does not weaken its pull on each article.
-          // Shared articles split their response between their linked hubs.
-          add(index, ux, uy, uz, -pull / Math.max(1, memberships[index]))
-          // All of a hub's articles together exert only a small reaction.
-          add(hubIndex, ux, uy, uz, pull * 0.02 / Math.max(1, connected.size))
-        } else {
-          const score = scores[hubIndex]
-          const radius = otherHub
-            ? current.hubTerritoryBase + current.hubTerritoryScale * (score + scores[index]) / 2
-            : current.unrelatedDistance
-          if (distance >= radius || radius <= 0) continue
-          const deficit = 1 - distance / radius
-          const strength = otherHub
-            ? current.hubForceBase + current.hubForceScale * (score * scores[index]) ** 1.2 + current.hubCharge / Math.max(28, distance)
-            : 4 * (current.unrelatedBaseStrength + current.unrelatedHubStrength * score) / Math.max(28, distance)
-          const push = Math.min(current.hubForceMax, strength * deficit) * temperature
-          add(index, ux, uy, uz, push)
-          // Unrelated articles move out of the territory without dragging its hub.
-          if (otherHub) add(hubIndex, ux, uy, uz, -push)
+      }
+    } else {
+      // For large maps, only unlinked articles inside the unrelated radius can
+      // receive this force. A grid preserves the equations while avoiding a
+      // full article-by-hub scan when most articles are far away.
+      const cellSize = Math.max(64, Number.isFinite(current.unrelatedDistance) ? current.unrelatedDistance : 480)
+      const maxRadius = Math.max(
+        0,
+        Number.isFinite(current.unrelatedDistance) ? current.unrelatedDistance : 0,
+        (Number.isFinite(current.hubTerritoryBase) ? current.hubTerritoryBase : 0)
+          + (Number.isFinite(current.hubTerritoryScale) ? current.hubTerritoryScale : 0),
+      )
+      const cellRadius = Math.ceil(maxRadius / cellSize)
+      const cells = new Map<string, number[]>()
+      const cellKey = (x: number, y: number) => `${x}:${y}`
+      for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index]
+        if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) continue
+        const x = Math.floor((node.x as number) / cellSize)
+        const y = Math.floor((node.y as number) / cellSize)
+        const key = cellKey(x, y)
+        const bucket = cells.get(key)
+        if (bucket) bucket.push(index)
+        else cells.set(key, [index])
+      }
+      for (const hubIndex of hubs) {
+        const connected = neighbors.get(hubIndex)!
+        for (const index of connected) applyPair(hubIndex, index, connected)
+        for (const otherHubIndex of hubs) {
+          if (otherHubIndex <= hubIndex) continue
+          applyPair(hubIndex, otherHubIndex, connected)
+        }
+        const hub = nodes[hubIndex]
+        if (!Number.isFinite(hub.x) || !Number.isFinite(hub.y) || cellRadius <= 0) continue
+        const hubCellX = Math.floor((hub.x as number) / cellSize)
+        const hubCellY = Math.floor((hub.y as number) / cellSize)
+        for (let cellX = hubCellX - cellRadius; cellX <= hubCellX + cellRadius; cellX += 1) {
+          for (let cellY = hubCellY - cellRadius; cellY <= hubCellY + cellRadius; cellY += 1) {
+            for (const index of cells.get(cellKey(cellX, cellY)) ?? []) {
+              if (index === hubIndex || hubIds.has(nodes[index].id) || connected.has(index)) continue
+              applyPair(hubIndex, index, connected)
+            }
+          }
         }
       }
     }

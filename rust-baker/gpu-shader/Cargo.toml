@@ -1,0 +1,11 @@
+[package]
+name = "wikigraph-gpu-shader"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+glam = { version = "=0.33.8", default-features = false, features = ["integer-types", "float-types", "libm", "scalar-math"] }
+spirv-std = "0.10.0-alpha.1"

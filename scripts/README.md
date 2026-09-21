@@ -108,13 +108,22 @@ npm run wiki:serve
 
 The baker reads `index/articles.jsonl` by default, writes
 `index/baked/positions.jsonl`, `index/baked/wikigraph.svg`, and a reproducible
-`index/baked/manifest.json`, and uses the same shared force helpers as the interactive canvas. Open
+`index/baked/manifest.json`, and uses a native Rust implementation of the same
+force model as the interactive canvas. Open
 `http://127.0.0.1:8787/baked.svg`. Use `--count`, `--iterations`, `--seed`,
 `--edge-limit`, or `--no-links` when testing a smaller bake. A full corpus bake
-is an offline batch job and can take hours; Node.js 22 or newer is required.
+is an offline batch job and can take hours; Rust and Cargo are required.
 The command reports progress for both input passes, physics ticks, and output
 writes. Each report includes percentage, throughput, elapsed time, and an ETA;
 long phases report at least every 5% or every 30 seconds.
+By default the SVG follows the website export structure: all links, all article
+labels, dynamic bounds, node IDs, and hub outlines. `--no-links` and
+`--no-labels` are available when a smaller overview is preferred.
+Pass `--gpu` to run the physics through the Rust-authored Vulkan compute shader
+in `rust-baker/gpu-shader/src/lib.rs`. The precompiled module is stored in
+`rust-baker/gpu/wikigraph_gpu.spv`; without `--gpu`, Rayon CPU physics is used.
+The GPU kernel is intentionally data-parallel and uses bounded charge samples,
+so its final coordinates are not bit-for-bit identical to the CPU path.
 
 ## Local API
 

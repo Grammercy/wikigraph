@@ -1,4 +1,6 @@
 node_modules/
+rust-baker/target/
+rust-baker/gpu-shader/target/
 dist/
 .vite/
 *.local
