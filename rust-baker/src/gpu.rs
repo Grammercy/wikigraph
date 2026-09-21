@@ -18,7 +18,9 @@ const WORKGROUP_SIZE: u32 = 64;
 const BATCH_SIZE: usize = 32;
 const LARGE_GRAPH_BATCH_THRESHOLD: usize = 1_000_000;
 const LARGE_GRAPH_CHARGE_SAMPLES: usize = 64;
-const MAX_WORKGROUPS_PER_DISPATCH: u32 = 65_535;
+// Keep individual submissions comfortably below Windows' GPU watchdog
+// timeout.  Full-corpus ticks are submitted chunk-by-chunk below.
+const MAX_WORKGROUPS_PER_DISPATCH: u32 = 8_192;
 const MAX_NODES_PER_DISPATCH: usize =
     MAX_WORKGROUPS_PER_DISPATCH as usize * WORKGROUP_SIZE as usize;
 
@@ -216,15 +218,22 @@ fn read_bytes<T: Copy>(device: &ash::Device, buffer: &Buffer, values: &mut [T]) 
 }
 
 fn memory_type(properties: &vk::PhysicalDeviceMemoryProperties, type_bits: u32) -> io::Result<u32> {
-    for index in 0..properties.memory_type_count {
-        let suitable = type_bits & (1 << index) != 0;
-        let flags = properties.memory_types[index as usize].property_flags;
-        if suitable
-            && flags.contains(
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-        {
-            return Ok(index);
+    let required = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    // Prefer the BAR-mapped device-local heap when available.  The previous
+    // first-match selection chose system RAM on AMD, forcing every shader
+    // access through PCIe and making the full-corpus dispatch trip Windows'
+    // GPU watchdog.  Keep the host-visible fallback for adapters without a
+    // simultaneously mapped VRAM heap.
+    for prefer_device_local in [true, false] {
+        for index in 0..properties.memory_type_count {
+            let suitable = type_bits & (1 << index) != 0;
+            let flags = properties.memory_types[index as usize].property_flags;
+            if suitable
+                && flags.contains(required)
+                && (!prefer_device_local || flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            {
+                return Ok(index);
+            }
         }
     }
     Err(error("Vulkan GPU has no host-visible coherent memory type"))
@@ -624,6 +633,79 @@ impl Runtime {
                     self.params_stride * index as u64,
                     std::slice::from_ref(params),
                 );
+            }
+            if graph.nodes.len() > LARGE_GRAPH_BATCH_THRESHOLD {
+                // Submit each chunk independently.  A single command buffer
+                // containing all 7M nodes runs long enough to trigger a WDDM
+                // TDR even on a discrete GPU; a fence between chunks keeps
+                // each submission preemptible and bounds recovery latency.
+                for (index, _) in params_values.iter().enumerate() {
+                    let command_info = vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1);
+                    let command_buffer = unsafe {
+                        self.device
+                            .allocate_command_buffers(&command_info)
+                            .map_err(|e| error(format!("allocate Vulkan command buffer: {e:?}")))?
+                            [0]
+                    };
+                    let chunk = index % self.dispatch_chunks;
+                    let remaining = graph
+                        .nodes
+                        .len()
+                        .saturating_sub(chunk * MAX_NODES_PER_DISPATCH);
+                    let chunk_nodes = remaining.min(MAX_NODES_PER_DISPATCH);
+                    unsafe {
+                        self.device
+                            .begin_command_buffer(
+                                command_buffer,
+                                &vk::CommandBufferBeginInfo::default(),
+                            )
+                            .map_err(|e| error(format!("begin Vulkan command buffer: {e:?}")))?;
+                        self.device.cmd_bind_pipeline(
+                            command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.pipeline,
+                        );
+                        let dynamic_offset = self.params_stride as u32 * index as u32;
+                        self.device.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.pipeline_layout,
+                            0,
+                            std::slice::from_ref(&self.descriptor_set),
+                            std::slice::from_ref(&dynamic_offset),
+                        );
+                        self.device.cmd_dispatch(
+                            command_buffer,
+                            (chunk_nodes as u32).div_ceil(WORKGROUP_SIZE),
+                            1,
+                            1,
+                        );
+                        self.device
+                            .end_command_buffer(command_buffer)
+                            .map_err(|e| error(format!("end Vulkan command buffer: {e:?}")))?;
+                        let fence = self
+                            .device
+                            .create_fence(&vk::FenceCreateInfo::default(), None)
+                            .map_err(|e| error(format!("create Vulkan fence: {e:?}")))?;
+                        let submit = vk::SubmitInfo::default()
+                            .command_buffers(std::slice::from_ref(&command_buffer));
+                        self.device
+                            .queue_submit(self.queue, std::slice::from_ref(&submit), fence)
+                            .map_err(|e| error(format!("submit Vulkan GPU work: {e:?}")))?;
+                        self.device
+                            .wait_for_fences(&[fence], true, u64::MAX)
+                            .map_err(|e| error(format!("wait for Vulkan GPU: {e:?}")))?;
+                        self.device
+                            .free_command_buffers(self.command_pool, &[command_buffer]);
+                        self.device.destroy_fence(fence, None);
+                    }
+                }
+                completed += batch_count;
+                progress.report(completed, false);
+                continue;
             }
             let command_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.command_pool)
