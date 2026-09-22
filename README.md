@@ -88,6 +88,26 @@ seven-million-node overview; keeping every edge in one SVG can produce a very
 large file. The baker prints phase progress with throughput, elapsed time, and
 an ETA while it loads the index, runs physics, and writes the output files.
 
+### View an extraordinarily large SVG
+
+Browsers and desktop SVG editors must parse the complete SVG DOM, so they are
+not suitable for multi-gigabyte exports. Build a bounded spatial cache and use
+the canvas viewer instead:
+
+```powershell
+npm run svg:view -- build `
+  --input D:\WikiGraphData\index\baked\wikigraph-complete.svg `
+  --cache D:\WikiGraphData\index\baked\wikigraph-complete.lvg
+npm run svg:view -- serve `
+  --cache D:\WikiGraphData\index\baked\wikigraph-complete.lvg
+```
+
+The builder streams the source, keeps deterministic per-tile reservoirs, and
+never loads the SVG into memory. The viewer draws only visible tiles on a
+canvas, with a sampled overview at low zoom and labels at higher zoom. Adjust
+`--grid`, `--line-cap`, `--node-cap`, and `--label-cap` for the desired
+fidelity/storage tradeoff.
+
 To dispatch the physics through a Rust-authored `rust-gpu` Vulkan compute
 shader, add `--gpu`:
 

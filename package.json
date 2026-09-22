@@ -13,6 +13,7 @@
     "wiki:index": "node scripts/wiki-data.mjs index",
     "wiki:tiers": "node scripts/build-wiki-tiers.mjs",
     "wiki:bake": "cargo run --release --manifest-path rust-baker/Cargo.toml --",
+    "svg:view": "node scripts/large-svg-viewer.mjs",
     "wiki:parse": "python scripts/parse-wikimedia-dump.py",
     "wiki:serve": "node scripts/serve-wikigraph.mjs"
   },
